@@ -170,6 +170,10 @@ The [M3 inactive-row guide](docs/m3-inactive-rows.md) describes the private mask
 KV/model boundary and compact-versus-padded correctness checks that precede CUDA
 graph work.
 
+The [M3 persistent-buffer guide](docs/m3-persistent-buffers.md) describes the
+private fixed storage, completion/ownership rules, and allocating-versus-reused
+buffer correctness comparison. Capture and performance remain separate gates.
+
 ## License
 
 Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The native model adapts

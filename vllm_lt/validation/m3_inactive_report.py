@@ -14,29 +14,57 @@ from .m3_inactive_schema import validate_plan
 def build_report(output_dir):
     from .m3_inactive_kernels import audit_kernel_outputs
 
-    output_dir = Path(output_dir).resolve()
-    result = {
-        "schema_version": 1,
-        "artifact_type": "m3_inactive_report",
-        "evidence_status": "incomplete",
-        "decision": "inconclusive",
-        "errors": [],
-        "hashes": {},
-        "scope": "inactive-row correctness prerequisite; not graph capture or performance",
-        "limitations": [
+    return _build_correctness_report(
+        output_dir,
+        validate=validate_plan,
+        audit_models=audit_model_rows,
+        audit_checks=audit_kernel_outputs,
+        artifact_prefix="m3_inactive",
+        checks_key="kernels",
+        check_kind="kernel",
+        plan_hash_key="kernel_plan_sha256",
+        scope="inactive-row correctness prerequisite; not graph capture or performance",
+        limitations=[
             "One deterministic pass per case; no timing or throughput claim.",
             "Memory-access checker unavailable; guard/source evidence does not replace it.",
             "Only eager decode uses eight physical rows; prefill and coda remain compact.",
             "Model intermediate/KV deltas are diagnostic; held-input checks require exactness.",
         ],
+    )
+
+
+def _build_correctness_report(
+    output_dir,
+    *,
+    validate,
+    audit_models,
+    audit_checks,
+    artifact_prefix,
+    checks_key,
+    check_kind,
+    plan_hash_key,
+    scope,
+    limitations,
+):
+    """Audit shared source/control/chronology gates for bounded eager prerequisites."""
+    output_dir = Path(output_dir).resolve()
+    result = {
+        "schema_version": 1,
+        "artifact_type": artifact_prefix + "_report",
+        "evidence_status": "incomplete",
+        "decision": "inconclusive",
+        "errors": [],
+        "hashes": {},
+        "scope": scope,
+        "limitations": limitations,
     }
     try:
         plan = read_json(output_dir / "plan.json")
-        validate_plan(plan)
+        validate(plan)
         manifest = read_json(output_dir / "manifest.json")
         equal(
             [manifest["schema_version"], manifest["artifact_type"], manifest["plan_sha256"]],
-            [1, "m3_inactive_manifest", plan["plan_sha256"]],
+            [1, artifact_prefix + "_manifest", plan["plan_sha256"]],
             "manifest identity",
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -48,8 +76,8 @@ def build_report(output_dir):
     result["execution_failures"] = manifest["failures"]
     for name in ("plan.json", "manifest.json"):
         result["hashes"][name] = _file_record(output_dir / name)["sha256"]
-    result["numerical"] = audit_model_rows(output_dir, plan)
-    result["kernels"] = audit_kernel_outputs(output_dir / "kernels", plan["kernels"])
+    result["numerical"] = audit_models(output_dir, plan)
+    result[checks_key] = audit_checks(output_dir / checks_key, plan[checks_key])
     children = {}
     try:
         start, end, deadline = (manifest[key] for key in ("started_ns", "ended_ns", "deadline_ns"))
@@ -96,7 +124,7 @@ def build_report(output_dir):
                 ],
                 [
                     1,
-                    "m3_inactive_worker_manifest",
+                    artifact_prefix + "_worker_manifest",
                     worker["worker_id"],
                     worker["implementation_id"],
                 ],
@@ -132,7 +160,7 @@ def build_report(output_dir):
             equal(
                 child["completed_executions"],
                 worker["execution_ids"][: len(child["completed_executions"])],
-                "worker completed case/kernel prefix",
+                "worker completed execution prefix",
             )
             completed_from_workers.extend(child["completed_executions"])
             equal(child["deadline_ns"], deadline, "worker deadline")
@@ -185,24 +213,26 @@ def build_report(output_dir):
         result["artifact_usage"] = ab.artifact_usage(output_dir, plan["contract"]["limits"])
         ledger = result["numerical"].get("ledger", {})
         numerical_times = ledger.get("case_lifetimes", {})
-        kernel_times = {row["evaluation_id"]: row for row in result["kernels"]["evaluations"]}
+        check_times = {row["evaluation_id"]: row for row in result[checks_key]["evaluations"]}
         started = set()
         actual_model = {p.name for p in (output_dir / "numerical/cases").glob("*") if p.is_dir()}
-        actual_kernel = {
-            p.name for p in (output_dir / "kernels/evaluations").glob("*") if p.is_dir()
+        actual_checks = {
+            p.name for p in (output_dir / checks_key / "evaluations").glob("*") if p.is_dir()
         }
         require(
             actual_model
             <= {r["execution_id"] for r in plan["execution_order"] if r["kind"] == "model"}
-            and actual_kernel
-            <= {r["execution_id"] for r in plan["execution_order"] if r["kind"] == "kernel"},
-            "unplanned model/kernel directories",
+            and actual_checks
+            <= {r["execution_id"] for r in plan["execution_order"] if r["kind"] == check_kind},
+            "unplanned model/held-input directories",
         )
         for row in plan["execution_order"]:
             if row["kind"] == "model":
                 marker = output_dir / "numerical/cases" / row["execution_id"] / "started.json"
             else:
-                marker = output_dir / "kernels/evaluations" / row["execution_id"] / "started.json"
+                marker = (
+                    output_dir / checks_key / "evaluations" / row["execution_id"] / "started.json"
+                )
             if marker.exists():
                 started.add(row["execution_id"])
         require(
@@ -215,26 +245,26 @@ def build_report(output_dir):
         previous_end = {}
         for row in plan["execution_order"][: len(manifest["completed_executions"])]:
             worker = children[row["worker_id"]]
-            if row["kind"] == "kernel" and row["execution_id"] not in kernel_times:
+            if row["kind"] == check_kind and row["execution_id"] not in check_times:
                 raw = read_json(
-                    output_dir / "kernels/evaluations" / row["execution_id"] / "result.json"
+                    output_dir / checks_key / "evaluations" / row["execution_id"] / "result.json"
                 )
                 equal(
-                    raw["kernel_plan_sha256"],
-                    plan["kernels"]["kernel_plan_sha256"],
-                    "partial kernel identity",
+                    raw[plan_hash_key],
+                    plan[checks_key][plan_hash_key],
+                    "partial held-input identity",
                 )
                 require(
                     raw["evaluation"]["evaluation_id"] == row["execution_id"]
                     and raw["status"] == "complete"
                     and raw["passed"] is True,
-                    "completed partial kernel result is inconsistent",
+                    "completed partial held-input result is inconsistent",
                 )
-                kernel_times[row["execution_id"]] = raw
+                check_times[row["execution_id"]] = raw
             timing = (
                 numerical_times[row["execution_id"]]
                 if row["kind"] == "model"
-                else kernel_times[row["execution_id"]]
+                else check_times[row["execution_id"]]
             )
             first, last = timing["started_ns"], timing["finished_ns"]
             limit = timing["deadline_ns"]
@@ -249,25 +279,25 @@ def build_report(output_dir):
             )
             require(
                 previous_end.get(row["worker_id"], first) <= first,
-                "model/kernel ordering overlaps or differs from plan",
+                "model/held-input ordering overlaps or differs from plan",
             )
             previous_end[row["worker_id"]] = last
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result["errors"].append({"scope": "controls/order", "message": str(exc)})
-    numerical, kernels = result["numerical"], result["kernels"]
+    numerical, checks = result["numerical"], result[checks_key]
     complete = (
         manifest["status"] == "complete"
         and not manifest["failures"]
-        and len(manifest["completed_executions"]) == 65
+        and len(manifest["completed_executions"]) == len(plan["execution_order"])
         and len(manifest["completed_workers"]) == 2
         and numerical["complete"]
-        and kernels["complete"]
+        and checks["complete"]
     )
     result["evidence_status"] = (
         "invalid" if result["errors"] else "complete" if complete else "incomplete"
     )
     if result["evidence_status"] == "complete":
-        result["decision"] = "passed" if numerical["passed"] and kernels["passed"] else "failed"
+        result["decision"] = "passed" if numerical["passed"] and checks["passed"] else "failed"
     elif manifest["status"] == "failed" and manifest["failures"]:
         result["decision"] = "failed"
         result["failure_basis"] = (
@@ -275,11 +305,11 @@ def build_report(output_dir):
             "remaining coverage is incomplete and cannot qualify the implementation."
         )
     result["counts"] = {
-        "planned_executions": 65,
+        "planned_executions": len(plan["execution_order"]),
         "completed_executions": len(manifest["completed_executions"]),
         **numerical["counts"],
-        "planned_kernel_evaluations": 52,
-        "verified_kernel_evaluations": len(kernels["completed_evaluations"]),
+        f"planned_{check_kind}_evaluations": len(plan[checks_key]["execution_order"]),
+        f"verified_{check_kind}_evaluations": len(checks["completed_evaluations"]),
         "sanitizer_evaluations": 0,
     }
     return result

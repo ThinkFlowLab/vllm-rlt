@@ -1,6 +1,6 @@
 """The bounded inactive-row correctness subset; no throughput or graph qualification."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -179,7 +179,7 @@ def model_view(parent):
 
 
 @contextmanager
-def _padding_execution(case, observations):
+def _padding_execution(case, observations, *, runner_context=None):
     """Instance-only runner selection; engine/observer loops remain the shared Q1 driver."""
     import torch
 
@@ -188,6 +188,7 @@ def _padding_execution(case, observations):
 
     original_engine, original_observer = runner.ValidationEngine, runner.observe_native
     engine_holder = []
+    contexts = ExitStack()
 
     class PaddedEngine(original_engine):
         def __init__(self, *args, **kwargs):
@@ -209,6 +210,8 @@ def _padding_execution(case, observations):
                 )
 
             self.model_runner._recurrent = recurrent
+            if runner_context is not None:
+                contexts.enter_context(runner_context(self))
 
     def physical(batch, outputs):
         if batch.active is None:
@@ -254,10 +257,13 @@ def _padding_execution(case, observations):
         yield
     finally:
         runner.ValidationEngine, runner.observe_native = original_engine, original_observer
-        for engine in engine_holder:
-            if "_recurrent" in vars(engine.model_runner):
-                del engine.model_runner._recurrent
-        engine_holder.clear()
+        try:
+            contexts.close()
+        finally:
+            for engine in engine_holder:
+                if "_recurrent" in vars(engine.model_runner):
+                    del engine.model_runner._recurrent
+            engine_holder.clear()
 
 
 def execute_model_case(model, view, case, output, budget, dumps, deadline):
@@ -287,9 +293,7 @@ def run_model_rows(model, parent, implementation, output_dir, deadline_ns, *, af
     )
 
 
-def audit_model_rows(output_dir, parent):
-    view = model_view(parent)
-    result = _audit_numerical_view(output_dir, view)
+def _add_model_counts(view, result):
     completed = set(result["completed_cases"])
     verified = {row["comparison_id"] for row in result["comparisons"]}
     result["counts"].update(
@@ -314,38 +318,46 @@ def audit_model_rows(output_dir, parent):
             for row in view["comparison_order"]
         ),
     )
+
+
+def _audit_padding_observations(case, evidence):
+    observations = evidence["padding_observations"]
+    expected = [row for row in evidence["schedule"] if row["stage"] == "recurrent"]
+    if case["padding"]["mode"] == "compact":
+        if observations:
+            raise ValueError("compact execution contains padded observations")
+        return
+    if len(observations) != len(expected) or not expected:
+        raise ValueError("padded dispatch coverage differs from executed recurrent schedule")
+    for actual, scheduled in zip(observations, expected):
+        ids = scheduled["request_ids"]
+        frozen = {
+            "row_count": 8,
+            "live_rows": [2 * i + 1 for i in range(len(ids))],
+            "table_width": 32,
+            "request_ids": ids,
+            "depths": scheduled["depths_after_step"],
+            "positions": scheduled["positions_after_step"],
+            "inactive_hidden_zero": True,
+            "inactive_gate_zero": True,
+            "all_finite": True,
+            "active_mask_matches": True,
+        }
+        if _digest(actual) != _digest(frozen):
+            raise ValueError("padding observations differ from logical execution history")
+
+
+def audit_model_rows(output_dir, parent):
+    view = model_view(parent)
+    result = _audit_numerical_view(output_dir, view)
+    _add_model_counts(view, result)
     if not result["complete"]:
         return result
     try:
         for case in view["execution_order"]:
             path = Path(output_dir) / "numerical" / "cases" / case["case_id"] / "result.json"
             evidence = read_json(path)
-            observations = evidence["padding_observations"]
-            expected = [row for row in evidence["schedule"] if row["stage"] == "recurrent"]
-            if case["padding"]["mode"] == "compact":
-                if observations:
-                    raise ValueError("compact execution contains padded observations")
-                continue
-            if len(observations) != len(expected) or not expected:
-                raise ValueError(
-                    "padded dispatch coverage differs from executed recurrent schedule"
-                )
-            for actual, scheduled in zip(observations, expected):
-                ids = scheduled["request_ids"]
-                frozen = {
-                    "row_count": 8,
-                    "live_rows": [2 * i + 1 for i in range(len(ids))],
-                    "table_width": 32,
-                    "request_ids": ids,
-                    "depths": scheduled["depths_after_step"],
-                    "positions": scheduled["positions_after_step"],
-                    "inactive_hidden_zero": True,
-                    "inactive_gate_zero": True,
-                    "all_finite": True,
-                    "active_mask_matches": True,
-                }
-                if _digest(actual) != _digest(frozen):
-                    raise ValueError("padding observations differ from logical execution history")
+            _audit_padding_observations(case, evidence)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result["complete"] = result["passed"] = False
         result["errors"].append({"type": type(exc).__name__, "message": str(exc)})

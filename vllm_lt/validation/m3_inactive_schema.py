@@ -120,7 +120,7 @@ def validate_contract(contract, *, resolved=False):
         _text(value, "stop condition")
 
 
-def source_controls(implementations):
+def source_controls(implementations, *, diff_paths=DIFF_PATHS):
     _keys(implementations, ("A", "B"), name="implementations")
     for item in implementations.values():
         _keys(item, ("root", "source", "imports"), name="implementation")
@@ -152,7 +152,7 @@ def source_controls(implementations):
     amap, bmap = ({r["path"]: r for r in source["files"]} for source in (a, b))
     differences = sorted(k for k in set(amap) | set(bmap) if amap.get(k) != bmap.get(k))
     require(
-        bool(differences) and set(differences) <= set(DIFF_PATHS),
+        bool(differences) and set(differences) <= set(diff_paths),
         "unexpected production differences",
     )
     return harness, differences
@@ -193,14 +193,8 @@ def execution_rows(numerical, kernels):
     return workers, rows
 
 
-def make_plan(*, baseline_root, candidate_root, contract_path, model_path, gpu_ids, affinity):
-    from .m3_inactive_kernels import build_kernel_plan
-
-    contract_path, model_path = Path(contract_path).resolve(), Path(model_path).resolve()
-    contract = read_json(contract_path)
-    validate_contract(contract)
-    contract["controls"].update(gpu_ids=gpu_ids, affinity=affinity)
-    validate_contract(contract, resolved=True)
+def _probe_inputs(baseline_root, candidate_root, model_path, *, diff_paths=DIFF_PATHS):
+    """Freeze the shared source/checkpoint/environment identity without CUDA."""
     roots = {"A": Path(baseline_root).resolve(), "B": Path(candidate_root).resolve()}
     probes = {key: probe_checkout(root) for key, root in roots.items()}
     equal(probes["A"]["dependencies"], probes["B"]["dependencies"], "A/B dependencies")
@@ -208,7 +202,7 @@ def make_plan(*, baseline_root, candidate_root, contract_path, model_path, gpu_i
         key: {"root": str(roots[key]), "source": p["source"], "imports": p["imports"]}
         for key, p in probes.items()
     }
-    harness, differences = source_controls(implementations)
+    harness, differences = source_controls(implementations, diff_paths=diff_paths)
     inputs = {}
     for key, relative in INPUTS.items():
         record, other = (_file_record(roots[k] / relative) for k in ("A", "B"))
@@ -228,6 +222,30 @@ def make_plan(*, baseline_root, candidate_root, contract_path, model_path, gpu_i
             inputs["suite"]["contents"]["provenance"]["tokenizer"][key],
             "fixture tokenizer",
         )
+    return {
+        "inputs": inputs,
+        "implementations": implementations,
+        "harness": harness,
+        "production_differences": differences,
+        "dependencies": probes["A"]["dependencies"],
+        "model_path": str(model_path),
+        "model_config": config,
+        "model_files": files,
+        "interpreter": sys.executable,
+        "runtime_environment": {name: os.environ.get(name) for name in RUNTIME_VARIABLES},
+    }
+
+
+def make_plan(*, baseline_root, candidate_root, contract_path, model_path, gpu_ids, affinity):
+    from .m3_inactive_kernels import build_kernel_plan
+
+    contract_path, model_path = Path(contract_path).resolve(), Path(model_path).resolve()
+    contract = read_json(contract_path)
+    validate_contract(contract)
+    contract["controls"].update(gpu_ids=gpu_ids, affinity=affinity)
+    validate_contract(contract, resolved=True)
+    common = _probe_inputs(baseline_root, candidate_root, model_path)
+    inputs, config = common["inputs"], common["model_config"]
     numerical = build_model_plan(
         inputs["suite"]["contents"], inputs["contract"]["contents"], config
     )
@@ -238,24 +256,53 @@ def make_plan(*, baseline_root, candidate_root, contract_path, model_path, gpu_i
         "artifact_type": "m3_inactive_plan",
         "contract": contract,
         "contract_file": _file_record(contract_path),
-        "inputs": inputs,
-        "implementations": implementations,
-        "harness": harness,
-        "production_differences": differences,
-        "dependencies": probes["A"]["dependencies"],
-        "model_path": str(model_path),
-        "model_config": config,
-        "model_files": files,
+        **common,
         "numerical": numerical,
         "kernels": kernels,
         "workers": workers,
         "execution_order": rows,
-        "interpreter": sys.executable,
-        "runtime_environment": {name: os.environ.get(name) for name in RUNTIME_VARIABLES},
     }
     plan["plan_sha256"] = _digest(plan)
     validate_plan(plan)
     return plan
+
+
+def _validate_identity(plan, *, diff_paths=DIFF_PATHS):
+    """Validate shared snapshot, environment and file-record structure offline."""
+    _validate_dependencies(plan["dependencies"])
+    equal(
+        plan["dependencies"]["official"]["dependencies"]["transformers"],
+        "4.55.0",
+        "prepared transformers",
+    )
+    equal(
+        plan["dependencies"]["official"]["optional_kernels_present"],
+        False,
+        "optional kernels absence",
+    )
+    harness, differences = source_controls(plan["implementations"], diff_paths=diff_paths)
+    equal(
+        [plan["harness"], plan["production_differences"]],
+        [harness, differences],
+        "frozen source controls",
+    )
+    _file_records(plan["model_files"], "model files")
+    _file_records([plan["contract_file"]], "contract file")
+    _keys(plan["inputs"], INPUTS, name="inputs")
+    for value in plan["inputs"].values():
+        _keys(value, ("file", "contents"), name="input")
+        _file_records([value["file"]], "input files")
+    validate_model_config(plan["model_config"])
+    _keys(plan["runtime_environment"], RUNTIME_VARIABLES, name="runtime environment")
+    require(
+        all(
+            value is None or isinstance(value, str)
+            for value in plan["runtime_environment"].values()
+        ),
+        "runtime variables require strings or null",
+    )
+    for key in ("interpreter", "model_path"):
+        require(isinstance(plan[key], str) and Path(plan[key]).is_absolute(), "absolute " + key)
 
 
 def validate_plan(plan):
@@ -293,30 +340,7 @@ def validate_plan(plan):
         "plan selfhash",
     )
     validate_contract(plan["contract"], resolved=True)
-    _validate_dependencies(plan["dependencies"])
-    equal(
-        plan["dependencies"]["official"]["dependencies"]["transformers"],
-        "4.55.0",
-        "prepared transformers",
-    )
-    equal(
-        plan["dependencies"]["official"]["optional_kernels_present"],
-        False,
-        "optional kernels absence",
-    )
-    harness, differences = source_controls(plan["implementations"])
-    equal(
-        [plan["harness"], plan["production_differences"]],
-        [harness, differences],
-        "frozen source controls",
-    )
-    _file_records(plan["model_files"], "model files")
-    _file_records([plan["contract_file"]], "contract file")
-    _keys(plan["inputs"], INPUTS, name="inputs")
-    for value in plan["inputs"].values():
-        _keys(value, ("file", "contents"), name="input")
-        _file_records([value["file"]], "input files")
-    validate_model_config(plan["model_config"])
+    _validate_identity(plan)
     validate_model_plan(plan["numerical"])
     equal(plan["numerical"]["model_config"], plan["model_config"], "model configuration")
     equal(
@@ -341,20 +365,15 @@ def validate_plan(plan):
     require(
         estimate <= LIMITS["artifact_bytes_max"], "estimated complete artifacts exceed disk cap"
     )
-    _keys(plan["runtime_environment"], RUNTIME_VARIABLES, name="runtime environment")
-    require(
-        all(
-            value is None or isinstance(value, str)
-            for value in plan["runtime_environment"].values()
-        ),
-        "runtime variables require strings or null",
-    )
-    for key in ("interpreter", "model_path"):
-        require(isinstance(plan[key], str) and Path(plan[key]).is_absolute(), "absolute " + key)
 
 
 def verify_plan(plan, *, implementation_id=None):
     validate_plan(plan)
+    _verify_inputs(plan, implementation_id=implementation_id)
+
+
+def _verify_inputs(plan, *, implementation_id=None):
+    """Verify already-validated correctness plans against actual source and controls."""
     for key in (implementation_id,) if implementation_id else ("A", "B"):
         expected = plan["implementations"][key]
         actual = source_probe() if implementation_id else probe_checkout(expected["root"])

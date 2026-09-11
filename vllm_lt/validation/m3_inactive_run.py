@@ -22,6 +22,15 @@ def controls_view(plan):
 
 
 def active_deadline(output_dir, worker):
+    return _active_deadline(
+        output_dir,
+        worker,
+        check_directory="kernels",
+        check_ids=[value for value in worker["execution_ids"] if value.startswith("K-")],
+    )
+
+
+def _active_deadline(output_dir, worker, *, check_directory, check_ids):
     allowed = set(worker["execution_ids"])
     candidates = []
     ledger_path = output_dir / "numerical/ledger.json"
@@ -37,10 +46,8 @@ def active_deadline(output_dir, worker):
                 "invalid numerical watchdog interval",
             )
             candidates.append(active["deadline_ns"])
-    for evaluation_id in worker["execution_ids"]:
-        if not evaluation_id.startswith("K-"):
-            continue
-        folder = output_dir / "kernels/evaluations" / evaluation_id
+    for evaluation_id in check_ids:
+        folder = output_dir / check_directory / "evaluations" / evaluation_id
         marker_path = folder / "started.json"
         if marker_path.exists() and not (folder / "result.json").exists():
             marker = read_json(marker_path)
@@ -63,11 +70,51 @@ def active_deadline(output_dir, worker):
 def run_worker(plan, *, worker_id, output_dir, deadline_ns):
     from .m3_inactive_kernels import run_kernel_evaluation
 
+    def checks(plan, implementation, output_dir, deadline_ns):
+        for evaluation in plan["kernels"]["execution_order"]:
+            if evaluation["implementation_id"] == implementation:
+                yield (
+                    evaluation["evaluation_id"],
+                    run_kernel_evaluation(
+                        plan["kernels"],
+                        evaluation["evaluation_id"],
+                        output_dir / "kernels",
+                        device="cuda",
+                        deadline_ns=deadline_ns,
+                    ),
+                )
+
+    return _run_worker(
+        plan,
+        worker_id=worker_id,
+        output_dir=output_dir,
+        deadline_ns=deadline_ns,
+        validate=validate_plan,
+        verify=verify_plan,
+        model_rows=run_model_rows,
+        checks=checks,
+        artifact_type="m3_inactive_worker_manifest",
+    )
+
+
+def _run_worker(
+    plan,
+    *,
+    worker_id,
+    output_dir,
+    deadline_ns,
+    validate,
+    verify,
+    model_rows,
+    checks,
+    artifact_type,
+):
+    """Owned model lifetime shared by the two bounded eager correctness protocols."""
     start = time.perf_counter_ns()
-    validate_plan(plan)
+    validate(plan)
     worker = next(row for row in plan["workers"] if row["worker_id"] == worker_id)
     implementation = worker["implementation_id"]
-    verify_plan(plan, implementation_id=implementation)
+    verify(plan, implementation_id=implementation)
     require(time.perf_counter_ns() < deadline_ns, "global deadline before device use")
     require(
         os.environ.get("CUDA_VISIBLE_DEVICES") == str(plan["contract"]["controls"]["gpu_ids"][0]),
@@ -79,7 +126,7 @@ def run_worker(plan, *, worker_id, output_dir, deadline_ns):
     manifest_path = folder / "manifest.json"
     manifest = {
         "schema_version": 1,
-        "artifact_type": "m3_inactive_worker_manifest",
+        "artifact_type": artifact_type,
         **worker,
         "plan_sha256": plan["plan_sha256"],
         "source": plan["implementations"][implementation]["source"],
@@ -126,21 +173,12 @@ def run_worker(plan, *, worker_id, output_dir, deadline_ns):
             manifest["completed_executions"].append(case["case_id"])
             write_json(manifest_path, manifest)
             if case["phase"] == "feasibility":
-                for evaluation in plan["kernels"]["execution_order"]:
-                    if evaluation["implementation_id"] != implementation:
-                        continue
-                    result = run_kernel_evaluation(
-                        plan["kernels"],
-                        evaluation["evaluation_id"],
-                        output_dir / "kernels",
-                        device="cuda",
-                        deadline_ns=deadline_ns,
-                    )
+                for evaluation_id, result in checks(plan, implementation, output_dir, deadline_ns):
                     require(
                         result["status"] == "complete" and result["passed"],
                         "held-input correctness prerequisite failed",
                     )
-                    manifest["completed_executions"].append(evaluation["evaluation_id"])
+                    manifest["completed_executions"].append(evaluation_id)
                     manifest["artifact_usage"] = ab.artifact_usage(
                         output_dir, plan["contract"]["limits"]
                     )
@@ -149,7 +187,7 @@ def run_worker(plan, *, worker_id, output_dir, deadline_ns):
                 time.perf_counter_ns() < deadline_ns, "global deadline after case/kernel exports"
             )
 
-        numerical = run_model_rows(
+        numerical = model_rows(
             model, plan, implementation, output_dir, deadline_ns, after_case=after_case
         )
         manifest["numerical"] = numerical
@@ -188,8 +226,20 @@ def run_worker(plan, *, worker_id, output_dir, deadline_ns):
 
 
 def run(plan, *, output_dir):
+    return _run_workers(
+        plan,
+        output_dir=output_dir,
+        verify=verify_plan,
+        module="vllm_lt.validation.m3_inactive_run",
+        watchdog=active_deadline,
+        artifact_type="m3_inactive_manifest",
+    )
+
+
+def _run_workers(plan, *, output_dir, verify, module, watchdog, artifact_type):
+    """Run the declared two-worker prefix with the shared owned-process watchdog."""
     start = time.perf_counter_ns()
-    verify_plan(plan)
+    verify(plan)
     require(
         os.environ.get("CUDA_VISIBLE_DEVICES") == str(plan["contract"]["controls"]["gpu_ids"][0]),
         "controller requires frozen scheduler visibility",
@@ -201,7 +251,7 @@ def run(plan, *, output_dir):
     deadline = start + 3600 * 10**9
     manifest = {
         "schema_version": 1,
-        "artifact_type": "m3_inactive_manifest",
+        "artifact_type": artifact_type,
         "plan_sha256": plan["plan_sha256"],
         "status": "running",
         "started_ns": start,
@@ -237,8 +287,8 @@ def run(plan, *, output_dir):
                     worker,
                     output_dir,
                     deadline,
-                    module="vllm_lt.validation.m3_inactive_run",
-                    active_deadline=active_deadline,
+                    module=module,
+                    active_deadline=watchdog,
                 )
             finally:
                 launch["returned_ns"] = time.perf_counter_ns()

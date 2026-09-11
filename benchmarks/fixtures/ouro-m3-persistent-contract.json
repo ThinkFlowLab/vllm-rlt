@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "artifact_type": "m3_persistent_contract",
+  "contract_id": "ouro-m3-persistent-correctness-v1",
+  "hypothesis": "Reusing bounded eager decode input/output storage preserves live behavior, ownership and safe request lifetime.",
+  "isolated_variable": "Allocating padded A versus persistent padded B with identical eight-row/32-column shapes and live maps; storage reuse and its required completion/publication are the only changes.",
+  "inputs": {
+    "suite": "benchmarks/fixtures/ouro-q1.json",
+    "contract": "benchmarks/fixtures/ouro-q1-contract.json"
+  },
+  "production_diff_paths": [
+    "vllm_lt/core/kv_cache_manager.py",
+    "vllm_lt/engine/llm_engine.py",
+    "vllm_lt/worker/model_runner.py"
+  ],
+  "controls": {
+    "gpu_ids": null,
+    "affinity": null,
+    "cpu_threads": 1,
+    "interop_threads": 1,
+    "seed": 0,
+    "dtype": "float32",
+    "numa_policy": "inherit-verified-parent-binding",
+    "residency_policy": "two-fresh-workers-one-model-each-one-pool-at-a-time",
+    "cache_policy": "fresh-case-state-preserve-worker-allocator",
+    "environment_policy": "same-prepared-Q1-environment"
+  },
+  "acceptance": {
+    "purpose": "eager-persistent-storage-correctness-only",
+    "passes_per_case": 1,
+    "full_model": "original-Q1-FP32-logits-and-actual-token-exit-gates",
+    "intermediates": "finite-required-numerical-deltas-diagnostic",
+    "storage": "stable-owned-boundary-tensors-and-independent-request-publication",
+    "lifecycle": "exact-held-input-pairs-guards-leases-reuse-and-counted-fallbacks",
+    "bucket": {
+      "row_count": 8,
+      "table_width": 32,
+      "max_live_rows": 4,
+      "mapping": "odd_slots"
+    },
+    "sanitizer": "unavailable-no-executions-no-coverage-claim"
+  },
+  "limits": {
+    "total_timeout_s": 3600,
+    "case_timeout_s": 600,
+    "workers": 2,
+    "model_loads": 2,
+    "model_cases": 13,
+    "excluded_feasibility_cases": 2,
+    "qualification_cases": 11,
+    "comparison_streams": 28,
+    "qualification_comparison_streams": 27,
+    "lifecycle_evaluations": 4,
+    "sanitizer_evaluations": 0,
+    "persistent_device_payload_bytes": 262144,
+    "persistent_cpu_staging_bytes": 16384,
+    "persistent_buckets": 1,
+    "lifecycle_evidence_bytes": 268435456,
+    "artifact_bytes_max": 12884901888,
+    "profile_total_bytes_max": 0,
+    "profile_trace_bytes_max": 0
+  },
+  "stop_conditions": [
+    "Any execution, pointer, lease, guard, publication, required-logit or actual-decision failure stops subsequent cases; no retry.",
+    "Any source, input, dependency, device, affinity or cleanup mismatch stops execution.",
+    "Stop at the first case/global deadline or evidence/storage cap violation.",
+    "Unsupported valid shapes take the frozen counted compact fallback; correctness/device failures never retry eagerly.",
+    "Unconfirmed completion quarantines state and cannot be reported as safe page reuse or successful cleanup.",
+    "No graph, performance, BF16 or unavailable memory-checker qualification is claimed."
+  ]
+}
