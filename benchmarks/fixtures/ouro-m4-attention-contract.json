@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "artifact_type": "m4_attention_contract",
+  "contract_id": "ouro-m4-attention-tile-v1",
+  "hypothesis": "A 64-token attention tile improves compact synchronous FP32 inference relative to the accepted 32-token tile while preserving numerical behavior and fixed control workloads.",
+  "isolated_variable": "Only the attention launch BLOCK_T literal changes from 32 on A to 64 on B; num_warps remains 4. Both use the same accepted compact synchronous runtime and common harness.",
+  "inputs": {
+    "benchmark_suite": "benchmarks/fixtures/ouro-m1.json",
+    "benchmark_contract": "benchmarks/fixtures/ouro-m1-contract.json",
+    "numerical_suite": "benchmarks/fixtures/ouro-q1.json",
+    "numerical_contract": "benchmarks/fixtures/ouro-q1-contract.json"
+  },
+  "production_diff_paths": [
+    "vllm_lt/kernels/triton_attention.py"
+  ],
+  "tile_policy": {
+    "A": 32,
+    "B": 64,
+    "num_warps": 4,
+    "baseline_sha256": "0861c57c25d7e5b284cfe4c259ae324a2a420a42c72fa3d3124d0fd13e63098e"
+  },
+  "controls": {
+    "gpu_ids": null,
+    "affinity": null,
+    "cpu_threads": 1,
+    "interop_threads": 1,
+    "seed": 0,
+    "numa_policy": "inherit-verified-parent-binding",
+    "residency_policy": "one-fresh-worker-one-model-one-engine",
+    "cache_policy": "fresh-engine-preserve-worker-allocator",
+    "environment_policy": "same-prepared-environment-all-workers",
+    "benchmark_path": "compact-synchronous-private-persistent-disabled",
+    "source_policy": "accepted-attention-source-one-literal-tile-change-only"
+  },
+  "acceptance": {
+    "target_cell": "W1-refill",
+    "target_ratio_min": 1.01,
+    "control_ratio_min": 0.95,
+    "peak_increase_bytes_max": 67108864,
+    "setup_increase_ns_max": 100000000,
+    "variation": "min-B-strictly-greater-than-max-A",
+    "numerical": "Q1-FP32-final-logits-and-token-exit-history-Torch-exact-Triton-fidelity",
+    "intermediates": "finite-required-hidden-gate-KV-deltas-diagnostic",
+    "held_attention": {
+      "atol": 2e-05,
+      "rtol": 2e-05
+    },
+    "held_invariants": "same-tile-masked-compact-exact-whole-pool-guards-and-inactive-zeros",
+    "profile": "matched-W1-W4-compact-prepared-real-kernel-copy-attribution",
+    "verdict_precedence": "invalid-evidence-then-required-failure-then-missing-or-variation",
+    "sanitizer": "unavailable-zero-executions-no-coverage-claim"
+  },
+  "limits": {
+    "total_timeout_s": 7200,
+    "case_timeout_s": 600,
+    "workers": 8,
+    "model_loads": 8,
+    "executions": 139,
+    "numerical_executions": 27,
+    "comparison_streams": 51,
+    "kernel_evaluations": 30,
+    "lifecycle_evaluations": 4,
+    "feasibility_executions": 14,
+    "warmup_executions": 28,
+    "measured_executions": 28,
+    "diagnostic_warmup_executions": 4,
+    "profile_executions": 4,
+    "profile_decode_outputs": 16,
+    "profile_trace_bytes_max": 2147483648,
+    "profile_total_bytes_max": 4294967296,
+    "held_evidence_bytes_max": 327155712,
+    "auxiliary_artifact_bytes_max": 1073741824,
+    "artifact_bytes_max": 12884901888,
+    "sanitizer_executions": 0
+  },
+  "stop_conditions": [
+    "Source, input, dependency, device, affinity, arithmetic, numerical, ownership or cleanup failure stops subsequent work.",
+    "Seven feasibility cells, direct held/lifecycle and native/reference gates pass on A before B; both sides and their raw prerequisite audit pass before A1.",
+    "Each complete case has a 600-second watchdog and the controller a 7200-second deadline, including preparation/export/cleanup; the earlier deadline wins.",
+    "Any frozen tensor, dump, index, comparison, held, profile or total artifact cap ends the attempt and preserves its completed prefix.",
+    "No retry, replacement execution, extra tile, profile or measured sample; failed pairs cannot be rescued by averages or additional runs."
+  ]
+}

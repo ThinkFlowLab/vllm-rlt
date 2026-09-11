@@ -39,7 +39,7 @@ def artifact_usage(output_dir, limits):
     return {"total_bytes": total, "profile_trace_bytes": traces}
 
 
-def audit_worker_controls(plan, manifest, previous=None):
+def audit_worker_controls(plan, manifest, previous=None, *, require_cleanup=True):
     """Device discovery happened in the worker; this check reads its recorded facts only."""
     controls = plan["contract"]["controls"]
     env = manifest["environment"]
@@ -91,11 +91,12 @@ def audit_worker_controls(plan, manifest, previous=None):
             "actual_torch_threads",
         ):
             equal(env[name], previous[name], f"cross-worker {name}")
-    equal(
-        manifest["teardown_after_workspace_release"],
-        {"allocated_bytes": 0, "reserved_bytes": 0},
-        "worker final CUDA cleanup",
-    )
+    if require_cleanup:
+        equal(
+            manifest["teardown_after_workspace_release"],
+            {"allocated_bytes": 0, "reserved_bytes": 0},
+            "worker final CUDA cleanup",
+        )
 
 
 def run_worker(plan, *, worker_id, output_dir, deadline_ns):

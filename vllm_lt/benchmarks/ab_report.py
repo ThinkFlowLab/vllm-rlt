@@ -38,8 +38,8 @@ def _memory(result, expected_pool):
     require(type(result["setup_ns"]) is int and result["setup_ns"] >= 0, "integer setup time")
 
 
-def _work_identity(result):
-    return {
+def _work_identity(result, *, compare_gate_values=True):
+    identity = {
         "requests": [
             {
                 key: row[key]
@@ -61,9 +61,25 @@ def _work_identity(result):
             )
         },
     }
+    if not compare_gate_values:
+        probabilities = result["counts"]["gate_probabilities"]
+        require(
+            isinstance(probabilities, list)
+            and all(
+                type(p) in (int, float) and math.isfinite(p) and 0 <= p <= 1 for p in probabilities
+            ),
+            "finite actual gate probabilities",
+        )
+        equal(
+            len(probabilities),
+            result["counts"]["stage_tokens"]["recurrent"],
+            "actual gate probability count",
+        )
+        identity["counts"]["gate_probabilities"] = len(probabilities)
+    return identity
 
 
-def pair_results(plan, records):
+def pair_results(plan, records, *, pair_prefix="M2", compare_gate_values=True):
     """Both observations must meet their own limits; never average away a failure."""
     acceptance = plan["contract"]["acceptance"]
     measured = [row for row in records if row["planned"]["phase"] == "measured"]
@@ -71,7 +87,7 @@ def pair_results(plan, records):
     for cell in CELLS:
         pairs, avalues, bvalues = [], [], []
         for repetition in (1, 2):
-            pair_id = f"M2-{cell}-{repetition}"
+            pair_id = f"{pair_prefix}-{cell}-{repetition}"
             members = [row for row in measured if row["planned"]["pair_id"] == pair_id]
             item = {"pair_id": pair_id, "status": "invalid", "errors": []}
             try:
@@ -94,7 +110,9 @@ def pair_results(plan, records):
                         result, plan["workload_stats"][arow["planned"]["workload_id"]]["pool_bytes"]
                     )
                 equal(
-                    _work_identity(a), _work_identity(b), "actual A/B token/depth/gate/work history"
+                    _work_identity(a, compare_gate_values=compare_gate_values),
+                    _work_identity(b, compare_gate_values=compare_gate_values),
+                    "actual A/B token/depth/gate/work history",
                 )
                 equal(a["memory"]["pool_bytes"], b["memory"]["pool_bytes"], "fixed KV pool bytes")
                 av = _finite(

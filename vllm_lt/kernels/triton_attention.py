@@ -125,7 +125,7 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, ac
         PAGE_SIZE=key_cache.shape[1],
         SCALE=q.shape[-1] ** -0.5,
         BLOCK_D=triton.next_power_of_2(q.shape[-1]),
-        BLOCK_T=32,
+        BLOCK_T=64,
         HAS_ACTIVE=active is not None,
         num_warps=4,
     )
