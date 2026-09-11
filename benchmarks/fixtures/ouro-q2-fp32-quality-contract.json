@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "artifact_type": "q2_fp32_quality_contract",
+  "contract_id": "ouro-q2-fp32-quality-v1",
+  "purpose": "One descriptive FP32 GSM8K slice; no paired quality or speed qualification.",
+  "dataset": {
+    "repo_id": "openai/gsm8k",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "config": "main",
+    "split": "test",
+    "path": "main/test-00000-of-00001.parquet",
+    "sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+    "size_bytes": 419088,
+    "source_count": 1319,
+    "license": "MIT"
+  },
+  "prompt_template": "Solve the following math problem. Show your reasoning, then give the final answer on its own line as #### <number>.\n\nQuestion: {question}\n\nAnswer:",
+  "selection": {
+    "version": "q2-fp32-quality-v1",
+    "seed": 0,
+    "prompt_tokens_min": 1,
+    "prompt_tokens_max": 512,
+    "evaluation_count": 64,
+    "feasibility_count": 2,
+    "source_id": "{revision}/main/test/{zero_based_row_index}",
+    "key": "sha256(canonical_compact_json([version,seed,source_id]))",
+    "order": "sort by (key,source_id); first64 evaluation, next2 feasibility; execute feasibility then evaluation"
+  },
+  "parser": {
+    "version": "q2-final-number-line-v1",
+    "grammar": "[ \\t]*####[ \\t]+([+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\\.[0-9]+)?)[ \\t]*",
+    "line_policy": "last fully matching LF line, optional terminal CR; end-of-generation terminates a line",
+    "normalization": "valid grouped commas removed; exact Decimal equality; no floats",
+    "invalid_answer": "incorrect",
+    "execution_failure": "incomplete"
+  },
+  "tokenizer": {
+    "version": "0.21.4",
+    "add_special_tokens": false,
+    "padding": false,
+    "truncation": false,
+    "skip_special_tokens": false,
+    "scoring_eos": "remove only terminal actual EOS0 for stop before decode",
+    "eos_token_id": 0
+  },
+  "controls": {
+    "gpu_ids": null,
+    "gpu_uuid": null,
+    "affinity": null,
+    "cpu_threads": 1,
+    "interop_threads": 1,
+    "seed": 0,
+    "dtype": "float32",
+    "numa_policy": "inherit-verified-parent-binding",
+    "residency_policy": "one-worker-one-model-one-pool",
+    "cache_policy": "reset-request-retain-allocator",
+    "environment_policy": "same-prepared-Q1-environment"
+  },
+  "arithmetic": {
+    "allow_tf32": false,
+    "allow_bf16_reduced_precision_reduction": false,
+    "allow_fp16_reduced_precision_reduction": false
+  },
+  "engine": {
+    "attention_backend": "triton",
+    "sampling": {
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "seed": 0,
+      "min_loops": 4,
+      "max_loops": 4,
+      "exit_threshold": 1.0,
+      "ignore_eos": false
+    },
+    "cache": {
+      "num_blocks": 192,
+      "block_size": 16
+    },
+    "scheduler": {
+      "max_num_seqs": 1,
+      "max_num_batched_tokens": 128,
+      "mode": "refill",
+      "min_coda_batch_size": 1
+    }
+  },
+  "limits": {
+    "workers": 1,
+    "model_loads": 1,
+    "executions": 66,
+    "feasibility_executions": 2,
+    "evaluation_executions": 64,
+    "total_timeout_s": 7200,
+    "case_timeout_s": 600,
+    "case_bytes_max": 2097152,
+    "artifact_bytes_max": 268435456,
+    "profile_bytes_max": 0,
+    "tensor_bytes_max": 0
+  },
+  "finite_checks": {
+    "feasibility": "full recurrent and coda hooks",
+    "evaluation": "one lm_head finite check before sampling per actual output"
+  },
+  "comparisons": [],
+  "paired_qualification": "not_applicable:F32_baseline_only",
+  "blocked_configurations": {
+    "B16": "Q1 BF16 numerical qualification failed",
+    "A16": "Q1 BF16 numerical qualification failed"
+  },
+  "acceptance": {
+    "completion": "all2feasibility+64evaluation records and cleanup within frozen bounds",
+    "scoring": "offline reproduce IDs-to-text/parser/outcomes with denominator64",
+    "quality_floor": null,
+    "speed_claim": false,
+    "issue_closure": false
+  }
+}

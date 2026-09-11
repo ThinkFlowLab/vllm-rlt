@@ -1,0 +1,1177 @@
+{
+  "answer_rescoring": false,
+  "artifact_type": "q2_quality_posthoc_format_inventory",
+  "evaluation_records": 64,
+  "finish_counts": {
+    "length": 57,
+    "stop": 7
+  },
+  "gpu_runs_added": 0,
+  "limitations": [
+    "Post-hoc lexical flags overlap; they are not semantic or correctness judgments.",
+    "The original strict parser, fixed denominator and 256-output cap are unchanged.",
+    "This inventory cannot localize an engine defect or establish checkpoint task accuracy.",
+    "Long-history native/official and alternative-template/output-budget runs remain unexecuted."
+  ],
+  "overlapping_format_flag_counts": {
+    "contains_chat_end": 42,
+    "contains_chat_start": 40,
+    "contains_four_hashes": 17,
+    "contains_question_heading": 11,
+    "contains_short_hash_line": 11
+  },
+  "parser_counts": {
+    "malformed_marker": 10,
+    "missing_marker": 48,
+    "parsed": 6
+  },
+  "primary_accuracy_unchanged": {
+    "correct": 4,
+    "fraction": 0.0625,
+    "total": 64
+  },
+  "primary_report": {
+    "sha256": "cd430dd4a710c2a188e04a37693c60210d9c7d1160e182404ae188c4f25a33ba",
+    "size_bytes": 74348
+  },
+  "records": [
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/171",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "ded2d85a714d4d397fdb1559e39a1cc466982753d5e5dfdcf84143b833d27834",
+        "size_bytes": 7749
+      },
+      "run_id": "F-eval-00"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/244",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "bf6e270d53b30a44458457ae498119e8a845a511a858d5df990d67e52d8d495e",
+        "size_bytes": 8742
+      },
+      "run_id": "F-eval-01"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/787",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "adb19acf682b3f66e277f016080b3015d93fcc7afd060663e15d3cce5b80022e",
+        "size_bytes": 8489
+      },
+      "run_id": "F-eval-02"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1297",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "f7d2ffdc7d1a43c11f46e86fc2551a36e2ca2357f3a436f50d0098cda5b60f78",
+        "size_bytes": 9110
+      },
+      "run_id": "F-eval-03"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/534",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "560502273729419cd634e61e99e13d7e79e87b77ce987f0aeddd003552500f1e",
+        "size_bytes": 9116
+      },
+      "run_id": "F-eval-04"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/872",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "e938c6a8049df87c24ecc116e9ebe0eeb98bd8fb1f7e78306e83ce0917af431b",
+        "size_bytes": 8502
+      },
+      "run_id": "F-eval-05"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/400",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "9cb59fc644aaa82236dbadb2c0508ee66817acb6ff7e6bd60a7d8cfebf9a3a2f",
+        "size_bytes": 8484
+      },
+      "run_id": "F-eval-06"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/840",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "bf06dc5ef144cedd9b73bab2f2d1f40e3474f930a6ad507487b54f8fca402b36",
+        "size_bytes": 9010
+      },
+      "run_id": "F-eval-07"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/559",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "4d1060c19cd9cbf68281083e557fdde41518f402d7dbc3ecce0e1d41694f27ed",
+        "size_bytes": 9041
+      },
+      "run_id": "F-eval-08"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/557",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "d6593661c8b9284a4134669df9e4354be509e9d87f9e7545ae8b43dbb0e76ade",
+        "size_bytes": 8527
+      },
+      "run_id": "F-eval-09"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1051",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "624d50c1e7eea28872ef2f72546aaa6864d7fef92059c83b0c2f69317d6b6b58",
+        "size_bytes": 8437
+      },
+      "run_id": "F-eval-10"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/247",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": false,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "be2087fb8c1acfc8cd8d404f42288f399c4bcb10064502623383113f0b65bf15",
+        "size_bytes": 4662
+      },
+      "run_id": "F-eval-11"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/530",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "314b7eb1cc0eec05a3bb68c2cda3411fe332589ad5bc307a7912a96549917fee",
+        "size_bytes": 8952
+      },
+      "run_id": "F-eval-12"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/608",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "e6fb44b7e3e147d0227562347e722bf84a7e8495c8698a7ea6c320a0c8ba7c94",
+        "size_bytes": 8793
+      },
+      "run_id": "F-eval-13"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1201",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": true,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "4a9093f0887015d9edf886f5e2f72386b50f41fa2e06f9a4d38c3603d7efc111",
+        "size_bytes": 8880
+      },
+      "run_id": "F-eval-14"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/2",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "8fd984d1130b1af46daf2a00ca44e13f482bbf5a328da5998aafaa6be7024691",
+        "size_bytes": 8561
+      },
+      "run_id": "F-eval-15"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/618",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "543062d7ae439b3456e326d81adf56db3ca6d1c354140f433b019fe582afed14",
+        "size_bytes": 8891
+      },
+      "run_id": "F-eval-16"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/30",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "ea675bb9665f5999a3b3d5cc3106b0f4c6477ec33d5d8bb8cd689320881af7f3",
+        "size_bytes": 8096
+      },
+      "run_id": "F-eval-17"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/695",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": true,
+        "contains_question_heading": true,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "a755c32fd3a6229eec6fefdf57a7ccaa769f3a7db341d66ecfb368af359d7e44",
+        "size_bytes": 8292
+      },
+      "run_id": "F-eval-18"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/913",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "127e9d194f628e4c1edc1ec52233bdd5d45bde499d94153db19634f843c2e663",
+        "size_bytes": 9066
+      },
+      "run_id": "F-eval-19"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/379",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "97190310d5846940b37dee92a41032510323d6b6328e04a3b591b17bfa0efc0a",
+        "size_bytes": 8205
+      },
+      "run_id": "F-eval-20"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/72",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "55f30212530122fab193269b64f054224cc1c81820bbe11354ff938ebe6eb157",
+        "size_bytes": 8397
+      },
+      "run_id": "F-eval-21"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1052",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "f1da4faf51cf8a8e8e8bfcab5225cbe5643bf40c922c01b072847909c6082479",
+        "size_bytes": 8333
+      },
+      "run_id": "F-eval-22"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/975",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "b4d46c75a1d782c9337c69f82730620df3f99b9f5eb3f21931ad17ddb3a59986",
+        "size_bytes": 8616
+      },
+      "run_id": "F-eval-23"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/797",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "ff2669cf5a4b291b136c65a43f6cbcdce55d5a2b4fc4870e0ed1b68ad61eee6c",
+        "size_bytes": 8849
+      },
+      "run_id": "F-eval-24"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/459",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "cac99941b9792fedb180488ae736704c8ad640c030d1c73a11bb9e9c0bebc43d",
+        "size_bytes": 8640
+      },
+      "run_id": "F-eval-25"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1173",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "d0bc4fec17dae52d31d6ec05b553b2000e751ef940e9c02c9b82c4759d10ca93",
+        "size_bytes": 8747
+      },
+      "run_id": "F-eval-26"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/895",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "762f7dbc12b1f91a65ed15dc08ab9d50adc42ecc31fcc82ce1a2d7e06b0e0e22",
+        "size_bytes": 8690
+      },
+      "run_id": "F-eval-27"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/463",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "0e6eb21f720101ad043f724e6ec35b5638f69751f8ee2e695d946f06ef69dfe7",
+        "size_bytes": 8315
+      },
+      "run_id": "F-eval-28"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/682",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "1715dd6da97ad5fc56922cf695c95135a37b677d872aa71a500515fbe755eb88",
+        "size_bytes": 8552
+      },
+      "run_id": "F-eval-29"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/368",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "5a8fc4f406e69779b8207546afab01752370f93d641590c6f52c8fdbab0a4f35",
+        "size_bytes": 8410
+      },
+      "run_id": "F-eval-30"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1237",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "cffaa8a4bf628d2b2c2e94a8d7f943262de60d0c9dde32a3d5daaaa720daa515",
+        "size_bytes": 8628
+      },
+      "run_id": "F-eval-31"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1315",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "fa9aaa812f4c8620f120bc15a65514689bd92e48b0b8775c783781bff5c6ea26",
+        "size_bytes": 9251
+      },
+      "run_id": "F-eval-32"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/732",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "e46a924442d943154d0a234f44a872bffb0f57758226268570f94d36e2ad9bdf",
+        "size_bytes": 8414
+      },
+      "run_id": "F-eval-33"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/469",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "817a28201c675faba200384d9814add9a78dd23cf3e4b56eda65803fc28f2672",
+        "size_bytes": 8727
+      },
+      "run_id": "F-eval-34"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1178",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "ca841d4c1f82984836e8975b47cb4459ecd5ff01762e3cb8aafb85f336716690",
+        "size_bytes": 7566
+      },
+      "run_id": "F-eval-35"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/824",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "06f3692be42e62d9c7702ce1f35d5a8d0e826ec2296c46f1bedd5ef79e7d0ecc",
+        "size_bytes": 8628
+      },
+      "run_id": "F-eval-36"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/651",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "18538d7f4e359166752ec1a2a6d0f1926907fbfb1ff53a139bb375d502779130",
+        "size_bytes": 8378
+      },
+      "run_id": "F-eval-37"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/537",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "e52443bca9c7b274119f04dff403f5fb2b7415fdbe380d3396cd2dcf714ea1af",
+        "size_bytes": 8394
+      },
+      "run_id": "F-eval-38"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/436",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "be477bd7690e5b4e12c565264d56b0c2a993743b0989040c9829dfc6719d2202",
+        "size_bytes": 8435
+      },
+      "run_id": "F-eval-39"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1113",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "f6e5eaf30d8de42e45b588524efba07d7508a0b9f892894988c7239d2964dc3e",
+        "size_bytes": 8472
+      },
+      "run_id": "F-eval-40"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/855",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "9fb5cec1802e1029c54a48030a94b0c7c61f05b4137073870e79320fcc86ed4a",
+        "size_bytes": 8450
+      },
+      "run_id": "F-eval-41"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1228",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "2833fe99e698f0906b1b3e722423b374e152614c10c5452b8f7322d76216d993",
+        "size_bytes": 7066
+      },
+      "run_id": "F-eval-42"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1041",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "abae404bd354f212553e2af95c2e9feacc708e3dc8c81647193b8e128d61a560",
+        "size_bytes": 8596
+      },
+      "run_id": "F-eval-43"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1186",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "a637a81e6d980cf7db4206c18dccd15113b9159c38e70c9845b7c487d0a062ab",
+        "size_bytes": 8643
+      },
+      "run_id": "F-eval-44"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/452",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "055f5e59ce5c8bd170c0c6365fa82407c18c0c95a3ed53182da2556e3fb4af9c",
+        "size_bytes": 8323
+      },
+      "run_id": "F-eval-45"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1239",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "0f032f17dd0abd44c0ffbccf72095f5d5ab0acc80aad4b06388aefb52b484891",
+        "size_bytes": 8494
+      },
+      "run_id": "F-eval-46"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/125",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "353f7a1d6e0c10bcdeef87f9ee9b4b056580098950d6cf320a1cc49a26faa025",
+        "size_bytes": 9105
+      },
+      "run_id": "F-eval-47"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1314",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "8ea110bbe0be10fdeb0f0d9d470733d283b4fb8dcf0c4ba18ccd20d77e5b9f8c",
+        "size_bytes": 8730
+      },
+      "run_id": "F-eval-48"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1223",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "23dde381aea8e255d3dd5e259c74224a328af369513e992533ca9aa906622b7e",
+        "size_bytes": 8380
+      },
+      "run_id": "F-eval-49"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/726",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "e6686532e4eabfb440ff6e6b31d75cfdb54d1de23e71c78a7790456db2153c16",
+        "size_bytes": 8933
+      },
+      "run_id": "F-eval-50"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/35",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "634ff4ed150cb286ceed237926bdbb1435199163bf4448c4293b598434d27c46",
+        "size_bytes": 8529
+      },
+      "run_id": "F-eval-51"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/23",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "01b51454c21f2c216d0fce0f16e3dcb73650be23cde363c9b7bfb464073ee7c6",
+        "size_bytes": 8367
+      },
+      "run_id": "F-eval-52"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/958",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "a742dcf956faeec8f13bf6c712f4a68732238713815f5bce0a51f31a87b124c6",
+        "size_bytes": 8530
+      },
+      "run_id": "F-eval-53"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/899",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "c7521f8033c3251c498ddab78e1e3dd17d4bca012d49284a35163f060025cb13",
+        "size_bytes": 6479
+      },
+      "run_id": "F-eval-54"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/304",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "c56ec93011cb25b8d2dfaf5cd0ea4acf3422504daca0b44ee8330ab000cc864f",
+        "size_bytes": 8671
+      },
+      "run_id": "F-eval-55"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/136",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": true,
+        "contains_question_heading": true,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "1d56953e6b5f5ec013f78aa051dd6c3f8d8756cd125dcb43ae0c0a2343bd664d",
+        "size_bytes": 8799
+      },
+      "run_id": "F-eval-56"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/47",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "98c5a708819f772dc9a567dd9de2e22e7a35492408a051e3b257c146b6f17335",
+        "size_bytes": 8057
+      },
+      "run_id": "F-eval-57"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1050",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "408efefb048fa489681fa95dd5745e3c49acb973c0b40f195d27cea893afde19",
+        "size_bytes": 8594
+      },
+      "run_id": "F-eval-58"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1269",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "666b9578f2c8a100e249dad8588ef813249fc447f0d5a141ae85d01ee197aa83",
+        "size_bytes": 8647
+      },
+      "run_id": "F-eval-59"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/143",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "malformed_marker",
+      "result": {
+        "sha256": "3eace98fdf17cd09cec64871ead1546b8e6f5a15a2af53a6dcb37212ac3a0b7e",
+        "size_bytes": 8595
+      },
+      "run_id": "F-eval-60"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/25",
+      "finish_reason": "stop",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": false,
+        "contains_four_hashes": true,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "parsed",
+      "result": {
+        "sha256": "de12f88ea3cb68a64cc9c51bc6c4867fba2b12f7c556c3a6bc09e4f45d9deeb8",
+        "size_bytes": 7538
+      },
+      "run_id": "F-eval-61"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/1254",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": true,
+        "contains_chat_start": true,
+        "contains_four_hashes": false,
+        "contains_question_heading": false,
+        "contains_short_hash_line": false
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "a845a1f80c13da76e8e4074fdff84ef61b545364391d4371f3e7116fe61adb49",
+        "size_bytes": 9107
+      },
+      "run_id": "F-eval-62"
+    },
+    {
+      "example_id": "740312add88f781978c0658806c59bc2815b9866/main/test/932",
+      "finish_reason": "length",
+      "format_flags": {
+        "contains_chat_end": false,
+        "contains_chat_start": false,
+        "contains_four_hashes": false,
+        "contains_question_heading": true,
+        "contains_short_hash_line": true
+      },
+      "original_parser_status": "missing_marker",
+      "result": {
+        "sha256": "8cdd25999698462c255e0fb0fb23c7855d56bde217bada14c9960766e571d7af",
+        "size_bytes": 7902
+      },
+      "run_id": "F-eval-63"
+    }
+  ],
+  "schema_version": 1,
+  "tokenizer_interface": {
+    "bos_token": "<|endoftext|>",
+    "chat_template_present": true,
+    "chat_template_sha256": "609d03c963c8d8d0519c9212df62280bc6dd561013259c3b6cd0ee43f7910f58",
+    "eos_token": "<|endoftext|>",
+    "files": {
+      "README.md": {
+        "sha256": "b819245a8c6036917de6eeb2468f515619dfe25a00f5ecc01eae08dea9118bec",
+        "size_bytes": 4348
+      },
+      "config.json": {
+        "sha256": "ce9cc13da41591b8b4deca053d7dfee06424c0228628ee862ea86d725bc163f3",
+        "size_bytes": 1472
+      },
+      "special_tokens_map.json": {
+        "sha256": "55087bb8409060d9cb0f80495e34f4e0d8a84f68a799a6b0cab3132be0aae319",
+        "size_bytes": 825
+      },
+      "tokenizer.json": {
+        "sha256": "fcb808fe5e7642f5299be28aea07fc7f6d4f4364c3ac5e408e15a772cbc8fa8d",
+        "size_bytes": 3522644
+      },
+      "tokenizer_config.json": {
+        "sha256": "7e010da95d71b0fa1aa809552922c74cc1dd98d628f21ba39ca6c35aa18d5d91",
+        "size_bytes": 4211
+      }
+    },
+    "model_bos_token_id": 0,
+    "model_eos_token_id": 0,
+    "post_processor": null,
+    "special_tokens": [
+      {
+        "content": "<|endoftext|>",
+        "id": 0,
+        "special": true
+      },
+      {
+        "content": "<|im_start|>",
+        "id": 1,
+        "special": true
+      },
+      {
+        "content": "<|im_end|>",
+        "id": 2,
+        "special": true
+      }
+    ],
+    "tokenizer_class": "GPT2Tokenizer"
+  }
+}
