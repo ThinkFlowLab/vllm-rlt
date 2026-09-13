@@ -58,6 +58,10 @@ class _PreparedKVBatch:
     owner: "KVCacheManager"
     rows: tuple[tuple[_Allocation, int, int], ...]
     allocations: tuple[tuple[str, _Allocation], ...]
+    row_count: int
+    live_rows: tuple[int, ...]
+    # None preserves the compact path without another transfer or mask launch.
+    active: torch.Tensor | None
     position_ids: torch.Tensor
     write_blocks: torch.Tensor
     write_offsets: torch.Tensor
@@ -252,6 +256,9 @@ class KVCacheManager:
             owner=self,
             rows=rows,
             allocations=tuple(allocations.items()),
+            row_count=len(rows),
+            live_rows=tuple(range(len(rows))),
+            active=None,
             position_ids=torch.tensor(
                 [position for _, _, position in rows], device=self.device, dtype=torch.long
             ),
@@ -268,6 +275,64 @@ class KVCacheManager:
                 [position + 1 for _, _, position in rows], device=self.device, dtype=torch.int32
             ),
             writable=for_write,
+        )
+
+    def _pad_prepared(
+        self,
+        batch: _PreparedKVBatch,
+        *,
+        row_indices: Sequence[int],
+        row_count: int,
+        table_width: int,
+    ) -> _PreparedKVBatch:
+        """Borrow live rows into physical slots; inactive addresses are never valid.
+
+        The host map is the sole source of the device mask. The resulting
+        tensors are private, read-only metadata, just like a compact batch's.
+        This eager helper creates no allocation or initialized KV position.
+        """
+        self._require_live_batch(batch)
+        for name, value in (("row_count", row_count), ("table_width", table_width)):
+            if not isinstance(value, Integral) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        live_rows = tuple(row_indices)
+        if len(live_rows) != len(batch.rows):
+            raise ValueError("row_indices must map every live row exactly once")
+        if any(
+            not isinstance(row, Integral) or isinstance(row, bool) or not 0 <= row < row_count
+            for row in live_rows
+        ) or len(set(live_rows)) != len(live_rows):
+            raise ValueError("row_indices must be unique integers within row_count")
+        width = max((position // self.block_size + 1 for _, _, position in batch.rows), default=0)
+        if table_width < width:
+            raise ValueError("table_width cannot truncate a live row's causal history")
+        live_rows = tuple(int(row) for row in live_rows)
+        positions, lengths = [0] * row_count, [0] * row_count
+        blocks, offsets = [-1] * row_count, [-1] * row_count
+        tables = [[-1] * table_width for _ in range(row_count)]
+        active = [False] * row_count
+        for row, (allocation, depth, position) in zip(live_rows, batch.rows):
+            active[row] = True
+            positions[row], lengths[row] = position, position + 1
+            blocks[row] = allocation.block_tables[depth][position // self.block_size]
+            offsets[row] = position % self.block_size
+            table = allocation.block_tables[depth][:table_width]
+            tables[row][: len(table)] = table
+        return _PreparedKVBatch(
+            owner=self,
+            rows=batch.rows,
+            allocations=batch.allocations,
+            row_count=int(row_count),
+            live_rows=live_rows,
+            active=torch.tensor(active, device=self.device, dtype=torch.bool),
+            position_ids=torch.tensor(positions, device=self.device, dtype=torch.long),
+            write_blocks=torch.tensor(blocks, device=self.device, dtype=torch.long),
+            write_offsets=torch.tensor(offsets, device=self.device, dtype=torch.long),
+            block_tables=torch.tensor(tables, device=self.device, dtype=torch.int32).reshape(
+                row_count, table_width
+            ),
+            context_lengths=torch.tensor(lengths, device=self.device, dtype=torch.int32),
+            writable=batch.writable,
         )
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
@@ -317,12 +382,34 @@ class KVCacheManager:
         self._require_live_batch(batch)
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")
-        self._validate_tensor(k, len(batch.rows), "k")
-        self._validate_tensor(v, len(batch.rows), "v")
+        self._validate_tensor(k, batch.row_count, "k")
+        self._validate_tensor(v, batch.row_count, "v")
         if not batch.rows:
             return
-        self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
-        self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+        if len(batch.rows) == batch.row_count:
+            self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k
+            self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v
+        elif self.backend == "triton":
+            from vllm_lt.kernels.triton_kv_write import masked_kv_write
+
+            masked_kv_write(
+                self.key_cache[:, layer],
+                self.value_cache[:, layer],
+                batch.write_blocks,
+                batch.write_offsets,
+                k,
+                v,
+                batch.active,
+            )
+        else:
+            # Diagnostic eager Torch padding only: Python indexing may transfer
+            # indices per layer. The production Triton path stays above.
+            # Select live source rows before indexing addresses: -1 must never
+            # alias a real page or token through advanced indexing.
+            live = list(batch.live_rows)
+            blocks, offsets = batch.write_blocks[live], batch.write_offsets[live]
+            self.key_cache[blocks, layer, offsets] = k[live]
+            self.value_cache[blocks, layer, offsets] = v[live]
         for allocation, depth, position in batch.rows:
             allocation.written[depth][layer].add(position)
 
@@ -355,19 +442,22 @@ class KVCacheManager:
     ) -> torch.Tensor:
         self._validate_layer(layer)
         self._require_live_batch(batch)
-        self._validate_tensor(q, len(batch.rows), "q", query=True)
+        self._validate_tensor(q, batch.row_count, "q", query=True)
         if not batch.rows:
-            return torch.empty_like(q)
+            return torch.zeros_like(q)
         for allocation, depth, position in batch.rows:
             self._require_prefix(allocation, layer, depth, position + 1)
         attention = triton_paged_attention if self.backend == "triton" else torch_paged_attention
-        return attention(
+        args = (
             q,
             self.key_cache[:, layer],
             self.value_cache[:, layer],
             batch.block_tables,
             batch.context_lengths,
         )
+        if len(batch.rows) == batch.row_count:
+            return attention(*args)
+        return attention(*args, active=batch.active)
 
     @torch.no_grad()
     def finalize_token(self, request_id: str, position: int, exit_depth: int) -> None:

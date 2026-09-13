@@ -124,7 +124,9 @@ gpu run --gpu-ids <available-id> --timeout 10m --note "vllm-lt kernel tests" -- 
 
 Core tests cover model numerics against a dense reference, attention, KV isolation
 and reuse, scheduling, cancellation, checkpoint loading, and sampling.
-The one-off M1/Q1 harnesses and their tests have been removed.
+Inactive-row tests cover masked attention/KV writes, poisoned padding, live-state
+publication, sampling isolation and compact-versus-padded execution.
+The one-off milestone harnesses and their tests have been removed.
 
 Historical [numerical results](https://github.com/hsliuustc0106/vllm-lt/blob/f0dfe5f71b83965a86fbda9cece3cb94dd0389ec/docs/validation.md)
 include passing FP32 comparisons and BF16 logit-tolerance failures. Measurements

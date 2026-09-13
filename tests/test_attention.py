@@ -85,7 +85,7 @@ def test_long_context_reference_is_numerically_stable():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [7, 32, 64, 128])
+@pytest.mark.parametrize("head_dim", [7, 32, 64, 128, 256])
 def test_triton_matches_dense_on_reserved_gpu(dtype, head_dim):
     run_mixed_batch_case("cuda", "triton", dtype, head_dim)
 

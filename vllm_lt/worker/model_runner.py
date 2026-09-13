@@ -43,12 +43,11 @@ class ModelRunner:
             return None
         hidden = torch.stack([r.hidden_state for r in requests])
         if batch.stage == Stage.RECURRENT:
-            hidden, gate_logits = self.model.recurrent(
+            hidden, gate_logits = self._recurrent(
                 hidden,
                 [r.request_id for r in requests],
                 [r.loops_done for r in requests],
                 [r.position for r in requests],
-                self.cache_manager,
             )
             for request, state in zip(requests, hidden):
                 request.hidden_state = state
@@ -58,6 +57,39 @@ class ModelRunner:
             logits = self.model.coda(hidden)
             return [self._sample(row, request) for row, request in zip(logits, requests)]
         raise ValueError(f"unsupported execution stage {batch.stage}")
+
+    def _recurrent(self, hidden, request_ids, depths, positions):
+        """Private decode seam; normal generation always uses compact rows."""
+        return self.model.recurrent(hidden, request_ids, depths, positions, self.cache_manager)
+
+    def _recurrent_padded(
+        self,
+        hidden,
+        request_ids,
+        depths,
+        positions,
+        *,
+        row_indices,
+        row_count,
+        table_width,
+    ):
+        """Exercise padding eagerly, returning only live rows in scheduler order.
+
+        No scheduler item, coda input or request generator is manufactured for
+        padding. Gathered output owns storage independently of the physical
+        traversal, which may outlive publication to a paused request.
+        """
+        if hidden.ndim != 2 or hidden.shape != (len(request_ids), self.model.config.hidden_size):
+            raise ValueError("padded recurrent requires compact live hidden inputs")
+        batch = self.cache_manager._prepare_batch(request_ids, depths, positions)
+        batch = self.cache_manager._pad_prepared(
+            batch, row_indices=row_indices, row_count=row_count, table_width=table_width
+        )
+        live = torch.tensor(batch.live_rows, device=self.device, dtype=torch.long)
+        physical = hidden.new_zeros((row_count, hidden.shape[1]))
+        physical.index_copy_(0, live, hidden)
+        physical, gates = self.model._recurrent_prepared(physical, batch, self.cache_manager)
+        return physical.index_select(0, live), gates.index_select(0, live)
 
     def _sample(self, logits: torch.Tensor, request: Request) -> int:
         params = request.sampling_params
