@@ -17,6 +17,7 @@ def _paged_attention_kernel(
     V,
     TABLES,
     LENGTHS,
+    ACTIVE,
     OUT,
     q_batch_stride: tl.constexpr,
     q_head_stride: tl.constexpr,
@@ -30,6 +31,7 @@ def _paged_attention_kernel(
     v_head_stride: tl.constexpr,
     v_dim_stride: tl.constexpr,
     table_stride: tl.constexpr,
+    active_stride: tl.constexpr,
     out_batch_stride: tl.constexpr,
     out_head_stride: tl.constexpr,
     out_dim_stride: tl.constexpr,
@@ -39,15 +41,19 @@ def _paged_attention_kernel(
     SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    HAS_ACTIVE: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
     kv_head = head // HEAD_GROUPS
-    length = tl.load(LENGTHS + row)
+    enabled = True
+    if HAS_ACTIVE:
+        enabled = tl.load(ACTIVE + row * active_stride)
+    length = tl.load(LENGTHS + row, mask=enabled, other=0)
     dims = tl.arange(0, BLOCK_D)
     query = tl.load(
         Q + row * q_batch_stride + head * q_head_stride + dims * q_dim_stride,
-        mask=dims < HEAD_DIM,
+        mask=enabled & (dims < HEAD_DIM),
         other=0,
     ).to(tl.float32)
     maximum = -float("inf")
@@ -90,13 +96,17 @@ def _paged_attention_kernel(
         maximum = next_maximum
     tl.store(
         OUT + row * out_batch_stride + head * out_head_stride + dims * out_dim_stride,
-        accumulator / normalizer,
+        accumulator / tl.where(enabled, normalizer, 1.0),
         mask=dims < HEAD_DIM,
     )
 
 
-def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
-    """Launch over [batch row, query head]; inputs are validated by the manager."""
+def paged_attention(q, key_cache, value_cache, block_tables, context_lengths, active=None):
+    """Launch over [batch row, query head]; inputs are validated by the manager.
+
+    Enabled rows require context length >= 1 and initialized KV prefixes.
+    Only inactive rows may have zero length; masking supplies their finite zero.
+    """
     output = torch.empty_like(q)
     if q.shape[0] == 0:
         return output
@@ -106,11 +116,13 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
         value_cache,
         block_tables,
         context_lengths,
+        active,
         output,
         *q.stride(),
         *key_cache.stride(),
         *value_cache.stride(),
         block_tables.stride(0),
+        active.stride(0) if active is not None else 0,
         *output.stride(),
         HEAD_DIM=q.shape[-1],
         HEAD_GROUPS=q.shape[1] // key_cache.shape[2],
@@ -118,6 +130,7 @@ def paged_attention(q, key_cache, value_cache, block_tables, context_lengths):
         SCALE=q.shape[-1] ** -0.5,
         BLOCK_D=triton.next_power_of_2(q.shape[-1]),
         BLOCK_T=32,
+        HAS_ACTIVE=active is not None,
         num_warps=4,
     )
     return output

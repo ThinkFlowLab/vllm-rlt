@@ -202,13 +202,41 @@ class OuroForCausalLM(nn.Module):
         # Internal model/cache traversal contract: descriptor ownership and
         # allocation identity are checked again by every prepared layer call.
         batch = cache._prepare_batch(request_ids, depths, positions)
+        return self._recurrent_prepared(hidden, batch, cache)
+
+    def _recurrent_prepared(
+        self, hidden: torch.Tensor, batch: "_PreparedKVBatch", cache: "KVCacheManager"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Eager borrowed traversal with explicit inactive physical rows.
+
+        Host ownership and layer bookkeeping remain outside any graph contract.
+        Padding changes the dense row shape, so active results need numerical
+        qualification even though rows do not interact mathematically.
+        """
+        cache._require_live_batch(batch)
+        if hidden.ndim != 2 or hidden.shape != (batch.row_count, self.config.hidden_size):
+            raise ValueError(
+                "prepared recurrent expects hidden with shape [row_count, hidden_size]"
+            )
+        if not batch.rows:
+            return torch.zeros_like(hidden), hidden.new_zeros(batch.row_count)
+        inactive = None
+        if len(batch.rows) != batch.row_count:
+            inactive = ~batch.active
+            # Multiplication would preserve poison NaNs in inactive inputs.
+            hidden = hidden.masked_fill(inactive[:, None], 0.0)
         position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
         for layer in self.model.layers:
             hidden = layer(hidden, position_embeddings, batch, cache)
         # Norm is inside the recurrence in Ouro; this normalized state is the
         # next loop's input as well as the gate and LM head input.
         hidden = self.model.norm(hidden)
-        return hidden, self.model.early_exit_gate(hidden).squeeze(-1)
+        gate_logits = self.model.early_exit_gate(hidden).squeeze(-1)
+        if inactive is not None:
+            hidden = hidden.masked_fill(inactive[:, None], 0.0)
+            # The gate has a bias; zero hidden alone does not define padding.
+            gate_logits = gate_logits.masked_fill(inactive, 0.0)
+        return hidden, gate_logits
 
     def coda(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

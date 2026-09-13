@@ -40,6 +40,7 @@ class LLMEngine:
         prompt_token_ids: list[int],
         sampling_params: SamplingParams | None = None,
     ):
+        self.model_runner._require_execution_usable()
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
@@ -67,9 +68,11 @@ class LLMEngine:
         return self.scheduler.has_unfinished_requests
 
     def abort_request(self, request_id: str) -> RequestOutput:
+        self.cache_manager._require_usable()
         return RequestOutput.from_request(self.scheduler.abort(request_id))
 
     def step(self) -> list[RequestOutput]:
+        self.model_runner._require_execution_usable()
         batch = self.scheduler.schedule()
         self.last_schedule = batch
         if batch is None:
@@ -77,11 +80,21 @@ class LLMEngine:
         try:
             result = self.model_runner.execute(batch)
             return self._update(batch, result)
-        except Exception:
-            # A failed execution may have partially written KV; invalidate the affected requests.
-            for item in batch.items:
-                if item.request.request_id in self.scheduler.requests:
-                    self.scheduler.abort(item.request.request_id)
+        except BaseException as error:
+            if not isinstance(error, Exception) and self.model_runner._persistent is None:
+                # Preserve the compact engine's existing interrupt behavior.
+                raise
+            # Finalization in _update can submit work after the runner's gate
+            # readback. Settle that work too, before returning pages to the pool.
+            if self.model_runner._settle_persistent_failure(error):
+                for item in batch.items:
+                    if item.request.request_id in self.scheduler.requests:
+                        try:
+                            self.scheduler.abort(item.request.request_id)
+                        except BaseException as cleanup_error:
+                            self.model_runner._record_cleanup_failure(cleanup_error)
+                            break
+            # Cleanup must never replace the original execution exception.
             raise
 
     def _update(self, batch, result) -> list[RequestOutput]:

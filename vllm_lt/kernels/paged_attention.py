@@ -9,19 +9,35 @@ import math
 import torch
 
 
+def _validate_active(active, q):
+    if active is not None and (
+        not isinstance(active, torch.Tensor)
+        or active.shape != (q.shape[0],)
+        or active.dtype != torch.bool
+        or active.device != q.device
+    ):
+        raise ValueError("active must be a bool tensor with shape [batch] on the query device")
+
+
 def torch_paged_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference attention over [physical block, token, KV head, dimension]."""
+    _validate_active(active, q)
     output = torch.empty_like(q)
+    enabled = None if active is None else active.tolist()
     block_size = key_cache.shape[1]
     head_groups = q.shape[1] // key_cache.shape[2]
     scale = 1.0 / math.sqrt(q.shape[-1])
     for row, length in enumerate(context_lengths.tolist()):
+        if enabled is not None and not enabled[row]:
+            output[row].zero_()
+            continue
         token_positions = torch.arange(length, device=q.device)
         blocks = block_tables[row, token_positions // block_size]
         offsets = token_positions % block_size
@@ -39,8 +55,10 @@ def triton_paged_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
+    active: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch explicitly to Triton, with no silent reference fallback."""
+    _validate_active(active, q)
     if q.device.type != "cuda":
         raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
     if q.shape[-1] > 256:
@@ -48,4 +66,4 @@ def triton_paged_attention(
     # Keep Triton optional and avoid loading its runtime for CPU-only callers.
     from vllm_lt.kernels.triton_attention import paged_attention
 
-    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths)
+    return paged_attention(q, key_cache, value_cache, block_tables, context_lengths, active)
