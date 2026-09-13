@@ -235,12 +235,15 @@ def test_failed_execution_stops_plan_without_retry_or_later_run(
 
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_capacity_preflight_uses_meta_parameters_and_rejects_impossible_pool(
-    monkeypatch, cuda_boundaries, headroom
+    monkeypatch, cuda_boundaries, headroom, dtype
 ):
     config = OuroConfig.tiny()
     original = runner.OuroForCausalLM
-    weight_bytes = sum(parameter.numel() * 4 for parameter in original(config).parameters())
+    weight_bytes = sum(
+        parameter.numel() * dtype.itemsize for parameter in original(config).parameters()
+    )
     pool_bytes = 1024
     minimum = weight_bytes + pool_bytes
     observed = []
@@ -252,7 +255,11 @@ def test_capacity_preflight_uses_meta_parameters_and_rejects_impossible_pool(
 
     monkeypatch.setattr(runner, "OuroForCausalLM", sizing)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (minimum + headroom, minimum * 2))
-    plan = {"model_config": config.to_dict(), "workload_stats": {"cpu": {"pool_bytes": pool_bytes}}}
+    plan = {
+        "model_config": config.to_dict(),
+        "workload_stats": {"cpu": {"pool_bytes": pool_bytes}},
+        "contract": {"engine": {"dtype": str(dtype).removeprefix("torch.")}},
+    }
     if headroom <= 0:
         with pytest.raises(ValueError, match="insufficient device memory"):
             runner.capacity_check(plan)

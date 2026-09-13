@@ -45,11 +45,12 @@ def capacity_check(plan):
     """Reject an impossible resident model/pool before allocating either tensor set."""
     with torch.device("meta"):
         sizing = OuroForCausalLM(OuroConfig.from_dict(plan["model_config"]))
-    weights = sum(parameter.numel() * 4 for parameter in sizing.parameters())
+    dtype = getattr(torch, plan.get("contract", {}).get("engine", {}).get("dtype", "float32"))
+    weights = sum(parameter.numel() * dtype.itemsize for parameter in sizing.parameters())
     pool = max(row["pool_bytes"] for row in plan["workload_stats"].values())
     free, total = torch.cuda.mem_get_info()
     result = {
-        "fp32_weight_bytes": weights,
+        "fp32_weight_bytes" if dtype == torch.float32 else "bf16_weight_bytes": weights,
         "pool_bytes": pool,
         "free_device_bytes": free,
         "total_device_bytes": total,
@@ -363,7 +364,8 @@ def load_model(plan, manifest):
     """Shared one-model worker preparation; callers record preparation separately."""
     manifest["capacity_preflight"] = capacity_check(plan)
     loading = time.perf_counter_ns()
-    model = OuroForCausalLM.from_pretrained(plan["model_path"], device="cuda", dtype=torch.float32)
+    dtype = getattr(torch, plan["contract"]["engine"]["dtype"])
+    model = OuroForCausalLM.from_pretrained(plan["model_path"], device="cuda", dtype=dtype)
     manifest["loading_ns"] = time.perf_counter_ns() - loading
     manifest["post_load_memory"] = memory()
     return model

@@ -104,6 +104,52 @@ def _verify_norms(model, norm_type, forward):
         raise RuntimeError("Official RMSNorm forward has been replaced")
 
 
+def _initialize_official(
+    config: Mapping[str, Any],
+    weights: Mapping[str, torch.Tensor],
+    *,
+    use_cache: bool = False,
+    allowed_dtypes: tuple[torch.dtype, ...] = (torch.float32, torch.bfloat16),
+):
+    """Construct the pinned model with shared weights; callers select cache policy."""
+    official_config, official_model, official_rotary, norm_type, norm_forward = _official_classes()
+    values = deepcopy(dict(config))
+    if values.get("total_ut_steps", 4) != 4:
+        raise ValueError("The official reference supports exactly four loops")
+    if values.get("tie_word_embeddings", False):
+        raise ValueError("The official reference requires untied Ouro-1.4B weights")
+    if not weights:
+        raise ValueError("An already-loaded parameter mapping is required")
+    first = next(iter(weights.values()))
+    if not isinstance(first, torch.Tensor):
+        raise ValueError("Weights must be tensors")
+    device, dtype = first.device, first.dtype
+    if device.type == "meta" or dtype not in allowed_dtypes:
+        raise ValueError("Weights must be materialized tensors with a supported reference dtype")
+    if any(
+        not isinstance(value, torch.Tensor) or value.device != device or value.dtype != dtype
+        for value in weights.values()
+    ):
+        raise ValueError("All official weights must share one device and dtype")
+    values["use_cache"] = use_cache
+    values["attn_implementation"] = "eager"
+    resolved_config = official_config(**values)
+    with torch.device("meta"):
+        model = official_model(resolved_config)
+    _verify_norms(model, norm_type, norm_forward)
+    # detach prevents load_state_dict(assign=True) from modifying a caller's
+    # Parameter requires_grad flag while retaining identical tensor storage.
+    model.load_state_dict(
+        {name: value.detach() for name, value in weights.items()}, strict=True, assign=True
+    )
+    # This nonpersistent buffer is absent from the parameter mapping. Rebuild
+    # it with the unchanged official constructor, never Module.to(bfloat16).
+    model.model.rotary_emb = official_rotary(resolved_config, device=device)
+    model.requires_grad_(False)
+    model.eval()
+    return model, resolved_config, device, dtype, norm_type, norm_forward
+
+
 class OfficialOuroReference:
     """Full-sequence, causal fixed-depth reference sharing caller-owned weights.
 
@@ -114,46 +160,14 @@ class OfficialOuroReference:
     """
 
     def __init__(self, config: Mapping[str, Any], weights: Mapping[str, torch.Tensor]):
-        official_config, official_model, official_rotary, self._norm_type, self._norm_forward = (
-            _official_classes()
-        )
-        values = deepcopy(dict(config))
-        if values.get("total_ut_steps", 4) != 4:
-            raise ValueError("The official reference supports exactly four loops")
-        if values.get("tie_word_embeddings", False):
-            raise ValueError("The official reference requires untied Ouro-1.4B weights")
-        if not weights:
-            raise ValueError("An already-loaded parameter mapping is required")
-        first = next(iter(weights.values()))
-        if not isinstance(first, torch.Tensor):
-            raise ValueError("Weights must be tensors")
-        self.device, self.dtype = first.device, first.dtype
-        if self.device.type == "meta" or self.dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError("Weights must be materialized FP32 or BF16 tensors")
-        if any(
-            not isinstance(value, torch.Tensor)
-            or value.device != self.device
-            or value.dtype != self.dtype
-            for value in weights.values()
-        ):
-            raise ValueError("All official weights must share one device and dtype")
-        values["use_cache"] = False
-        values["attn_implementation"] = "eager"
-        self.config = official_config(**values)
-        with torch.device("meta"):
-            model = official_model(self.config)
-        _verify_norms(model, self._norm_type, self._norm_forward)
-        # detach prevents load_state_dict(assign=True) from modifying a caller's
-        # Parameter requires_grad flag while retaining identical tensor storage.
-        model.load_state_dict(
-            {name: value.detach() for name, value in weights.items()}, strict=True, assign=True
-        )
-        # This nonpersistent buffer is absent from the parameter mapping. Rebuild
-        # it with the unchanged official constructor, never Module.to(bfloat16).
-        model.model.rotary_emb = official_rotary(self.config, device=self.device)
-        model.requires_grad_(False)
-        model.eval()
-        self.model = model
+        (
+            self.model,
+            self.config,
+            self.device,
+            self.dtype,
+            self._norm_type,
+            self._norm_forward,
+        ) = _initialize_official(config, weights)
 
     @torch.inference_mode()
     def predict(
