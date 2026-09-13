@@ -71,9 +71,9 @@ def test_fixed_storage_payload_and_snapshot_are_detached(model):
     snapshot = runner._persistent_snapshot()
     assert snapshot["status"] == "ready" and snapshot["generation"] == 0
     assert snapshot["capacity"] == {"row_count": 8, "table_width": 32, "max_live_rows": 4}
-    assert snapshot["device_payload_bytes"] == 64 * model.config.hidden_size + 1320
-    assert snapshot["cpu_staging_bytes"] == 1256
-    assert snapshot["cpu_staging_bytes"] == _metadata_payload_bytes()
+    assert snapshot["device_payload_bytes"] == 96 * model.config.hidden_size + 1980
+    assert snapshot["cpu_staging_bytes"] == 1884
+    assert snapshot["cpu_staging_bytes"] == _metadata_payload_bytes(4) + _metadata_payload_bytes(8)
     assert snapshot["device_payload_bytes"] <= 256 * 1024
     assert snapshot["cpu_staging_bytes"] <= 16 * 1024
     metadata = runner._persistent["metadata"]
@@ -95,8 +95,8 @@ def test_constructor_cap_dtype_and_partial_failure_leave_executor_disabled(model
     runner = ModelRunner(model, cache)
     initial = cache.num_free_blocks
     with monkeypatch.context() as patch:
-        patch.setattr(model, "config", replace(model.config, hidden_size=8192))
-        with pytest.raises(ValueError, match="256 KiB"):
+        patch.setattr(model, "config", replace(model.config, hidden_size=16384))
+        with pytest.raises(ValueError, match="1 MiB"):
             runner._enable_persistent_decode()
     assert runner._persistent_snapshot() == {"enabled": False}
     original = torch.empty
@@ -183,7 +183,7 @@ def test_persistent_matches_allocating_padded_and_published_state_survives_reuse
     initial = b._persistent_snapshot()
     hidden = torch.stack([r.hidden_state for r in requests])
     expected = a._recurrent_padded(
-        hidden, ["a", "b"], [0, 0], [0, 0], row_indices=[1, 3], row_count=8, table_width=32
+        hidden, ["a", "b"], [0, 0], [0, 0], row_indices=[1, 3], row_count=4, table_width=32
     )
     observations = []
     original = model._recurrent_prepared
@@ -195,7 +195,7 @@ def test_persistent_matches_allocating_padded_and_published_state_survives_reuse
     monkeypatch.setattr(model, "_recurrent_prepared", observed)
     actual = run_request(b, *requests)
     assert observations[0][0]["status"] == "in_flight"
-    assert observations[0][1] == initial["tensors"]["hidden_in"]["data_ptr"]
+    assert observations[0][1] == initial["buckets"]["4"]["tensors"]["hidden_in"]["data_ptr"]
     torch.testing.assert_close(
         torch.stack([r.hidden_state for r in requests]), expected[0], atol=0, rtol=0
     )
@@ -219,8 +219,8 @@ def test_persistent_matches_allocating_padded_and_published_state_survives_reuse
     assert torch.equal(held.generator.get_state(), rng)
     assert held.generated_token_ids == [] and held.exit_depths == []
     after = b._persistent_snapshot()
-    assert after["tensors"] == initial["tensors"]
-    assert after["staging_tensors"] == initial["staging_tensors"]
+    assert after["tensors"] == initial["buckets"]["4"]["tensors"]
+    assert after["staging_tensors"] == initial["buckets"]["4"]["staging_tensors"]
     assert after["counters"] == {"calls": 2, "prepared": 2, "completed": 2, "empty": 0}
     assert after["status"] == "ready" and after["generation"] == 2
 

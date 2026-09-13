@@ -129,7 +129,17 @@ def test_passing_ratios_with_overlapping_ranges_are_inconclusive(ab_plan):
 
 @pytest.mark.parametrize(
     "change",
-    ["missing", "duplicate", "tokens", "depths", "gates", "occupancy", "pool", "eligibility"],
+    [
+        "missing",
+        "duplicate",
+        "tokens",
+        "depths",
+        "gates",
+        "occupancy",
+        "work",
+        "pool",
+        "eligibility",
+    ],
 )
 def test_incomparable_work_or_missing_observation_cannot_qualify(ab_plan, change):
     rows = records_for(ab_plan)
@@ -141,8 +151,12 @@ def test_incomparable_work_or_missing_observation_cannot_qualify(ab_plan, change
     elif change in ("tokens", "depths"):
         key = "token_ids" if change == "tokens" else "exit_depths"
         row["result"]["requests"][0][key][0] += 1
-    elif change in ("gates", "occupancy"):
-        key = "gate_probabilities" if change == "gates" else "recurrent_occupancy"
+    elif change in ("gates", "occupancy", "work"):
+        key = {
+            "gates": "gate_probabilities",
+            "occupancy": "recurrent_occupancy",
+            "work": "request_work",
+        }[change]
         row["result"]["counts"][key].append(1)
     elif change == "pool":
         # Matching incorrect pool sizes must also fail.

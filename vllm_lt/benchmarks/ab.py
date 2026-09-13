@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from .ab_schema import (
@@ -24,22 +25,33 @@ from .runner import write_json
 from .schema import read_json
 
 
-def artifact_usage(output_dir, limits):
+def artifact_usage(output_dir, limits, *, failures=None, exclude=()):
+    def cap(value, limit, reason, *, scope="artifacts"):
+        if failures is None:
+            require(value <= limit, reason)
+        elif value > limit:
+            failures.append({"scope": scope, "reason": reason, "bytes": value, "limit": limit})
+
     total, traces = 0, 0
     for path in Path(output_dir).rglob("*"):
         require(not path.is_symlink(), "artifact directories cannot contain symbolic links")
-        if path.is_file():
+        if path.is_file() and path.name not in exclude:
             size = path.stat().st_size
             total += size
             if path.name == "trace.json":
-                require(size <= limits["profile_trace_bytes_max"], "individual profile byte cap")
+                cap(
+                    size,
+                    limits["profile_trace_bytes_max"],
+                    "individual profile byte cap",
+                    scope=str(path.relative_to(output_dir)),
+                )
                 traces += size
-    require(traces <= limits["profile_total_bytes_max"], "total profile byte cap")
-    require(total <= limits["artifact_bytes_max"], "total artifact byte cap")
+    cap(traces, limits["profile_total_bytes_max"], "total profile byte cap")
+    cap(total, limits["artifact_bytes_max"], "total artifact byte cap")
     return {"total_bytes": total, "profile_trace_bytes": traces}
 
 
-def audit_worker_controls(plan, manifest, previous=None):
+def audit_worker_controls(plan, manifest, previous=None, *, require_cleanup=True):
     """Device discovery happened in the worker; this check reads its recorded facts only."""
     controls = plan["contract"]["controls"]
     env = manifest["environment"]
@@ -91,11 +103,12 @@ def audit_worker_controls(plan, manifest, previous=None):
             "actual_torch_threads",
         ):
             equal(env[name], previous[name], f"cross-worker {name}")
-    equal(
-        manifest["teardown_after_workspace_release"],
-        {"allocated_bytes": 0, "reserved_bytes": 0},
-        "worker final CUDA cleanup",
-    )
+    if require_cleanup:
+        equal(
+            manifest["teardown_after_workspace_release"],
+            {"allocated_bytes": 0, "reserved_bytes": 0},
+            "worker final CUDA cleanup",
+        )
 
 
 def run_worker(plan, *, worker_id, output_dir, deadline_ns):
@@ -285,8 +298,18 @@ def _launch_worker(
 def run_ab(plan, *, output_dir):
     from vllm_lt.validation.m2 import audit_numerical
 
+    return _run_ab(
+        plan,
+        output_dir=output_dir,
+        verify=verify_ab_plan,
+        audit=audit_numerical,
+        artifact_type="m2_ab_manifest",
+    )
+
+
+def _run_ab(plan, *, output_dir, verify, audit, artifact_type, launch_worker=None):
     start = time.perf_counter_ns()
-    verify_ab_plan(plan)
+    verify(plan)
     require(
         os.environ.get("CUDA_VISIBLE_DEVICES") == str(plan["contract"]["controls"]["gpu_ids"][0]),
         "controller must run inside the frozen scheduler assignment",
@@ -298,7 +321,7 @@ def run_ab(plan, *, output_dir):
     deadline = start + plan["contract"]["limits"]["total_timeout_s"] * 1_000_000_000
     manifest = {
         "schema_version": 1,
-        "artifact_type": "m2_ab_manifest",
+        "artifact_type": artifact_type,
         "plan_sha256": plan["plan_sha256"],
         "status": "running",
         "started_ns": start,
@@ -321,7 +344,7 @@ def run_ab(plan, *, output_dir):
         for worker in plan["workers"]:
             require(time.perf_counter_ns() < deadline, "global deadline exhausted")
             if worker["worker_id"] == "A1":
-                gate = audit_numerical(output_dir, plan)
+                gate = audit(output_dir, plan)
                 manifest["numerical_gate"] = gate
                 manifest["numerical_gate_ns"] = time.perf_counter_ns()
                 write_json(output_dir / "numerical-gate.json", gate)
@@ -338,7 +361,7 @@ def run_ab(plan, *, output_dir):
             manifest["workers"].append(launch)
             write_json(output_dir / "manifest.json", manifest)
             try:
-                exit_code = _launch_worker(plan, worker, output_dir, deadline)
+                exit_code = (launch_worker or _launch_worker)(plan, worker, output_dir, deadline)
                 launch["exit_code"] = exit_code
             finally:
                 launch["returned_ns"] = time.perf_counter_ns()
@@ -367,11 +390,25 @@ def run_ab(plan, *, output_dir):
             manifest["artifact_usage"] = artifact_usage(output_dir, plan["contract"]["limits"])
             write_json(output_dir / "manifest.json", manifest)
         manifest["status"] = "complete"
-    except (Exception, KeyboardInterrupt) as exc:
+    except BaseException as exc:
         manifest["status"] = (
             "incomplete" if isinstance(exc, (TimeoutError, KeyboardInterrupt)) else "failed"
         )
-        manifest["failures"].append({"type": type(exc).__name__, "message": str(exc)})
+        failure = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:2048],
+            "traceback": (
+                "".join(traceback.format_tb(exc.__traceback__, limit=16))[-6000:]
+                + f"{type(exc).__name__}: {str(exc)[:2048]}"
+            )[:8192],
+        }
+        if isinstance(exc, OSError):
+            failure.update(
+                errno=exc.errno,
+                filename=None if exc.filename is None else str(exc.filename)[:1024],
+                filename2=None if exc.filename2 is None else str(exc.filename2)[:1024],
+            )
+        manifest["failures"].append(failure)
     finally:
         signal.signal(signal.SIGTERM, old_sigterm)
         manifest["ended_ns"] = time.perf_counter_ns()

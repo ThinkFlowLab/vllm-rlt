@@ -727,7 +727,9 @@ def run_lifecycle_evaluation(plan, evaluation_id, output_dir, device="cuda", dea
         model = _probe_model(target, observe, emit)
         runner = ModelRunner(model, cache)
         if persistent:
-            runner._enable_persistent_decode()
+            from .m3_persistent import _enable_frozen_persistent_decode
+
+            _enable_frozen_persistent_decode(runner)
             for name, tensor in runner._persistent["tensors"].items():
                 if name != "live_indices":
                     tensor.zero_()
@@ -1148,15 +1150,14 @@ def _owned_layout(initial, expected_device):
     )
     device = initial["tensors"]["hidden_in"]["device"]
     _require(device == expected_device, "persistent evidence is from the wrong execution device")
-    for name, (shape, dtype) in layout.items():
-        _pointer(initial["tensors"][name], shape, dtype, device=device, snapshot=True)
-        if name in _METADATA:
-            _pointer(initial["staging_tensors"][name], shape, dtype, device="cpu", snapshot=True)
-    for group in (initial["tensors"], initial["staging_tensors"]):
-        _require(
-            len({row["storage_ptr"] for row in group.values()}) == len(group),
-            "persistent storage aliases",
-        )
+    from .m3_persistent import _check_storage_inventory
+
+    _check_storage_inventory(
+        initial["tensors"],
+        initial["staging_tensors"],
+        {name: (shape, dtype.removeprefix("torch.")) for name, (shape, dtype) in layout.items()},
+        device=device,
+    )
     return device
 
 
@@ -1176,6 +1177,13 @@ def _snapshot_evidence(snapshot, initial, *, generation, calls, empty, fallbacks
         "last_publication",
         "failure",
     }
+    if "buckets" in snapshot:
+        expected_fields.add("buckets")
+        _require(
+            snapshot["buckets"]
+            == {"8": {key: snapshot[key] for key in ("generation", "tensors", "staging_tensors")}},
+            "frozen persistent bucket inventory differs",
+        )
     _require(
         set(snapshot) == expected_fields
         and snapshot["enabled"] is True

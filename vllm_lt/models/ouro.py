@@ -21,7 +21,7 @@ from torch.nn import functional as F
 from .config import OURO_MODEL_ID, OURO_REVISION, OuroConfig
 
 if TYPE_CHECKING:
-    from vllm_lt.core.kv_cache_manager import KVCacheManager, _PreparedKVBatch
+    from vllm_lt.core.kv_cache_manager import KVCacheManager, _PreparedKVBatch, _TensorKVView
 
 
 class OuroRMSNorm(nn.Module):
@@ -97,8 +97,8 @@ class OuroAttention(nn.Module):
         self,
         hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        batch: "_PreparedKVBatch",
-        cache: "KVCacheManager",
+        batch: "_PreparedKVBatch | _TensorKVView",
+        cache: "KVCacheManager | _TensorKVView",
     ) -> torch.Tensor:
         shape = (hidden.shape[0], -1, self.config.head_dim)
         q = self.q_proj(hidden).view(shape)
@@ -137,8 +137,8 @@ class OuroDecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        batch: "_PreparedKVBatch",
-        cache: "KVCacheManager",
+        batch: "_PreparedKVBatch | _TensorKVView",
+        cache: "KVCacheManager | _TensorKVView",
     ) -> torch.Tensor:
         attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)
         hidden = hidden + self.input_layernorm_2(attention)
@@ -220,9 +220,23 @@ class OuroForCausalLM(nn.Module):
             )
         if not batch.rows:
             return torch.zeros_like(hidden), hidden.new_zeros(batch.row_count)
-        inactive = None
-        if len(batch.rows) != batch.row_count:
-            inactive = ~batch.active
+        inactive = ~batch.active if len(batch.rows) != batch.row_count else None
+        return self._recurrent_body(hidden, batch, cache, inactive)
+
+    def _recurrent_tensor(
+        self, hidden: torch.Tensor, view: "_TensorKVView"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fixed-shape tensor body; its caller owns validation and prefix commit.
+
+        The mask stays a tensor even when setup has one live row. No request,
+        allocation, host prefix, lease generation or host live count is read.
+        This entry point does not publish any host-side request state.
+        """
+        return self._recurrent_body(hidden, view, view, ~view.active)
+
+    def _recurrent_body(self, hidden, batch, cache, inactive):
+        """Common Ouro arithmetic for checked eager and tensor-only traversal."""
+        if inactive is not None:
             # Multiplication would preserve poison NaNs in inactive inputs.
             hidden = hidden.masked_fill(inactive[:, None], 0.0)
         position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)

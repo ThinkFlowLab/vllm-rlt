@@ -430,146 +430,263 @@ def audit_numerical(output_dir, parent_plan):
     return _audit_numerical_view(output_dir, _view(parent_plan))
 
 
-def _audit_numerical_view(output_dir, view):
-    """Audit a caller-validated A/B view without loading a checkpoint or device."""
+def _audit_numerical_view(output_dir, view, *, audit_case=None):
+    """Require a complete, independently audited numerical prefix."""
+    result = _audit_numerical_prefix(output_dir, view, audit_case=audit_case)
+    result["artifact_type"] = view["artifact_type"].replace("_plan", "_report")
+    workers = result.get("ledger", {}).get("workers", {})
+    if (
+        result["valid_prefix"]
+        and not result["missing_case_ids"]
+        and all(worker["complete"] for worker in workers.values())
+    ):
+        result["complete"] = True
+        result["evidence_status"] = "complete"
+        result["passed"] = not result["known_required_failure"] and all(
+            worker["passed"] for worker in workers.values()
+        )
+    elif not result["errors"]:
+        result["errors"].append({"type": "ValueError", "message": "incomplete numerical ledger"})
+    return result
+
+
+def _audit_numerical_prefix(output_dir, view, *, audit_case=None):
+    """Audit a settled prefix without turning its missing suffix into corruption.
+
+    Original case/comparison rows and the full frozen plan hash are preserved.
+    Error aggregates are reconstructed from recorded statistics; retained typed
+    anchors are byte-verified, not a recomputation of all native tensor errors.
+    An active unfinished case is explicitly unaudited and cannot establish a
+    trusted failure through this completed-prefix interface.
+    """
     from .report import _audit_case, _audit_comparison, _audit_raw_evidence
 
+    def _require(value, message):
+        if not value:
+            raise ValueError(message)
+
     folder = Path(output_dir) / "numerical"
+    planned = [case["case_id"] for case in view["execution_order"]]
     result = {
         "schema_version": 1,
-        "artifact_type": view["artifact_type"].replace("_plan", "_report"),
+        "artifact_type": view["artifact_type"].replace("_plan", "_prefix_report"),
         "plan_sha256": view["plan_sha256"],
         "complete": False,
         "passed": False,
+        "valid_prefix": False,
+        "known_required_failure": False,
+        "evidence_status": "incomplete",
+        "expected_case_ids": planned,
         "completed_cases": [],
+        "missing_case_ids": planned,
         "comparisons": [],
+        "required_failures": 0,
+        "behavior_failures": 0,
         "errors": [],
+        "counts": {
+            "planned_cases": len(planned),
+            "verified_cases": 0,
+            "planned_comparisons": len(view["comparison_order"]),
+            "verified_comparisons": 0,
+        },
     }
-    fixtures = {row["fixture_id"]: row for row in view["suite"]["fixtures"]}
-    verified_cases = 0
+    if not (folder / "ledger.json").exists():
+        result["missing_evidence"] = "numerical ledger has not been published"
+        return result
     try:
         ledger = read_json(folder / "ledger.json")
-        expected_ids = [case["case_id"] for case in view["execution_order"]]
         result["ledger"] = ledger
-        if (
+        _require(
             ledger["plan_sha256"] == view["plan_sha256"]
-            and ledger["numerical_plan_sha256"] == view["numerical_plan_sha256"]
-            and ledger["completed_cases"] == expected_ids[: len(ledger["completed_cases"])]
-        ):
-            result["completed_cases"] = list(ledger["completed_cases"])
-        if (
-            ledger["plan_sha256"] != view["plan_sha256"]
-            or ledger["numerical_plan_sha256"] != view["numerical_plan_sha256"]
-            or ledger["completed_cases"] != expected_ids
-            or ledger["started_cases"] != expected_ids
-            or set(ledger["workers"]) != {"A", "B"}
-            or not all(row["complete"] for row in ledger["workers"].values())
-            or ledger["active_case"] is not None
-            or set(ledger["case_lifetimes"]) != set(expected_ids)
-        ):
-            raise ValueError("numerical ledger lacks the complete ordered case execution")
-        previous_end = 0
-        for case_id in expected_ids:
-            lifetime = ledger["case_lifetimes"][case_id]
-            start, end, deadline = (
-                lifetime[key] for key in ("started_ns", "finished_ns", "deadline_ns")
+            and ledger["numerical_plan_sha256"] == view["numerical_plan_sha256"],
+            "prefix ledger identity differs",
+        )
+        completed = ledger["completed_cases"]
+        _require(
+            isinstance(completed, list) and completed == planned[: len(completed)],
+            "completed numerical cases are not the frozen prefix",
+        )
+        started = ledger["started_cases"]
+        _require(
+            started == planned[: len(started)]
+            and len(completed) <= len(started) <= len(completed) + 1,
+            "started numerical cases are not the bounded prefix",
+        )
+        result["completed_cases"] = list(completed)
+        result["missing_case_ids"] = planned[len(completed) :]
+        active = ledger["active_case"]
+        if active is not None:
+            _require(
+                len(started) == len(completed) + 1 and active["case_id"] == started[-1],
+                "active case differs from next frozen case",
             )
-            if (
-                any(type(value) is not int or value <= 0 for value in (start, end, deadline))
-                or not previous_end <= start <= end <= deadline
-                or deadline - start > view["contract"]["limits"]["case_timeout_s"] * 1_000_000_000
-            ):
-                raise ValueError("numerical case lifetime exceeded its frozen deadline")
+            _require(
+                set(active) == {"case_id", "started_ns", "deadline_ns"}
+                and all(type(active[k]) is int for k in ("started_ns", "deadline_ns"))
+                and 0 < active["started_ns"] < active["deadline_ns"]
+                and active["deadline_ns"] - active["started_ns"]
+                <= view["contract"]["limits"]["case_timeout_s"] * 10**9,
+                "pending numerical case marker is malformed or over budget",
+            )
+            result["pending_case"] = active
+            result["missing_evidence"] = (
+                "active case and its partial tensor/dump writes remain unaudited"
+            )
+            return result
+        _require(started == completed, "unsettled started case has no active marker")
+        _require(
+            set(ledger["case_lifetimes"]) == set(completed), "prefix lifetime coverage differs"
+        )
+        actual = (
+            sorted(path.name for path in (folder / "cases").iterdir() if path.is_dir())
+            if (folder / "cases").exists()
+            else []
+        )
+        _require(actual == sorted(completed), "unexpected or missing completed case directories")
+        subset = {
+            **view,
+            "execution_order": view["execution_order"][: len(completed)],
+            "comparison_order": [
+                r for r in view["comparison_order"] if r["candidate_case_id"] in completed
+            ],
+        }
+        fixtures = {f["fixture_id"]: f for f in view["suite"]["fixtures"]}
+        cases, previous_end = {}, 0
+        for case in subset["execution_order"]:
+            case_id = case["case_id"]
+            life = ledger["case_lifetimes"][case_id]
+            start, end, deadline = (
+                life[key] for key in ("started_ns", "finished_ns", "deadline_ns")
+            )
+            _require(
+                all(type(v) is int and v > 0 for v in (start, end, deadline))
+                and previous_end <= start <= end <= deadline
+                and deadline - start <= view["contract"]["limits"]["case_timeout_s"] * 10**9,
+                "prefix case lifetime exceeded its frozen deadline",
+            )
             previous_end = end
-        actual_ids = sorted(path.name for path in (folder / "cases").iterdir() if path.is_dir())
-        if actual_ids != sorted(expected_ids):
-            raise ValueError("unexpected or missing numerical case directories")
-        cases = {}
-        for case in view["execution_order"]:
-            value = read_json(folder / "cases" / case["case_id"] / "result.json")
+            value = read_json(folder / "cases" / case_id / "result.json")
             _audit_case(value, view, case, fixtures)
-            cases[case["case_id"]] = value
-            verified_cases += 1
-        observations, reverse = {}, {}
-        for comparison in view["comparison_order"]:
+            if audit_case is not None:
+                audit_case(case, value, life)
+            cases[case_id] = value
+            result["counts"]["verified_cases"] += 1
+        indices, reverse = {}, {}
+        for comparison in subset["comparison_order"]:
+            _require(
+                comparison["reference_case_id"] in cases,
+                "completed comparison lacks its earlier reference",
+            )
             case_id = comparison["candidate_case_id"]
-            seen = observations.setdefault(case_id, {})
-            keys = reverse.setdefault(case_id, {})
+            seen, identities = indices.setdefault(case_id, {}), reverse.setdefault(case_id, {})
 
             def observe(index, fixture_id, key):
                 identity = (fixture_id, key)
-                if (index in seen and seen[index] != identity) or (
-                    identity in keys and keys[identity] != index
-                ):
-                    raise ValueError("inconsistent cross-comparison observation order")
-                seen[index], keys[identity] = identity, index
+                _require(
+                    (index not in seen or seen[index] == identity)
+                    and (identity not in identities or identities[identity] == index),
+                    "inconsistent prefix cross-stream observation order",
+                )
+                seen[index], identities[identity] = identity, index
 
             result["comparisons"].append(
                 _audit_comparison(folder, view, comparison, cases, fixtures, observe)
             )
-        for case_id, seen in observations.items():
-            if sorted(seen) != list(range(1, cases[case_id]["observed_boundaries"] + 1)):
-                raise ValueError("missing global candidate observation coverage")
-        expected_comparisons = sorted(row["comparison_id"] for row in view["comparison_order"])
-        actual_comparisons = sorted(path.stem for path in (folder / "comparisons").glob("*.jsonl"))
-        if actual_comparisons != expected_comparisons:
-            raise ValueError("unexpected or missing numerical comparison artifacts")
-        result["raw_evidence"] = _audit_raw_evidence(
-            folder, view, cases, fixtures, result["comparisons"], ledger
-        )
-        expected_groups = {}
-        for spool in result["raw_evidence"]["retained_references"]:
+            result["counts"]["verified_comparisons"] += 1
+        for case_id, seen in indices.items():
+            _require(
+                sorted(seen) == list(range(1, cases[case_id]["observed_boundaries"] + 1)),
+                "prefix global observation coverage differs",
+            )
+        comparison_ids = [c["comparison_id"] for c in subset["comparison_order"]]
+        for suffix in (".jsonl", ".summary.json"):
+            actual = sorted(
+                p.name.removesuffix(suffix) for p in (folder / "comparisons").glob("*" + suffix)
+            )
+            _require(
+                actual == sorted(comparison_ids),
+                "unexpected or missing prefix comparison artifacts",
+            )
+        raw = _audit_raw_evidence(folder, subset, cases, fixtures, result["comparisons"], ledger)
+        groups = {}
+        for spool in raw["retained_references"]:
             group = cases[spool["namespace"]]["case"]["spool_group"]
-            expected_groups[group] = expected_groups.get(group, 0) + spool["size_bytes"]
-        expected_groups.update(ledger["diagnostic_dumps"]["fixture_written_bytes"])
-        if expected_groups != ledger["spool_bytes_by_group"]:
-            raise ValueError("per-execution ledger differs from retained spool/dump sizes")
-        if sum(ledger["spool_bytes_by_group"].values()) != ledger["tensor_written_bytes"]:
-            raise ValueError("cumulative numerical ledger differs from group sums")
-        caps = view["contract"]["limits"]
-        if (
-            ledger["tensor_written_bytes"] > caps["cumulative_spool_written_bytes"]
-            or any(
-                size > caps["group_spool_bytes"] for size in ledger["spool_bytes_by_group"].values()
-            )
-            or ledger["diagnostic_dumps"]["written_bytes"] > caps["persisted_dump_bytes"]
-        ):
-            raise ValueError("numerical spool/dump budget exceeded")
-        result["complete"] = True
-        result["passed"] = not any(
-            row["required_failures"] or row["behavior_failures"] for row in result["comparisons"]
+            groups[group] = groups.get(group, 0) + spool["size_bytes"]
+        groups.update(ledger["diagnostic_dumps"]["fixture_written_bytes"])
+        _require(
+            groups == ledger["spool_bytes_by_group"]
+            and sum(groups.values()) == ledger["tensor_written_bytes"],
+            "prefix spool ledger differs from verified retained bytes",
         )
-        for implementation_id in ("A", "B"):
-            worker = ledger["workers"][implementation_id]
-            worker_cases = [
-                case["case_id"]
-                for case in view["execution_order"]
-                if case["implementation_id"] == implementation_id
+        caps = view["contract"]["limits"]
+        _require(
+            ledger["tensor_written_bytes"] <= caps["cumulative_spool_written_bytes"]
+            and all(0 <= size <= caps["group_spool_bytes"] for size in groups.values())
+            and ledger["diagnostic_dumps"]["written_bytes"] <= caps["persisted_dump_bytes"],
+            "prefix tensor budget exceeded",
+        )
+        workers = ledger["workers"]
+        sides = [side for side in ("A", "B") if side in workers]
+        _require(
+            sides and list(workers) == sides and sides in (["A"], ["A", "B"]),
+            "prefix worker order differs",
+        )
+        failures = {
+            r["comparison_id"]
+            for r in result["comparisons"]
+            if r["required_failures"] or r["behavior_failures"]
+        }
+        for side in sides:
+            worker = workers[side]
+            expected = [
+                c["case_id"] for c in view["execution_order"] if c["implementation_id"] == side
             ]
-            failed = any(
-                (row["required_failures"] or row["behavior_failures"])
-                and any(
-                    comparison["comparison_id"] == row["comparison_id"]
-                    and comparison["candidate_case_id"] in worker_cases
-                    for comparison in view["comparison_order"]
-                )
-                for row in result["comparisons"]
+            observed = [c for c in completed if c in expected]
+            failed_ids = {
+                c["comparison_id"]
+                for c in subset["comparison_order"]
+                if c["candidate_case_id"] in observed and c["comparison_id"] in failures
+            }
+            _require(
+                worker["implementation_id"] == side
+                and worker["completed_cases"] == observed
+                and type(worker["complete"]) is bool
+                and type(worker["passed"]) is bool
+                and isinstance(worker["errors"], list),
+                "prefix worker summary identity differs",
             )
-            if (
-                worker["implementation_id"] != implementation_id
-                or worker["completed_cases"] != worker_cases
-                or worker["passed"] is not (not failed)
-                or bool(worker["errors"]) != failed
-            ):
-                raise ValueError("numerical worker summary differs from audited evidence")
-        result["ledger"] = ledger
+            _require(
+                not worker["complete"] or observed == expected,
+                "incomplete side falsely marked complete",
+            )
+            _require(
+                worker["passed"] is (worker["complete"] and not worker["errors"]),
+                "prefix worker summary pass flag differs from completion/errors",
+            )
+            claimed = {
+                error["comparison_id"] for error in worker["errors"] if "comparison_id" in error
+            }
+            _require(
+                claimed == failed_ids, "worker required-failure claims differ from audited streams"
+            )
+            if side == "B":
+                _require(
+                    workers["A"]["passed"], "B started after an unqualified A numerical worker"
+                )
+        _require(
+            all(c["implementation_id"] in sides for c in subset["execution_order"]),
+            "completed cases have no owning worker ledger",
+        )
+        result.update(
+            valid_prefix=True,
+            raw_evidence=raw,
+            required_failures=sum(r["required_failures"] for r in result["comparisons"]),
+            behavior_failures=sum(r["behavior_failures"] for r in result["comparisons"]),
+        )
+        result["known_required_failure"] = bool(
+            result["required_failures"] or result["behavior_failures"]
+        )
     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-        result["complete"] = result["passed"] = False
+        result["evidence_status"] = "invalid"
         result["errors"].append({"type": type(exc).__name__, "message": str(exc)})
-    result["counts"] = {
-        "planned_cases": len(view["execution_order"]),
-        "verified_cases": verified_cases,
-        "planned_comparisons": len(view["comparison_order"]),
-        "verified_comparisons": len(result["comparisons"]),
-    }
     return result

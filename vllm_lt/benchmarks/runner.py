@@ -128,7 +128,7 @@ def environment():
     }
 
 
-def _execute(model, plan, run, workload, output_dir, deadline):
+def _execute(model, plan, run, workload, output_dir, deadline, *, execution_adapter=None):
     contract = plan["contract"]
     engine_config = contract["engine"]
     run_dir = output_dir / "runs" / run["run_id"]
@@ -154,12 +154,14 @@ def _execute(model, plan, run, workload, output_dir, deadline):
         if workload["kind"] == "scheduler_replay"
         else LLMEngine(model, **arguments)
     )
+    if execution_adapter is not None:
+        execution_adapter.prepare(engine, run, run_dir)
     setup_ns = time.perf_counter_ns() - setup
     request_ids = [item["request_id"] for item in workload["requests"]]
     max_steps = run["max_steps"]
     failures = []
     capture = (
-        Capture(
+        (execution_adapter.capture_type if execution_adapter is not None else Capture)(
             engine,
             output_dir / "profiles" / run["run_id"],
             limit=contract["limits"]["profile_decode_outputs"],
@@ -191,7 +193,12 @@ def _execute(model, plan, run, workload, output_dir, deadline):
         for item in workload["requests"]
     ]
     try:
-        with finite_checks(model, run["phase"] == "feasibility") as finite_counts:
+        checks = (
+            execution_adapter.finite_checks(engine, run["phase"] == "feasibility")
+            if execution_adapter is not None
+            else finite_checks(model, run["phase"] == "feasibility")
+        )
+        with checks as finite_counts:
             with (
                 instrument_engine(
                     engine, collector, profile=capture is not None, max_steps=max_steps
@@ -274,6 +281,13 @@ def _execute(model, plan, run, workload, output_dir, deadline):
     except Exception as exc:
         status = "failed"
         failures.append({"type": "memory_accounting", "message": str(exc)})
+    adapter_result = None
+    if execution_adapter is not None:
+        try:
+            adapter_result = execution_adapter.finish(engine, capture)
+        except BaseException as exc:
+            status = "failed"
+            failures.append({"type": "execution_adapter_cleanup", "message": str(exc)})
     result = {
         "schema_version": 1,
         "artifact_type": "run_result",
@@ -295,6 +309,8 @@ def _execute(model, plan, run, workload, output_dir, deadline):
         "cleanup": cleanup,
         "failures": failures,
     }
+    if execution_adapter is not None:
+        result["capture"] = adapter_result
     events = collected["events"]
     if observation:
         for snapshot in result["counts"]["snapshots"]:
@@ -391,36 +407,47 @@ def release_device(manifest):
         raise RuntimeError("task-owned tensor or allocator memory remains after teardown")
 
 
-def run_loaded_rows(model, plan, rows, *, output_dir, deadline, record_completed):
+def run_loaded_rows(
+    model, plan, rows, *, output_dir, deadline, record_completed, execution_adapter=None
+):
     """Execute rows through the sole M1 inference loop; stop without retries."""
     workloads = {row["workload_id"]: row for row in plan["suite"]["workloads"]}
     for run in rows:
         if time.perf_counter_ns() >= deadline:
             raise TimeoutError("overall experiment budget exhausted")
         try:
-            result = _execute(model, plan, run, workloads[run["workload_id"]], output_dir, deadline)
-        except (Exception, KeyboardInterrupt) as exc:
-            # An allocation/setup failure may precede the inner recovery boundary.
-            run_dir = output_dir / "runs" / run["run_id"]
-            run_dir.mkdir(parents=True, exist_ok=True)
-            result_path = run_dir / "result.json"
-            if not result_path.exists():
-                write_json(
-                    result_path,
-                    {
-                        "schema_version": 1,
-                        "artifact_type": "run_result",
-                        **run,
-                        "experiment_id": output_dir.name,
-                        "plan_sha256": plan["plan_sha256"],
-                        "status": "failed",
-                        "comparison_eligible": False,
-                        "requests": [],
-                        "metrics": None,
-                        "cleanup": None,
-                        "failures": [{"type": type(exc).__name__, "message": str(exc)}],
-                    },
-                )
+            kwargs = {} if execution_adapter is None else {"execution_adapter": execution_adapter}
+            result = _execute(
+                model, plan, run, workloads[run["workload_id"]], output_dir, deadline, **kwargs
+            )
+        except BaseException as exc:
+            try:
+                # An allocation/setup failure may precede the inner recovery boundary.
+                run_dir = output_dir / "runs" / run["run_id"]
+                run_dir.mkdir(parents=True, exist_ok=True)
+                if execution_adapter is not None:
+                    execution_adapter.abort(exc, run_dir)
+                result_path = run_dir / "result.json"
+                if not result_path.exists():
+                    write_json(
+                        result_path,
+                        {
+                            "schema_version": 1,
+                            "artifact_type": "run_result",
+                            **run,
+                            "experiment_id": output_dir.name,
+                            "plan_sha256": plan["plan_sha256"],
+                            "status": "failed",
+                            "comparison_eligible": False,
+                            "requests": [],
+                            "metrics": None,
+                            "cleanup": None,
+                            "failures": [{"type": type(exc).__name__, "message": str(exc)}],
+                        },
+                    )
+            except BaseException as secondary:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"failed-result recovery also failed: {secondary}")
             raise
         if result["status"] != "complete":
             raise RuntimeError(f"stopping after {run['run_id']}: {result['failures']}")
@@ -429,6 +456,10 @@ def run_loaded_rows(model, plan, rows, *, output_dir, deadline, record_completed
         result["memory"]["after_engine_release"] = memory()
         marker = read_json(output_dir / "runs" / run["run_id"] / "started.json")
         result["case_started_ns"] = marker["started_ns"]
+        pending = output_dir / "runs" / run["run_id"] / "result.pending.json"
+        if execution_adapter is not None:
+            # Include first serialization of all graph evidence in the case lifetime.
+            write_json(pending, result)
         result["case_completed_ns"] = time.perf_counter_ns()
         if result["case_completed_ns"] >= marker["deadline_ns"]:
             result["status"], result["comparison_eligible"] = "incomplete", False
@@ -437,7 +468,19 @@ def run_loaded_rows(model, plan, rows, *, output_dir, deadline, record_completed
             )
             write_json(output_dir / "runs" / run["run_id"] / "result.json", result)
             raise TimeoutError("case lifetime including cleanup exceeded")
-        write_json(output_dir / "runs" / run["run_id"] / "result.json", result)
+        result_path = output_dir / "runs" / run["run_id"] / "result.json"
+        if execution_adapter is None:
+            write_json(result_path, result)
+        else:
+            write_json(pending, result)
+            pending.replace(result_path)
+            if time.perf_counter_ns() >= marker["deadline_ns"]:
+                result["status"], result["comparison_eligible"] = "incomplete", False
+                result["failures"].append(
+                    {"type": "deadline", "message": "case deadline during final result export"}
+                )
+                write_json(result_path, result)
+                raise TimeoutError("case lifetime including final result export exceeded")
         record_completed(run["run_id"], result)
         print(
             json.dumps(

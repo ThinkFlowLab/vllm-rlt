@@ -31,6 +31,7 @@ __all__ = [
     "dependency_manifest",
 ]
 
+PROJECTION = "loop_gate_logits_full_kv_v1"
 DTYPES = ("float32", "bfloat16")
 LENGTHS = (16, 64, 128, 256)
 OPERATIONS = (

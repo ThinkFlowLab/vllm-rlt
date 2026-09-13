@@ -330,5 +330,9 @@ def test_offline_report_rejects_forged_case_lifetime_and_worker_flags(completed_
         write_json(path, ledger)
         report = m2.audit_numerical(output, parent)
         assert not report["complete"] and "worker summary" in report["errors"][0]["message"]
+        ledger["workers"]["B"]["complete"] = False
+        write_json(path, ledger)
+        report = m2.audit_numerical(output, parent)
+        assert not report["complete"] and not report["passed"]
     finally:
         path.write_bytes(original)

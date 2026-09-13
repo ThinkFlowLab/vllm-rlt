@@ -15,6 +15,7 @@ from vllm_lt.models import OuroForCausalLM
 from vllm_lt.models.reference import dense_reference
 from vllm_lt.models.serial_oracle import ExitPolicy, SerialOuroOracle
 from vllm_lt.sampling_params import SamplingParams
+from vllm_lt.validation.schema import PROJECTION
 
 from .diagnostics import DiagnosticDump, SpoolBudget, TensorSpool
 from .evidence import ComparisonStream, boundary_key
@@ -377,6 +378,9 @@ def _check_trace(case, fixture, traces):
 @torch.inference_mode()
 def execute_case(model, plan, case, output, budget, dumps, deadline):
     """One execution; CPU tiny models exercise this same driver before GPU use."""
+    projection = case.get("boundary_projection")
+    if projection not in (None, PROJECTION):
+        raise ValueError("unknown numerical boundary projection")
     output = Path(output)
     folder = output / "cases" / case["case_id"]
     folder.mkdir(parents=True, exist_ok=False)
@@ -431,6 +435,15 @@ def execute_case(model, plan, case, output, budget, dumps, deadline):
 
         def sink(metadata, tensor):
             _deadline(deadline)
+            if projection and metadata["operation"] not in (
+                "loop_hidden",
+                "gate_logits",
+                "logits",
+                "populated_kv",
+            ):
+                if case["implementation"] == "oracle":
+                    return
+                raise ValueError("native capture observation emitted an omitted boundary")
             fixture_id = metadata["fixture_id"]
             counts[fixture_id] += 1
             result["observed_boundaries"] += 1
@@ -491,7 +504,7 @@ def execute_case(model, plan, case, output, budget, dumps, deadline):
                 fixture_id = fixture["fixture_id"]
                 _check_trace(case, fixture, traces[fixture_id])
                 expected = (
-                    (6 * model.config.num_hidden_layers + 2)
+                    ((0 if projection else 6 * model.config.num_hidden_layers) + 2)
                     * sum(row["exit_depth"] for row in traces[fixture_id])
                     + 9
                     + 2 * ((len(fixture["prompt_token_ids"]) + 8 + 3) // 4)

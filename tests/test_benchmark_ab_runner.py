@@ -1,6 +1,7 @@
 """CPU-only subprocess/control fixtures exercise M2 lifecycle and offline ordering."""
 
 import signal
+import subprocess
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -328,7 +329,8 @@ def test_worker_partial_environment_failure_still_releases_device(ab_plan, monke
     assert value["failures"][0]["message"] == "partial environment discovery"
 
 
-def test_owned_child_group_is_terminated_on_controller_stop(ab_plan, tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason", ["interrupt", "artifact_cap"])
+def test_owned_child_group_is_terminated_on_controller_stop(ab_plan, tmp_path, monkeypatch, reason):
     calls = []
 
     class Child:
@@ -337,7 +339,9 @@ def test_owned_child_group_is_terminated_on_controller_stop(ab_plan, tmp_path, m
         def wait(self, timeout=None):
             calls.append(("wait", timeout))
             if len(calls) == 1:
-                raise KeyboardInterrupt("owned controller stop")
+                if reason == "interrupt":
+                    raise KeyboardInterrupt("owned controller stop")
+                raise subprocess.TimeoutExpired("owned worker", timeout)
             return -15
 
         def poll(self):
@@ -352,8 +356,14 @@ def test_owned_child_group_is_terminated_on_controller_stop(ab_plan, tmp_path, m
 
     monkeypatch.setattr(ab.subprocess, "Popen", launch)
     monkeypatch.setattr(ab.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    if reason == "artifact_cap":
+
+        def over_cap(*args):
+            raise ValueError("artifact cap exceeded")
+
+        monkeypatch.setattr(ab, "artifact_usage", over_cap)
     (tmp_path / "workers").mkdir()
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt if reason == "interrupt" else ValueError):
         ab._launch_worker(ab_plan, ab_plan["workers"][0], tmp_path, deadline_ns=10**30)
     assert (424242, signal.SIGTERM) in calls
     assert calls[-1] == ("wait", 2)

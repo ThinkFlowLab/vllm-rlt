@@ -9,7 +9,7 @@ The initial admission policy reserves a request's complete token budget at all
 depths. It is conservative, but admitted requests cannot deadlock on KV growth.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from math import prod
 from numbers import Integral
@@ -36,6 +36,11 @@ def _metadata_payload_bytes(row_count=8, table_width=32):
         prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
         for shape, dtype in _metadata_specifications(row_count, table_width).values()
     )
+
+
+def decode_live_rows(count):
+    """Interleave live rows with inactive sentinels in persistent storage."""
+    return tuple(range(1, 2 * count, 2))
 
 
 @dataclass
@@ -82,9 +87,13 @@ class _MetadataStorage:
     owner: "KVCacheManager"
     tensors: dict[str, torch.Tensor]
     staging: dict[str, torch.Tensor]
+    packed: torch.Tensor
+    packed_staging: torch.Tensor
+    capacity: tuple[int, int] = (8, 32)
     generation: int = 0
     in_use: bool = False
     failed: bool = False
+    transaction: "_DecodeTraversal | None" = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -110,6 +119,59 @@ class _PreparedKVBatch:
     writable: bool
     storage: _MetadataStorage | None = None
     generation: int | None = None
+    allocation_generation: int | None = None
+
+
+@dataclass(eq=False)
+class _DecodeTraversal:
+    owner: "KVCacheManager"
+    host: _HostKVBatch
+    allocation_generation: int
+    batch: _PreparedKVBatch | None = None
+    state: str = "begun"
+
+
+@dataclass(frozen=True, eq=False)
+class _TensorKVView:
+    """Fixed tensor arguments and kernels, with no host allocation or lease state.
+
+    Construct once outside capture. The caller validates ownership and preceding
+    history before submission, and commits written prefixes after completion.
+    Inactive rows are selected only by the device mask, including during replay.
+    """
+
+    row_count: int
+    position_ids: torch.Tensor
+    write_blocks: torch.Tensor
+    write_offsets: torch.Tensor
+    block_tables: torch.Tensor
+    context_lengths: torch.Tensor
+    active: torch.Tensor
+    key_layers: tuple[torch.Tensor, ...]
+    value_layers: tuple[torch.Tensor, ...]
+    write_kernel: Callable
+    attention_kernel: Callable
+
+    def _write_prepared(self, layer, batch, k, v):
+        self.write_kernel(
+            self.key_layers[layer],
+            self.value_layers[layer],
+            batch.write_blocks,
+            batch.write_offsets,
+            k,
+            v,
+            batch.active,
+        )
+
+    def _attend_prepared(self, layer, batch, q):
+        return self.attention_kernel(
+            q,
+            self.key_layers[layer],
+            self.value_layers[layer],
+            batch.block_tables,
+            batch.context_lengths,
+            active=batch.active,
+        )
 
 
 class KVCacheManager:
@@ -161,6 +223,7 @@ class KVCacheManager:
         self.device = self.key_cache.device
         self._free_blocks = list(reversed(range(num_blocks)))
         self._allocations: dict[str, _Allocation] = {}
+        self._allocation_generation = 0
         self._quarantine_reason: str | None = None
 
     def _require_usable(self) -> None:
@@ -220,6 +283,7 @@ class KVCacheManager:
             tables,
             [[_WrittenPositions() for _ in range(self.num_layers)] for _ in range(self.max_loops)],
         )
+        self._allocation_generation += 1
         return True
 
     def free(self, request_id: str) -> None:
@@ -227,6 +291,7 @@ class KVCacheManager:
         self._require_usable()
         allocation = self._allocations.pop(request_id, None)
         if allocation is not None:
+            self._allocation_generation += 1
             for table in allocation.block_tables:
                 self._free_blocks.extend(reversed(table))
 
@@ -406,38 +471,66 @@ class KVCacheManager:
             writable=batch.writable,
         )
 
-    def _allocate_metadata_storage(self) -> _MetadataStorage:
-        """Allocate the single private 8-row/32-column decode capacity."""
+    def _allocate_metadata_storage(
+        self, row_count: int = 8, table_width: int = 32
+    ) -> _MetadataStorage:
+        """Allocate fixed storage for a caller-budgeted decode bucket."""
         self._require_usable()
-        specifications = _metadata_specifications()
-        staging = {
-            name: torch.empty(shape, dtype=dtype, device="cpu", pin_memory=False)
-            for name, (shape, dtype) in specifications.items()
-        }
-        tensors = {
-            name: torch.empty(shape, dtype=dtype, device=self.device)
-            for name, (shape, dtype) in specifications.items()
-        }
-        return _MetadataStorage(self, tensors, staging)
+        if (
+            not isinstance(row_count, Integral)
+            or isinstance(row_count, bool)
+            or row_count < 4
+            or row_count & (row_count - 1)
+        ):
+            raise ValueError("persistent row_count must be a power of two of at least 4")
+        if type(table_width) is not int or table_width <= 0:
+            raise ValueError("persistent table_width must be a positive integer")
+        row_count = int(row_count)
+        specifications = _metadata_specifications(row_count, table_width)
+        size = _metadata_payload_bytes(row_count, table_width)
+        packed_staging = torch.empty(
+            size, dtype=torch.uint8, device="cpu", pin_memory=self.device.type == "cuda"
+        )
+        packed = torch.empty(size, dtype=torch.uint8, device=self.device)
+
+        def views(buffer):
+            offset, result = 0, {}
+            for name, (shape, dtype) in specifications.items():
+                width = prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
+                result[name] = buffer[offset : offset + width].view(dtype).reshape(shape)
+                offset += width
+            return result
+
+        return _MetadataStorage(
+            self,
+            views(packed),
+            views(packed_staging),
+            packed,
+            packed_staging,
+            capacity=(row_count, table_width),
+        )
 
     def _prepare_into(self, storage: _MetadataStorage, host: _HostKVBatch) -> _PreparedKVBatch:
         """Borrow fixed tensors for exactly one generation, after all host checks."""
         self._require_usable()
         if storage.owner is not self or host.owner is not self:
             raise ValueError("persistent metadata belongs to a different cache manager")
-        if storage.failed or storage.in_use:
+        if storage.failed or storage.in_use or storage.transaction is not None:
             raise RuntimeError("persistent metadata is failed or already in use")
-        if len(host.rows) > 4 or host.width > 32:
+        row_count, table_width = storage.tensors["block_tables"].shape
+        if (row_count, table_width) != storage.capacity:
+            raise ValueError("persistent metadata must retain its fixed capacity")
+        if len(host.rows) > row_count // 2 or host.width > table_width:
             raise ValueError("persistent metadata capacity exceeded")
         for request_id, allocation in host.allocations:
             if self._allocations.get(request_id) is not allocation:
                 raise RuntimeError(f"stale host KV batch for request {request_id!r}")
-        live_rows = tuple(2 * index + 1 for index in range(len(host.rows)))
+        live_rows = decode_live_rows(len(host.rows))
         # All metadata tails are initialized, including addresses never consumed
-        # by inactive kernels. Fixed unpinned staging never aliases device storage.
-        staging = storage.staging
+        # by inactive kernels. The lease prevents staging reuse before completion.
+        staging = {name: tensor.numpy() for name, tensor in storage.staging.items()}
         for name, tensor in staging.items():
-            tensor.fill_(-1 if name in {"write_blocks", "write_offsets", "block_tables"} else 0)
+            tensor.fill(-1 if name in {"write_blocks", "write_offsets", "block_tables"} else 0)
         for row, (allocation, depth, position) in zip(live_rows, host.rows):
             staging["active"][row] = True
             staging["position_ids"][row] = position
@@ -446,13 +539,12 @@ class KVCacheManager:
                 position // self.block_size
             ]
             staging["write_offsets"][row] = position % self.block_size
-            for column, page in enumerate(allocation.block_tables[depth][:32]):
-                staging["block_tables"][row, column] = page
+            table = allocation.block_tables[depth][:table_width]
+            staging["block_tables"][row, : len(table)] = table
         storage.generation += 1
         storage.in_use = True
         try:
-            for name, tensor in storage.tensors.items():
-                tensor.copy_(staging[name], non_blocking=False)
+            storage.packed.copy_(storage.packed_staging, non_blocking=self.device.type == "cuda")
         except BaseException:
             storage.failed = True
             raise
@@ -460,11 +552,12 @@ class KVCacheManager:
             owner=self,
             rows=host.rows,
             allocations=host.allocations,
-            row_count=8,
+            row_count=row_count,
             live_rows=live_rows,
             writable=host.writable,
             storage=storage,
             generation=storage.generation,
+            allocation_generation=self._allocation_generation,
             **storage.tensors,
         )
 
@@ -473,7 +566,153 @@ class KVCacheManager:
         self._require_live_batch(batch)
         if batch.storage is None:
             raise ValueError("only persistent descriptors have a releasable lease")
+        if batch.storage.transaction is not None:
+            raise RuntimeError("decode transaction must finish before releasing its lease")
         batch.storage.in_use = False
+
+    def _validate_decode_host(self, host: _HostKVBatch) -> None:
+        self._require_usable()
+        if host.owner is not self or not host.writable or not host.rows:
+            raise ValueError("decode traversal requires this cache's nonempty writable batch")
+        for request_id, allocation in host.allocations:
+            if self._allocations.get(request_id) is not allocation:
+                raise RuntimeError(f"stale host KV batch for request {request_id!r}")
+        owners = {id(allocation) for _, allocation in host.allocations}
+        addresses = []
+        for allocation, depth, position in host.rows:
+            if id(allocation) not in owners:
+                raise RuntimeError("decode row does not belong to its captured allocation")
+            self._validate_depth(depth)
+            self._validate_position(allocation, position)
+            addresses.append(
+                (
+                    allocation.block_tables[depth][position // self.block_size],
+                    position % self.block_size,
+                )
+            )
+            # LAST-EXITED may already have initialized this position. Rewrites
+            # are valid, but every layer must have all preceding positions.
+            for layer in range(self.num_layers):
+                self._require_prefix(allocation, layer, depth, position)
+        if tuple(addresses) != host.addresses or len(set(addresses)) != len(addresses):
+            raise ValueError("decode traversal contains changed or duplicate destinations")
+
+    def _begin_decode_traversal(self, host: _HostKVBatch) -> _DecodeTraversal:
+        """Validate every preceding layer before any metadata copy or KV write."""
+        self._validate_decode_host(host)
+        return _DecodeTraversal(self, host, self._allocation_generation)
+
+    def _check_decode_ticket(self, ticket):
+        self._require_usable()
+        if ticket.allocation_generation != self._allocation_generation:
+            raise RuntimeError("stale decode allocation generation")
+
+    def _bind_decode_traversal(self, ticket: _DecodeTraversal, batch: _PreparedKVBatch) -> None:
+        """Bind the actual newly prepared lease, not its previous generation."""
+        if ticket.owner is not self or ticket.state != "begun":
+            raise RuntimeError("decode transaction is foreign or already bound")
+        self._check_decode_ticket(ticket)
+        self._require_live_batch(batch)
+        if (
+            batch.storage is None
+            or not batch.writable
+            or batch.rows is not ticket.host.rows
+            or batch.allocations is not ticket.host.allocations
+            or batch.storage.transaction is not None
+        ):
+            raise ValueError("decode transaction must bind its own newly prepared batch")
+        ticket.batch = batch
+        ticket.state = "bound"
+        batch.storage.transaction = ticket
+
+    def _commit_decode_traversal(
+        self, ticket: _DecodeTraversal, *, completion_confirmed: bool
+    ) -> None:
+        """Publish host prefixes once, after the caller confirms device completion.
+
+        All rows are checked before the first mutation. A mutation-time failure
+        cannot be rolled back honestly: quarantine the manager and storage, so
+        a partially committed traversal can never be reused or retried.
+        """
+        if ticket.owner is not self or ticket.state != "bound":
+            raise RuntimeError("decode transaction is foreign, unbound or already finished")
+        if completion_confirmed is not True:
+            raise RuntimeError("decode commit requires confirmed device completion")
+        batch = ticket.batch
+        try:
+            self._require_usable()
+            if (
+                batch.storage.failed
+                or not batch.storage.in_use
+                or batch.storage.generation != batch.generation
+            ):
+                raise RuntimeError("stale or failed persistent KV generation")
+            if batch.storage.transaction is not ticket:
+                raise RuntimeError("decode transaction does not own this metadata lease")
+            self._check_decode_ticket(ticket)
+            for allocation, depth, position in ticket.host.rows:
+                for layer in range(self.num_layers):
+                    allocation.written[depth][layer].add(position)
+        except BaseException:
+            ticket.state = "failed"
+            batch.storage.failed = True
+            self._quarantine("decode prefix commit failed")
+            raise
+        ticket.state = "committed"
+        batch.storage.transaction = None
+
+    def _cancel_decode_traversal(self, ticket: _DecodeTraversal) -> None:
+        """Cancel before submission only; leave every written prefix unchanged."""
+        if ticket.owner is not self or ticket.state not in {"begun", "bound"}:
+            raise RuntimeError("decode transaction cannot be cancelled")
+        if ticket.batch is not None:
+            self._require_live_batch(ticket.batch)
+            if ticket.batch.storage.transaction is not ticket:
+                raise RuntimeError("decode transaction does not own this metadata lease")
+            ticket.batch.storage.transaction = None
+        ticket.state = "cancelled"
+
+    def _abort_decode_traversal(
+        self, ticket: _DecodeTraversal, *, completion_confirmed: bool
+    ) -> None:
+        """Fail closed after submission; preserve any already committed history."""
+        if ticket.owner is not self:
+            raise ValueError("decode transaction belongs to a different cache manager")
+        if not isinstance(completion_confirmed, bool):
+            raise ValueError("completion_confirmed must be boolean")
+        batch = ticket.batch
+        ticket.state = "failed"
+        if batch is not None:
+            storage = batch.storage
+            storage.failed = True
+            if storage.generation != batch.generation or (
+                storage.transaction is not None and storage.transaction is not ticket
+            ):
+                self._quarantine("stale decode transaction cannot settle another lease")
+                raise RuntimeError("stale decode transaction cannot settle another lease")
+            if completion_confirmed:
+                storage.transaction = None
+                storage.in_use = False
+        if not completion_confirmed:
+            self._quarantine("decode traversal completion failed")
+
+    def _make_tensor_decode_view(self, storage: _MetadataStorage) -> _TensorKVView:
+        """Resolve fixed tensor views and Triton imports before capture begins."""
+        self._require_usable()
+        if storage.owner is not self or storage.failed:
+            raise ValueError("tensor decode view requires this cache's usable storage")
+        if self.backend != "triton":
+            raise ValueError("tensor-only decode requires the Triton backend")
+        from vllm_lt.kernels.triton_kv_write import masked_kv_write
+
+        return _TensorKVView(
+            row_count=storage.tensors["block_tables"].shape[0],
+            **storage.tensors,
+            key_layers=tuple(self.key_cache[:, layer] for layer in range(self.num_layers)),
+            value_layers=tuple(self.value_cache[:, layer] for layer in range(self.num_layers)),
+            write_kernel=masked_kv_write,
+            attention_kernel=triton_paged_attention,
+        )
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
         self._require_usable()
@@ -488,8 +727,11 @@ class KVCacheManager:
                 or storage.generation != batch.generation
             ):
                 raise RuntimeError("stale or failed persistent KV generation")
+            if batch.allocation_generation != self._allocation_generation:
+                raise RuntimeError("stale prepared KV allocation generation")
             if any(getattr(batch, name) is not tensor for name, tensor in storage.tensors.items()):
                 raise ValueError("persistent descriptor changed its borrowed tensor storage")
+            return
         for request_id, allocation in batch.allocations:
             if self._allocations.get(request_id) is not allocation:
                 raise RuntimeError(f"stale prepared KV batch for request {request_id!r}")

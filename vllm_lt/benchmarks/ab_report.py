@@ -8,6 +8,41 @@ from .report import _profiles, _run_record
 from .schema import _file_record, read_json, write_json
 
 
+def audit_worker_launches(manifest):
+    launches = manifest["workers"]
+    equal(
+        [row["worker_id"] for row in launches],
+        list(WORKERS)[: len(launches)],
+        "worker launch order",
+    )
+    if manifest["status"] == "complete":
+        equal(len(launches), len(WORKERS), "eight actual launches")
+
+
+def audit_worker_lifetime(manifest, index, child, *, interrupted=False):
+    launches = manifest["workers"]
+    launch = launches[index]
+    times = [manifest["started_ns"], launch["launched_ns"], child["started_ns"]]
+    if not interrupted:
+        times.append(child["ended_ns"])
+    times.extend([launch["returned_ns"], manifest["ended_ns"]])
+    require(all(a <= b for a, b in zip(times, times[1:])), "worker process lifetime")
+    if index:
+        require(launches[index - 1]["returned_ns"] <= launch["launched_ns"], "overlapping workers")
+    if child["worker_id"] == "A1":
+        require(
+            launches[index - 1]["returned_ns"]
+            <= manifest["numerical_gate_ns"]
+            < launch["launched_ns"],
+            "correctness gate must precede timed workers",
+        )
+        require(
+            manifest["numerical_gate"]["complete"] is True
+            and manifest["numerical_gate"]["passed"] is True,
+            "failed pre-timing gate",
+        )
+
+
 def _finite(value, label, *, positive=False):
     require(
         type(value) in (int, float)
@@ -63,7 +98,7 @@ def _work_identity(result):
     }
 
 
-def pair_results(plan, records):
+def pair_results(plan, records, *, pair_prefix="M2", pair_extra=None):
     """Both observations must meet their own limits; never average away a failure."""
     acceptance = plan["contract"]["acceptance"]
     measured = [row for row in records if row["planned"]["phase"] == "measured"]
@@ -71,7 +106,7 @@ def pair_results(plan, records):
     for cell in CELLS:
         pairs, avalues, bvalues = [], [], []
         for repetition in (1, 2):
-            pair_id = f"M2-{cell}-{repetition}"
+            pair_id = f"{pair_prefix}-{cell}-{repetition}"
             members = [row for row in measured if row["planned"]["pair_id"] == pair_id]
             item = {"pair_id": pair_id, "status": "invalid", "errors": []}
             try:
@@ -120,7 +155,6 @@ def pair_results(plan, records):
                 setup = _finite(b["setup_ns"], "B setup") - _finite(a["setup_ns"], "A setup")
                 gates = {
                     "throughput": bv / av >= target,
-                    "setup": setup <= acceptance["setup_increase_ns_max"],
                     **{
                         name: value <= acceptance["peak_increase_bytes_max"]
                         for name, value in increases.items()
@@ -141,18 +175,24 @@ def pair_results(plan, records):
                     baseline_metrics=arow["recomputed_metrics"],
                     candidate_metrics=brow["recomputed_metrics"],
                 )
+                if pair_extra is None:
+                    gates["setup"] = setup <= acceptance["setup_increase_ns_max"]
+                else:
+                    pair_extra(arow, brow, item, acceptance)
+                item["status"] = "passed" if all(gates.values()) else "failed"
                 avalues.append(av)
                 bvalues.append(bv)
             except (ValueError, KeyError, TypeError) as exc:
+                item["status"] = "invalid"
                 item["errors"].append(str(exc))
             pairs.append(item)
         complete = len(avalues) == len(bvalues) == 2
         separated = (min(bvalues) > max(avalues)) if complete else None
         status = (
-            "inconclusive"
-            if not complete
-            else "failed"
+            "failed"
             if any(pair["status"] == "failed" for pair in pairs)
+            else "inconclusive"
+            if not complete
             else "inconclusive"
             if (cell == acceptance["target_cell"] and not separated)
             else "passed"
@@ -263,15 +303,9 @@ def build_report(output_dir):
         )
         previous = None
         launches = manifest["workers"]
-        if manifest["status"] == "complete":
-            equal(len(launches), 8, "eight actual worker launches")
+        audit_worker_launches(manifest)
         actual_workers = {path.name for path in (output_dir / "workers").glob("*") if path.is_dir()}
         require(actual_workers <= set(WORKERS), "unplanned worker artifacts")
-        equal(
-            [row["worker_id"] for row in launches],
-            list(WORKERS)[: len(launches)],
-            "actual worker launch order",
-        )
         for index, launch in enumerate(launches):
             worker = plan["workers"][index]
             path = output_dir / "workers" / worker["worker_id"] / "manifest.json"
@@ -300,31 +334,7 @@ def build_report(output_dir):
             )
             equal(child["model_loads"], 1, "one model load per worker")
             equal(child["deadline_ns"], manifest["deadline_ns"], "worker global deadline")
-            require(
-                manifest["started_ns"]
-                <= launch["launched_ns"]
-                <= child["started_ns"]
-                <= child["ended_ns"]
-                <= launch["returned_ns"]
-                <= manifest["ended_ns"],
-                "worker clock ordering is inconsistent",
-            )
-            if index:
-                require(
-                    launches[index - 1]["returned_ns"] <= launch["launched_ns"],
-                    "worker processes overlap",
-                )
-            if worker["worker_id"] == "A1":
-                require(
-                    launches[index - 1]["returned_ns"]
-                    <= manifest["numerical_gate_ns"]
-                    < launch["launched_ns"],
-                    "numerical gate did not precede measured-worker launch",
-                )
-                require(
-                    manifest["numerical_gate"]["complete"] and manifest["numerical_gate"]["passed"],
-                    "timing started without numerical qualification",
-                )
+            audit_worker_lifetime(manifest, index, child)
             audit_worker_controls(plan, child, previous)
             previous = child
         report["artifact_usage"] = artifact_usage(output_dir, plan["contract"]["limits"])

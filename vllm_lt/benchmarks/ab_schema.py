@@ -196,25 +196,25 @@ def validate_contract(contract, *, resolved=False):
         _text(item, "stop condition")
 
 
-def source_probe():
+def source_probe(*, import_modules=IMPORT_MODULES):
     """Called in the selected checkout; imports must originate there, without CUDA."""
     import importlib
 
     source = _source_manifest()
     root = Path(source["root"]).resolve()
     imports = {}
-    for name in IMPORT_MODULES:
+    for name in import_modules:
         path = Path(importlib.import_module(name).__file__).resolve()
         require(path.is_relative_to(root), f"import outside selected implementation: {name}")
         imports[name] = str(path.relative_to(root))
     return {"source": source, "imports": imports, "dependencies": dependency_manifest()}
 
 
-def probe_checkout(root):
+def probe_checkout(root, *, module="vllm_lt.benchmarks.ab"):
     root = Path(root).resolve()
     env = dict(os.environ, PYTHONPATH=str(root))
     raw = subprocess.check_output(
-        [sys.executable, "-m", "vllm_lt.benchmarks.ab", "source-probe"],
+        [sys.executable, "-m", module, "source-probe"],
         cwd=root,
         env=env,
         text=True,
@@ -282,7 +282,7 @@ def _source_controls(implementations):
     return harness, differences
 
 
-def execution_rows(suite, contract, stats, numerical):
+def execution_rows(suite, contract, stats, numerical, *, pair_prefix="M2"):
     workloads = {row["workload_id"]: row for row in suite["workloads"]}
     rows, workers = [], []
     shared_hash = _digest(contract)
@@ -304,7 +304,7 @@ def execution_rows(suite, contract, stats, numerical):
                 "mode": mode,
                 "phase": phase,
                 "repetition": repetition,
-                "pair_id": f"M2-{cell}-{repetition}" if phase == "measured" else None,
+                "pair_id": f"{pair_prefix}-{cell}-{repetition}" if phase == "measured" else None,
                 "instrumentation": {"feasibility": "validation", "profile": "profile"}.get(
                     phase, "timing"
                 ),
@@ -339,9 +339,10 @@ def execution_rows(suite, contract, stats, numerical):
                 for cell in CELLS:
                     add(cell, phase, int(worker_id[-1]))
         workers.append(worker)
+    expected = len(numerical["execution_order"]) + 78
     require(
-        len(rows) == 105 and len({row["execution_id"] for row in rows}) == 105,
-        "M2 must resolve to 105 unique executions",
+        len(rows) == len({row["execution_id"] for row in rows}) == expected,
+        "unique numerical cases and 78 benchmark executions required",
     )
     return workers, rows
 
@@ -547,6 +548,11 @@ def verify_ab_plan(plan, *, implementation_id=None):
         equal(actual["source"], expected["source"], "frozen implementation source")
         equal(actual["imports"], expected["imports"], "frozen import paths")
         equal(actual["dependencies"], plan["dependencies"], "frozen dependencies")
+    verify_inputs(plan, affinity=affinity_snapshot())
+
+
+def verify_inputs(plan, *, affinity):
+    """Verify checkpoint/input bytes and the prepared host environment without CUDA."""
     equal(_model_files(Path(plan["model_path"])), plan["model_files"], "frozen checkpoint files")
     equal(
         OuroConfig.from_dict(read_json(Path(plan["model_path"]) / "config.json")).to_dict(),
@@ -556,14 +562,14 @@ def verify_ab_plan(plan, *, implementation_id=None):
     equal(
         _file_record(Path(plan["contract_file"]["path"])),
         plan["contract_file"],
-        "M2 input contract",
+        "frozen contract",
     )
     original = read_json(Path(plan["contract_file"]["path"]))
     original["controls"].update(
         gpu_ids=plan["contract"]["controls"]["gpu_ids"],
         affinity=plan["contract"]["controls"]["affinity"],
     )
-    equal(original, plan["contract"], "resolved M2 contract contents")
+    equal(original, plan["contract"], "resolved contract contents")
     for name, record in plan["inputs"].items():
         equal(_file_record(Path(record["file"]["path"])), record["file"], "frozen input " + name)
         equal(read_json(Path(record["file"]["path"])), record["contents"], "embedded input " + name)
@@ -573,7 +579,7 @@ def verify_ab_plan(plan, *, implementation_id=None):
         plan["runtime_environment"],
         "runtime environment",
     )
-    equal(affinity_snapshot(), plan["contract"]["controls"]["affinity"], "CPU/NUMA affinity")
+    equal(affinity, plan["contract"]["controls"]["affinity"], "CPU/NUMA affinity")
 
 
 def execution_view(plan):

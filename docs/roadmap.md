@@ -37,6 +37,12 @@ throughput improvement or task-quality result yet. See the
 | M5 — asynchronous routing, later | Evaluate the paper's lookahead method only after the synchronous baseline is fast | Available or separately trained/calibrated gate, held-out quality evidence, and benefit over the optimized synchronous engine. |
 
 M1 and Q1 can proceed independently using FP32 as the numerical baseline.
+M3 uses scheduler-sized persistent buckets and captures one recurrent traversal.
+It reduces launch overhead while retaining actual gate readback and host routing
+after each traversal; it does not implement M5 lookahead. Observed throughput
+ratios are workload measurements, not a theoretical ceiling. See
+[the CUDA graph design and qualification boundaries](m3-cuda-graphs.md).
+
 M2–M4 retain synchronous gating initially. Attention work can precede graphs if
 M1 identifies it as the larger cost. Q2 depends on Q1 for BF16 promotion and is
 required before publishing adaptive speed/quality claims. Serving, more models,

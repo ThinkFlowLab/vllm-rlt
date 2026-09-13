@@ -1,0 +1,109 @@
+{
+  "schema_version": 2,
+  "artifact_type": "m3_capture_contract",
+  "contract_id": "ouro-m3-capture-replay-v2",
+  "hypothesis": "Replaying the common fixed-bucket FP32 Triton decode tensor body improves W1 throughput while preserving original numerical behavior, controls, and bounded setup/storage.",
+  "isolated_variable": "Identical source and common tensor body: eager A use_graphs=false versus CUDA graph replay B use_graphs=true.",
+  "inputs": {
+    "benchmark_suite": "benchmarks/fixtures/ouro-m1.json",
+    "benchmark_contract": "benchmarks/fixtures/ouro-m1-contract.json",
+    "numerical_suite": "benchmarks/fixtures/ouro-q1.json",
+    "numerical_contract": "benchmarks/fixtures/ouro-q1-contract.json"
+  },
+  "implementation_options": {
+    "A": {
+      "use_graphs": false
+    },
+    "B": {
+      "use_graphs": true
+    }
+  },
+  "controls": {
+    "gpu_ids": null,
+    "affinity": null,
+    "cpu_threads": 1,
+    "interop_threads": 1,
+    "seed": 0,
+    "numa_policy": "inherit-verified-parent-binding",
+    "residency_policy": "one-fresh-worker-one-model-fresh-case-engine",
+    "cache_policy": "fresh-engine-preserve-worker-allocator",
+    "environment_policy": "same-prepared-Q1-environment-all-workers",
+    "source_policy": "same-clean-commit-and-all-source-bytes",
+    "graph_setup_policy": "fresh-executor-before-admission-outside-measured-arrival-window",
+    "timing_observer": "lightweight-host-events-and-executor-counters",
+    "diagnostic_observer": "correctness-and-profile-only"
+  },
+  "acceptance": {
+    "target_cell": "W1-refill",
+    "target_ratio_min": 1.1,
+    "control_cells": [
+      "W2-refill",
+      "W3-refill",
+      "W4-refill",
+      "W4-no_refill",
+      "W5-refill",
+      "W5-no_refill"
+    ],
+    "control_ratio_min": 0.95,
+    "target_ttft_ratio_max": 1.05,
+    "pairs": [
+      [
+        "A1",
+        "B1"
+      ],
+      [
+        "A2",
+        "B2"
+      ]
+    ],
+    "pair_gates": "each-pair-not-only-aggregate",
+    "variation": "min-B-strictly-greater-than-max-A",
+    "verdict_precedence": "invalid-evidence-then-required-failure-then-missing-or-inconclusive",
+    "numerical": "all-original-Q1-FP32-required-logit-token-exit-and-full-populated-KV-gates",
+    "intermediates": "finite-required-deltas-diagnostic-no-new-tolerance",
+    "profile": "actual-correlated-replay-launch-proof-for-W1-and-W4-refill",
+    "setup": "reported-separately-scheduler-sized-graph-limits-no-M2-relative-setup-cap",
+    "sanitizer": "unavailable-no-executions-no-coverage-claim",
+    "peak_increase_bytes_max": 536870912
+  },
+  "limits": {
+    "total_timeout_s": 7200,
+    "case_timeout_s": 600,
+    "workers": 8,
+    "model_loads": 8,
+    "executions": 93,
+    "correctness_executions": 15,
+    "model_cases": 15,
+    "model_qualification_cases": 13,
+    "model_excluded_feasibility_cases": 2,
+    "comparison_streams": 31,
+    "qualification_comparison_streams": 30,
+    "feasibility_executions": 14,
+    "warmup_executions": 28,
+    "measured_executions": 28,
+    "diagnostic_warmup_executions": 4,
+    "profile_executions": 4,
+    "profile_decode_outputs": 16,
+    "profile_trace_bytes_max": 2147483648,
+    "profile_total_bytes_max": 4294967296,
+    "artifact_bytes_max": 17179869184,
+    "pointer_evidence_bytes_max": 209715200,
+    "sanitizer_executions": 0
+  },
+  "graph_limits": {
+    "common_payload_bytes": 1048576,
+    "cpu_staging_bytes": 16384,
+    "graph_retained_allocated_bytes": 268435456,
+    "graph_retained_reserved_bytes": 268435456,
+    "setup_peak_allocated_bytes": 536870912,
+    "setup_peak_reserved_bytes": 536870912,
+    "setup_timeout_s": 60
+  },
+  "stop_conditions": [
+    "Any execution, nonfinite, ownership, source, input, dependency, device, affinity or cleanup failure stops subsequent executions; retain the failed prefix and do not retry.",
+    "All correctness and excluded feasibility gates must pass before measured A1.",
+    "Independent parent watchdogs enforce case 600-second and total 7200-second limits, including setup, export and cleanup. Setup must complete within 60 seconds to qualify; its phase checks are cooperative, while blocked device calls remain subject to the case/global watchdogs. No hard 60-second interruption is claimed.",
+    "Any frozen tensor, pointer, trace or total artifact budget overrun.",
+    "Performance misses and overlapping ranges cannot promote the candidate or expand the matrix."
+  ]
+}

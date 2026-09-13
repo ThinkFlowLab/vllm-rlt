@@ -4,71 +4,161 @@ from copy import deepcopy
 
 import torch
 
-from vllm_lt.core.kv_cache_manager import _metadata_payload_bytes
 from vllm_lt.core.scheduler import SchedulerOutput
 from vllm_lt.request import Request, Stage
+from vllm_lt.worker.decode_buffers import DecodeBucketLayout, allocate_bucket
+from vllm_lt.worker.graph_diagnostics import (
+    GraphLimits,
+    _bucket_snapshot,
+    _description,
+    _error,
+    _storage_snapshot,
+)
 
 
 class ModelRunner:
-    def __init__(self, model, cache_manager):
+    def __init__(self, model, cache_manager, *, max_num_seqs=4):
         self.model = model.eval()
         self.cache_manager = cache_manager
         self.device = next(model.parameters()).device
+        self._decode_layout = DecodeBucketLayout(max_num_seqs=max_num_seqs)
         self._persistent = None
+        self._decode_executor = None
+        self._graph_declined = None
         self._persistent_stream = None
         self._inside_execute = False
         self._persistent_lease = None
 
-    @staticmethod
-    def _tensor_description(tensor):
-        return {
-            "data_ptr": tensor.data_ptr(),
-            "storage_ptr": tensor.untyped_storage().data_ptr(),
-            "shape": list(tensor.shape),
-            "stride": list(tensor.stride()),
-            "dtype": str(tensor.dtype),
-            "device": str(tensor.device),
-            "size_bytes": tensor.numel() * tensor.element_size(),
-            "storage_bytes": tensor.untyped_storage().nbytes(),
-        }
+    @property
+    def decode_executor(self):
+        """Current private executor, exposed for lifecycle and diagnostics."""
+        return self._decode_executor
+
+    def _require_decode_unconfigured(self):
+        self.cache_manager._require_usable()
+        if (
+            self._persistent is not None
+            or self._decode_executor is not None
+            or self._graph_declined is not None
+        ):
+            raise RuntimeError(
+                "a private decode executor is already enabled; replacement is forbidden"
+            )
 
     def _enable_persistent_decode(self):
-        """Opt in to one fixed eager capacity; construction never changes request KV."""
-        self.cache_manager._require_usable()
-        if self._persistent is not None:
-            raise RuntimeError("persistent decode is already enabled; replacement is forbidden")
+        """Prepare the scheduler-sized eager bucket ladder before request admission."""
+        self._require_decode_unconfigured()
         parameter = next(self.model.parameters())
         if parameter.dtype != torch.float32 or self.cache_manager.dtype != torch.float32:
             raise ValueError("persistent decode initially supports float32 only")
         if parameter.device != self.cache_manager.device:
             raise ValueError("persistent model and KV cache must use the same device")
         width = self.model.config.hidden_size
-        payload_bytes = (2 * 8 * width + 8) * 4 + _metadata_payload_bytes() + 4 * 8
-        if payload_bytes > 256 * 1024:
-            raise ValueError("persistent decode exceeds the 256 KiB tensor payload cap")
+        payload_bytes, staging_bytes = self._decode_layout.payload_bytes(width)
+        limits = GraphLimits()
+        if payload_bytes > limits.common_payload_bytes or staging_bytes > limits.cpu_staging_bytes:
+            raise ValueError("persistent decode exceeds its 1 MiB tensor / 16 KiB staging cap")
         setup_stream = (
             torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
         )
-        metadata = self.cache_manager._allocate_metadata_storage()
-        tensors = {
-            **metadata.tensors,
-            "hidden_in": torch.empty((8, width), dtype=torch.float32, device=self.device),
-            "hidden_out": torch.empty((8, width), dtype=torch.float32, device=self.device),
-            "gate_out": torch.empty(8, dtype=torch.float32, device=self.device),
-            "live_indices": torch.tensor([1, 3, 5, 7], dtype=torch.long, device=self.device),
+        buckets = {
+            rows: allocate_bucket(self.cache_manager, self._decode_layout, rows, width)
+            for rows in self._decode_layout.row_counts
         }
         # Publish the bundle only after every allocation succeeds. No partially
         # constructed executor is reachable after a constructor exception.
         self._persistent_stream = setup_stream
         self._persistent = {
-            "metadata": metadata,
-            "tensors": tensors,
+            **buckets[self._decode_layout.row_counts[-1]],
+            "buckets": buckets,
             "counters": {"calls": 0, "prepared": 0, "completed": 0, "empty": 0},
             "fallback_counts": {"live_count": 0, "table_width": 0},
             "last_dispatch": None,
             "last_publication": None,
             "failure": None,
         }
+
+    def _enable_recurrent_graph(self, *, use_graphs: bool, limits=None):
+        """Install the private eager/replay buckets before any request admission."""
+        from .recurrent_graph import CaptureBudgetExceeded, RecurrentGraphExecutor
+
+        self._require_decode_unconfigured()
+        executor = None
+        try:
+            executor = RecurrentGraphExecutor(
+                self.model,
+                self.cache_manager,
+                use_graphs=use_graphs,
+                limits=limits,
+                layout=self._decode_layout,
+            )
+            # Retain partial setup storage on failure until completion permits close.
+            self._decode_executor = executor
+            executor.setup()
+        except CaptureBudgetExceeded as error:
+            attempt_setup = attempt_failure = None
+            if executor is not None:
+                # setup() already settles its failure. Any secondary device or
+                # restoration error prevents decline, even if a later close might
+                # establish completion; that remains explicit recovery work.
+                failure = executor.failure
+                if failure is None or not failure["completion_confirmed"] or failure["secondary"]:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "capture budget decline refused: setup did not settle cleanly"
+                        )
+                    raise
+                attempt_setup = deepcopy(executor.setup_record)
+                attempt_failure = deepcopy(failure)
+                try:
+                    executor.close()
+                    self.cache_manager._require_usable()
+                    if self.cache_manager._allocations:
+                        raise RuntimeError("capture budget decline retained scratch allocations")
+                except BaseException as secondary:
+                    self.cache_manager._quarantine("capture budget decline cleanup failed")
+                    if hasattr(error, "add_note"):
+                        error.add_note(f"capture budget decline cleanup failed: {secondary}")
+                    raise error from secondary
+            # Constructor declines happened before allocating/submitting anything.
+            # Otherwise the entire attempted executor was closed after confirmed
+            # completion, leaving the original pool available to ordinary eager.
+            self._graph_declined = {
+                "reason": "capture_budget",
+                "attempted_use_graphs": use_graphs,
+                "limits": dict(error.limits),
+                "error": error.record(),
+                "attempt_setup": attempt_setup,
+                "attempt_failure": attempt_failure,
+                "completion_confirmed": True,
+                "calls": 0,
+                "closed": False,
+            }
+            self._decode_executor = None
+
+    def _graph_snapshot(self):
+        if self._graph_declined is not None:
+            return {
+                "enabled": False,
+                "status": "closed" if self._graph_declined["closed"] else "budget_fallback",
+                "budget_decline": deepcopy(self._graph_declined),
+            }
+        return (
+            {"enabled": False}
+            if self._decode_executor is None
+            else self._decode_executor.snapshot()
+        )
+
+    def _close_recurrent_graph(self):
+        if self._decode_executor is not None:
+            self._decode_executor.close()
+        elif self._graph_declined is not None:
+            self._graph_declined["closed"] = True
+
+    def _settle_execution_failure(self, error):
+        if self._decode_executor is not None:
+            return self._decode_executor.settle_failure(error)
+        return self._settle_persistent_failure(error)
 
     def _persistent_snapshot(self):
         """Detached host metadata only; never read device tensor contents."""
@@ -79,18 +169,13 @@ class ModelRunner:
         return {
             "enabled": True,
             "status": "failed" if metadata.failed else "in_flight" if metadata.in_use else "ready",
-            "generation": metadata.generation,
-            "capacity": {"row_count": 8, "table_width": 32, "max_live_rows": 4},
-            "device_payload_bytes": sum(
-                t.numel() * t.element_size() for t in bundle["tensors"].values()
-            ),
-            "cpu_staging_bytes": sum(
-                t.numel() * t.element_size() for t in metadata.staging.values()
-            ),
-            "tensors": {k: self._tensor_description(v) for k, v in bundle["tensors"].items()},
-            "staging_tensors": {
-                k: self._tensor_description(v) for k, v in metadata.staging.items()
+            "capacity": {
+                "row_count": self._decode_layout.row_counts[-1],
+                "table_width": self._decode_layout.table_width,
+                "max_live_rows": self._decode_layout.max_num_seqs,
             },
+            **_storage_snapshot(bundle["buckets"]),
+            **_bucket_snapshot(bundle),
             **deepcopy(
                 {
                     k: bundle[k]
@@ -107,7 +192,13 @@ class ModelRunner:
 
     def _require_execution_usable(self):
         self.cache_manager._require_usable()
-        if self._persistent is not None and self._persistent["metadata"].failed:
+        if self._graph_declined is not None and self._graph_declined["closed"]:
+            raise RuntimeError("declined recurrent executor is closed")
+        if self._decode_executor is not None:
+            self._decode_executor.require_usable()
+        if self._persistent is not None and any(
+            b["metadata"].failed for b in self._persistent["buckets"].values()
+        ):
             raise RuntimeError("persistent executor failed; retry is forbidden")
 
     def _select_persistent_stream(self):
@@ -121,10 +212,6 @@ class ModelRunner:
         if self._persistent_stream is not None:
             self._persistent_stream.synchronize()
 
-    @staticmethod
-    def _error_description(error):
-        return {"type": type(error).__name__, "message": str(error)[:512]}
-
     def _settle_persistent_failure(self, error, *, completion_error=None):
         """Invalidate before cleanup; return whether pages are safe to release."""
         bundle = self._persistent
@@ -132,32 +219,36 @@ class ModelRunner:
             return True
         if bundle["failure"] is not None:
             return bundle["failure"]["completion_confirmed"]
-        metadata = bundle["metadata"]
-        metadata.failed = True
+        for bucket in bundle["buckets"].values():
+            bucket["metadata"].failed = True
         failure = {
-            "primary": self._error_description(error),
+            "primary": _error(error),
             "secondary": [],
             "completion_confirmed": False,
         }
         bundle["failure"] = failure
         if completion_error is not None:
-            failure["secondary"].append(self._error_description(completion_error))
+            failure["secondary"].append(_error(completion_error))
             self.cache_manager._quarantine("persistent stream completion failed")
             return False
         try:
             self._synchronize_persistent()
         except BaseException as completion_error:
-            failure["secondary"].append(self._error_description(completion_error))
+            failure["secondary"].append(_error(completion_error))
             self.cache_manager._quarantine("persistent stream completion failed")
             return False
         failure["completion_confirmed"] = True
-        metadata.in_use = False
+        for bucket in bundle["buckets"].values():
+            bucket["metadata"].in_use = False
         self._persistent_lease = None
         return True
 
     def _record_cleanup_failure(self, error):
+        if self._decode_executor is not None:
+            self._decode_executor.record_cleanup_failure(error)
+            return
         if self._persistent is not None and self._persistent["failure"] is not None:
-            self._persistent["failure"]["secondary"].append(self._error_description(error))
+            self._persistent["failure"]["secondary"].append(_error(error))
         self.cache_manager._quarantine("request cleanup failed after execution failure")
 
     def _finish_persistent_lease(self):
@@ -169,22 +260,27 @@ class ModelRunner:
     @torch.inference_mode()
     def execute(self, batch: SchedulerOutput):
         self._require_execution_usable()
-        if self._persistent is None:
+        if self._persistent is None and self._decode_executor is None:
             return self._execute_batch(batch)
         if self._inside_execute:
             raise RuntimeError("persistent execution cannot be reentered")
-        self._select_persistent_stream()
+        if self._decode_executor is not None:
+            self._decode_executor.select_stream()
+        else:
+            self._select_persistent_stream()
         self._inside_execute = True
         try:
             return self._execute_batch(batch)
         except BaseException as error:
-            self._settle_persistent_failure(error)
+            self._settle_execution_failure(error)
             raise
         finally:
             self._inside_execute = False
 
     def _execute_batch(self, batch: SchedulerOutput):
         requests = [item.request for item in batch.items]
+        if not requests:
+            return [] if batch.stage in (Stage.RECURRENT, Stage.CODA) else None
         if batch.stage == Stage.PREFILL:
             ids, positions, tokens = [], [], []
             for item in batch.items:
@@ -219,6 +315,12 @@ class ModelRunner:
                 [r.loops_done for r in requests],
                 [r.position for r in requests],
             )
+            if self._decode_executor is not None:
+                probabilities = gate_logits.float().sigmoid().cpu().tolist()
+                self._decode_executor.complete_after_gate()
+                for request, state in zip(requests, hidden):
+                    request.hidden_state = state
+                return probabilities
             for request, state in zip(requests, hidden):
                 request.hidden_state = state
             # This is explicitly synchronous. A stock gate cannot act as the paper's lookahead gate.
@@ -234,8 +336,15 @@ class ModelRunner:
 
     def _recurrent(self, hidden, request_ids, depths, positions):
         """Private decode seam; persistent storage requires explicit setup."""
+        if self._decode_executor is not None:
+            return self._decode_executor.recurrent(
+                hidden, request_ids, depths, positions, defer_completion=self._inside_execute
+            )
         if self._persistent is not None:
             return self._recurrent_persistent(hidden, request_ids, depths, positions)
+        if self._graph_declined is not None:
+            self._require_execution_usable()
+            self._graph_declined["calls"] += 1
         return self.model.recurrent(hidden, request_ids, depths, positions, self.cache_manager)
 
     @torch.inference_mode()
@@ -244,7 +353,7 @@ class ModelRunner:
         bundle = self._persistent
         if bundle is None:
             raise RuntimeError("persistent decode is not enabled")
-        if bundle["metadata"].in_use:
+        if any(b["metadata"].in_use for b in bundle["buckets"].values()):
             raise RuntimeError("persistent decode still has an in-flight lease")
         if hidden.shape != (len(request_ids), self.model.config.hidden_size):
             raise ValueError("persistent decode requires compact live hidden inputs")
@@ -252,7 +361,11 @@ class ModelRunner:
             raise ValueError("persistent hidden inputs must match the float32 model device")
         host = self.cache_manager._prepare_host_batch(request_ids, depths, positions)
         count = len(host.rows)
-        reason = "live_count" if count > 4 else "table_width" if host.width > 32 else None
+        rows, reason = self._decode_layout.select(count, host.width)
+        if not reason and count:
+            # The selected view supports existing diagnostic callers; all
+            # bucket storage remains owned by the executor between traversals.
+            bundle.update(bundle["buckets"][rows])
         bundle["counters"]["calls"] += 1
         bundle["last_publication"] = None
         bundle["last_dispatch"] = {
@@ -261,8 +374,8 @@ class ModelRunner:
             "depths": [depth for _, depth, _ in host.rows],
             "positions": [position for _, _, position in host.rows],
             "live_rows": list(range(count)) if reason else [2 * i + 1 for i in range(count)],
-            "row_count": count if reason else 8,
-            "table_width": host.width if reason else 32,
+            "row_count": count if reason else rows,
+            "table_width": host.width if reason else self._decode_layout.table_width,
             "generation": bundle["metadata"].generation,
         }
         if not count:
@@ -294,8 +407,8 @@ class ModelRunner:
                     tensors["gate_out"].index_select(0, live),
                 )
             bundle["last_publication"] = {
-                "hidden": self._tensor_description(outputs[0]),
-                "gates": self._tensor_description(outputs[1]),
+                "hidden": _description(outputs[0]),
+                "gates": _description(outputs[1]),
             }
             if not self._inside_execute:
                 try:
