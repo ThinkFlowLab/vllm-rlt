@@ -6,7 +6,7 @@ import torch
 
 @pytest.mark.gpu
 def test_paged_attention_int32_block_ids_use_64bit_physical_offsets():
-    from vllm_lt.kernels.triton_attention import paged_attention
+    from vllm_rlt.kernels.triton_attention import paged_attention
 
     # Small logical rows separated by a large physical layer/block stride.
     # The last block's offset is 2**31 elements, although ID and stride each

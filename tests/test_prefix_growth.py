@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from vllm_lt import CacheConfig, SamplingParams, SchedulerConfig
-from vllm_lt.core.kv_cache_manager import KVCacheManager
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
 
 
 def model():
@@ -112,7 +112,7 @@ def test_lossless_preemption_preserves_looped_history():
 def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph):
     from dataclasses import replace
 
-    from vllm_lt import ExecutionConfig, ExitConfig
+    from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(21)
     cfg = replace(OuroConfig.tiny(), head_dim=64)
@@ -188,7 +188,7 @@ def test_priority_preempts_at_safe_boundary():
 
 @pytest.mark.gpu
 def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer():
-    from vllm_lt.worker.prefill_metadata import PrefillMetadataBank
+    from vllm_rlt.worker.prefill_metadata import PrefillMetadataBank
 
     c = KVCacheManager(
         2, 2, 64, 64, 16, 4, device="cuda", dtype=torch.bfloat16, backend="flash_attn_4"
@@ -229,7 +229,7 @@ def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer():
 def test_async_pressure_preemption_with_resident_state():
     from dataclasses import replace
 
-    from vllm_lt import ExecutionConfig, ExitConfig
+    from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(71)
     cfg = replace(OuroConfig.tiny(), head_dim=64)

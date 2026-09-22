@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm-lt"
+name = "vllm-rlt"
 version = "0.1.0"
 description = "Loop-level continuous batching for Ouro language models"
 readme = "README.md"
@@ -21,12 +21,12 @@ triton = ["triton>=3.1; platform_system == 'Linux'"]
 dev = ["pytest>=8", "ruff>=0.9"]
 
 [project.scripts]
-vllm-lt = "vllm_lt.entrypoints.cli:main"
-vllm-lt-serve = "vllm_lt.entrypoints.serve:main"
-vllm-lt-pd-serve = "vllm_lt.entrypoints.pd_serve:main"
+vllm-rlt = "vllm_rlt.entrypoints.cli:main"
+vllm-rlt-serve = "vllm_rlt.entrypoints.serve:main"
+vllm-rlt-pd-serve = "vllm_rlt.entrypoints.pd_serve:main"
 
 [tool.setuptools.packages.find]
-include = ["vllm_lt*"]
+include = ["vllm_rlt*"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE"]

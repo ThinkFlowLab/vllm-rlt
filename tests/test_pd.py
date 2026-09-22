@@ -6,12 +6,12 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.core.kv_cache_manager import KVCacheManager
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.pd.config import PDConfig
-from vllm_lt.pd.transport import kv_segments, partition_segments
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.pd.config import PDConfig
+from vllm_rlt.pd.transport import kv_segments, partition_segments
 
 
 def test_transfer_lease_defers_free_until_last_reader():
@@ -109,7 +109,7 @@ def drain(engine):
 
 def create_pd(*, graph=False, layout="last_exited", multi=False):
     pytest.importorskip("nixl")
-    from vllm_lt.pd.engine import PDEngine
+    from vllm_rlt.pd.engine import PDEngine
 
     if torch.cuda.device_count() < (4 if multi else 2):
         pytest.skip("requires 2/4 visible GPUs")
@@ -234,9 +234,9 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_lt.core.scheduler import Scheduler
-    from vllm_lt.engine.preemption import PreemptionManager
-    from vllm_lt.request import Request, Stage
+    from vllm_rlt.core.scheduler import Scheduler
+    from vllm_rlt.engine.preemption import PreemptionManager
+    from vllm_rlt.request import Request, Stage
 
     engine = object.__new__(LLMEngine)
     engine.preemption = PreemptionManager(engine)
@@ -279,7 +279,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 @pytest.mark.gpu
 @pytest.mark.parametrize("p_cache,d_cache", [(True, True), (True, False), (False, True)])
 def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cache):
-    from vllm_lt.pd.engine import PDEngine
+    from vllm_rlt.pd.engine import PDEngine
 
     cfg = replace(OuroConfig.tiny(), head_dim=64)
     params = SamplingParams(max_tokens=6, min_loops=1, ignore_eos=True)

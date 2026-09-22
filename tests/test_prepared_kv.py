@@ -6,8 +6,8 @@ import weakref
 import pytest
 import torch
 
-from vllm_lt.core.kv_cache_manager import KVCacheManager
-from vllm_lt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
 
 
 @pytest.fixture(autouse=True)

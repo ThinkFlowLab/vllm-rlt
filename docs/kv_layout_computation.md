@@ -1,6 +1,6 @@
 # SHARED and LAST_EXITED KV: Semantics and Worked Examples
 
-This note explains the `shared` and `last_exited` KV layouts in vllm-lt and illustrates their attention computations with a numerical example. It describes the implementation reviewed on 2026-09-20.
+This note explains the `shared` and `last_exited` KV layouts in vllm-rlt and illustrates their attention computations with a numerical example. It describes the implementation reviewed on 2026-09-20.
 
 ## 1. Semantic distinction
 
@@ -213,7 +213,7 @@ These formulas describe version selection within each execution path. They do no
 
 ### 4.1 Storage and block tables
 
-See initialization, `allocate()`, `_plane()`, and `get_block_table()` in [KVCacheManager](../vllm_lt/core/kv_cache_manager.py). The mapping is equivalent to:
+See initialization, `allocate()`, `_plane()`, and `get_block_table()` in [KVCacheManager](../vllm_rlt/core/kv_cache_manager.py). The mapping is equivalent to:
 
 ```python
 storage_depths = max_loops if layout == "last_exited" else 1
@@ -254,11 +254,11 @@ After checking that all physical layers have written KV at the final executed de
 - `shared` returns immediately: the single entry already contains the final values.
 - `last_exited` copies the token's K/V at every physical layer into each unexecuted depth and records those positions as valid.
 
-The operation copies per-token, per-layer KV, rather than the final hidden state or an entire physical page. The asynchronous [ModelRunner](../vllm_lt/worker/model_runner.py) can batch finalization through `finalize_many()` and `finalize_kernel`, with events enforcing execution ordering.
+The operation copies per-token, per-layer KV, rather than the final hidden state or an entire physical page. The asynchronous [ModelRunner](../vllm_rlt/worker/model_runner.py) can batch finalization through `finalize_many()` and `finalize_kernel`, with events enforcing execution ordering.
 
 ## 5. Prefill execution order
 
-The current [ModelRunner._prefill()](../vllm_lt/worker/model_runner.py) uses different execution orders for the two layouts.
+The current [ModelRunner._prefill()](../vllm_rlt/worker/model_runner.py) uses different execution orders for the two layouts.
 
 `last_exited` can pack multiple prompt tokens within one chunk:
 

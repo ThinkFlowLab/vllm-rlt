@@ -1,0 +1,4 @@
+interface:
+  display_name: "vllm-rlt PR Review"
+  short_description: "Review Ouro correctness and BF16 A/B evidence"
+  default_prompt: "Use $vllm-rlt-review-pr to review this vllm-rlt PR for correctness and accuracy/speed evidence."

@@ -122,9 +122,14 @@ support:
 python -m pip install -e '.[text,serve,triton]'
 ```
 
+When upgrading from `vllm-lt`, uninstall it with `python -m pip uninstall vllm-lt`
+before installing this checkout. Update Python imports from `vllm_lt` to
+`vllm_rlt` and command names to `vllm-rlt`, `vllm-rlt-serve`, and
+`vllm-rlt-pd-serve`.
+
 FlashAttention and NIXL are optional; see the
-[FlashAttention](https://github.com/hsliuustc0106/vllm-lt/pull/30) and
-[prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-lt/pull/31) implementation notes for details.
+[FlashAttention](https://github.com/hsliuustc0106/vllm-rlt/pull/30) and
+[prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) implementation notes for details.
 
 ### Offline inference
 
@@ -232,10 +237,10 @@ benchmark client usage.
 | [Scheduler walkthrough](docs/scheduler_walkthrough.md) | Responsibilities, admission cases, control flow, and refactoring checklist |
 | [KV layout examples](docs/kv_layout_computation.md) | SHARED and LAST_EXITED semantics and worked attention examples |
 | [Runtime configuration](docs/cdb_runtime.md) | Exit policies, KV layouts, execution options, and CUDA Graphs |
-| [Asynchronous scheduling](https://github.com/hsliuustc0106/vllm-lt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
-| [FlashAttention](https://github.com/hsliuustc0106/vllm-lt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
-| [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-lt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
-| [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-lt/pull/31) | Single-host GPU worker pools and NIXL transfer |
+| [Asynchronous scheduling](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
+| [FlashAttention](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
+| [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
+| [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](docs/serving.md) | Completions API, streaming, and service lifecycle |
 | [Accuracy evaluation](docs/accuracy.md) | GSM8K regression setup and comparison methodology |
 
@@ -251,8 +256,8 @@ experiments. Neither is a distilled lookahead predictor.
 ## Performance Baselines
 
 The current performance baselines are recorded in
-[PR #30: depth-aware KV and asynchronous execution](https://github.com/hsliuustc0106/vllm-lt/pull/30)
-and [PR #31: prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-lt/pull/31).
+[PR #30: depth-aware KV and asynchronous execution](https://github.com/hsliuustc0106/vllm-rlt/pull/30)
+and [PR #31: prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31).
 These reports provide the reference measurements for subsequent runtime work.
 
 ### Single-GPU runtime
@@ -275,7 +280,7 @@ Values are medians of three trials, with 128 output tokens per request and
 and drain time, excluding HTTP, tokenization, loading, and warmup. The vertical
 axis is linear. P2→P3 changes the exit policy;
 output and exit-depth differences remain unresolved in some configurations.
-See [PR #30](https://github.com/hsliuustc0106/vllm-lt/pull/30) for decode-only
+See [PR #30](https://github.com/hsliuustc0106/vllm-rlt/pull/30) for decode-only
 results, latency tables, and the full protocol.
 
 ### Four-GPU serving
@@ -300,7 +305,7 @@ are averages of phase percentiles, not pooled percentiles. TTFT measures time
 to first token, TPOT average time per subsequent token, ITL individual token
 intervals, and E2E request completion latency. Some cases use isolated reruns
 while others were measured with concurrent configurations on the same host;
-see [PR #31](https://github.com/hsliuustc0106/vllm-lt/pull/31) for the full protocol.
+see [PR #31](https://github.com/hsliuustc0106/vllm-rlt/pull/31) for the full protocol.
 
 In this workload, 1P3D improves generation latency at the cost of TTFT, while
 2P2D improves all reported latency metrics with slightly lower throughput.
@@ -309,24 +314,24 @@ not isolate the benefit of individual cache or scheduling features.
 
 ### Validation
 
-See the [runtime validation and context/concurrency results](https://github.com/hsliuustc0106/vllm-lt/pull/30)
+See the [runtime validation and context/concurrency results](https://github.com/hsliuustc0106/vllm-rlt/pull/30)
 and [GSM8K evaluation guide](docs/accuracy.md) for additional checks. The PRs above
 are the public references for the reported performance results and limitations.
 
 ## Roadmap
 
 The next development focus is **modular architecture refactoring**, tracked in
-[RFC #32](https://github.com/hsliuustc0106/vllm-lt/issues/32). The goal is to make
+[RFC #32](https://github.com/hsliuustc0106/vllm-rlt/issues/32). The goal is to make
 state ownership and module interfaces explicit while preserving loop-level
 batching, exit policies, depth-aware KV semantics, and PD handoff behavior.
 
 The first scheduler-responsibility refactor landed in
-[PR #34](https://github.com/hsliuustc0106/vllm-lt/pull/34); the broader architecture
+[PR #34](https://github.com/hsliuustc0106/vllm-rlt/pull/34); the broader architecture
 migration remains in progress.
 
 ### Target Architecture
 
-The following diagram follows [RFC #32](https://github.com/hsliuustc0106/vllm-lt/issues/32).
+The following diagram follows [RFC #32](https://github.com/hsliuustc0106/vllm-rlt/issues/32).
 It describes the **planned refactoring architecture**, rather than a completed
 migration of the current code.
 
@@ -394,7 +399,7 @@ A reproducible bug report, a carefully measured experiment, or a clearer example
 can be just as useful as a runtime optimization.
 
 - 🛠️ **Improve the engine.** Work on loop-level scheduling, attention, KV caching,
-  or prefill/decode disaggregation. The [architecture RFC and refactoring roadmap](https://github.com/hsliuustc0106/vllm-lt/issues/32)
+  or prefill/decode disaggregation. The [architecture RFC and refactoring roadmap](https://github.com/hsliuustc0106/vllm-rlt/issues/32)
   describe the current priorities and module boundaries.
 - 📊 **Bring evidence.** Test your workloads and hardware, investigate numerical
   differences, or contribute reproducible benchmarks. Include your configuration
@@ -402,8 +407,8 @@ can be just as useful as a runtime optimization.
 - 📖 **Make it easier to use.** Improve installation instructions, explain a
   runtime behavior, or turn a working example into a guide for the next user.
 
-**Have an idea or found a problem?** [Open an issue](https://github.com/hsliuustc0106/vllm-lt/issues/new)
-with the details, or [send a pull request](https://github.com/hsliuustc0106/vllm-lt/compare).
+**Have an idea or found a problem?** [Open an issue](https://github.com/hsliuustc0106/vllm-rlt/issues/new)
+with the details, or [send a pull request](https://github.com/hsliuustc0106/vllm-rlt/compare).
 For larger changes, start a discussion in an issue so we can work through the
 design together. If you are new to the codebase, tell us what interests you—we
 can help identify a useful starting point.

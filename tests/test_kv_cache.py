@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from vllm_lt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
 
 
 def make_cache(**kwargs):

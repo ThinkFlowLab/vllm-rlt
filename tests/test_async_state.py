@@ -5,10 +5,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.request import Stage
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.request import Stage
 
 
 def engine(*, asynchronous=True, static=False, graph=False, shared=False):
@@ -85,7 +85,7 @@ def test_bank_is_not_reused_until_its_final_gpu_reader_finishes(use_uva):
     expected = torch.tensor([17, 23, 29], dtype=torch.int64)
     bank.host[0].copy_(expected)
     actual = torch.empty(3, dtype=torch.int64, device="cuda")
-    from vllm_lt.kernels.routing import gather_kernel
+    from vllm_rlt.kernels.routing import gather_kernel
 
     with torch.cuda.stream(stream):
         slots = torch.zeros(1, dtype=torch.int64, device="cuda")

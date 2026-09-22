@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from vllm_lt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
 
 
 def dense_attention(q, k, v):

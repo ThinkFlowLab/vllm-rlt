@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.request import Stage
-from vllm_lt.worker.model_runner import Submission
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.request import Stage
+from vllm_rlt.worker.model_runner import Submission
 
 
 def make_engine(

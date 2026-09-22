@@ -12,9 +12,9 @@ from pathlib import Path
 
 import torch
 
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
 
 
 def drive(engine):

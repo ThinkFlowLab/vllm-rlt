@@ -13,13 +13,18 @@ pytest.importorskip("aiohttp")
 from aiohttp import ClientPayloadError
 from aiohttp.test_utils import TestClient, TestServer
 
-from vllm_lt import CacheConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.request import Stage
-from vllm_lt.serving.protocol import CompletionRequest, IncrementalText, ServingError, ServingLimits
-from vllm_lt.serving.server import WORKER, create_app
-from vllm_lt.serving.worker import EngineWorker
+from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.request import Stage
+from vllm_rlt.serving.protocol import (
+    CompletionRequest,
+    IncrementalText,
+    ServingError,
+    ServingLimits,
+)
+from vllm_rlt.serving.server import WORKER, create_app
+from vllm_rlt.serving.worker import EngineWorker
 
 
 class TinyTokenizer:
@@ -188,7 +193,7 @@ def test_byte_decoder_unicode_special_tokens_and_final_flush(monkeypatch):
 def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level):
     tokenizers = pytest.importorskip("tokenizers")
     transformers = pytest.importorskip("transformers")
-    from vllm_lt.entrypoints.serve import load_engine
+    from vllm_rlt.entrypoints.serve import load_engine
 
     decoder = tokenizers.decoders.ByteLevel() if byte_level else tokenizers.decoders.WordPiece()
     tokenizer = SimpleNamespace(backend_tokenizer=SimpleNamespace(decoder=decoder))
@@ -512,7 +517,7 @@ def test_slow_channel_does_not_block_other_requests():
     [("disconnect", True, 4), ("engine", True, 4), ("decode", False, 2), ("decode", True, 4)],
 )
 def test_request_failure_and_disconnect_cleanup(monkeypatch, failure, stream, max_tokens):
-    from vllm_lt.serving import worker as worker_module
+    from vllm_rlt.serving import worker as worker_module
 
     pause = PauseAt(Stage.RECURRENT, fail=failure == "engine")
 
@@ -659,7 +664,7 @@ def test_invalid_trace_id(value):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_http_trace_selection_and_concurrent_reuse(asynchronous):
-    from vllm_lt.config import ExecutionConfig, ExitConfig
+    from vllm_rlt.config import ExecutionConfig, ExitConfig
 
     async def run():
         completed = []

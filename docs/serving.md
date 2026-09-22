@@ -1,8 +1,8 @@
 # OpenAI-compatible Ouro serving
 
 Install `python -m pip install -e '.[serve,triton]'` in a prepared PyTorch
-environment. The `vllm-lt-serve` entrypoint (or `python -m
-vllm_lt.entrypoints.serve`) serves one resident model on one device. Bind defaults
+environment. The `vllm-rlt-serve` entrypoint (or `python -m
+vllm_rlt.entrypoints.serve`) serves one resident model on one device. Bind defaults
 to `127.0.0.1:8000`; this benchmark frontend has no authentication or TLS.
 
 Prepare the Ouro checkpoint and tokenizer separately. The official model ID
@@ -12,14 +12,14 @@ Use a GPU scheduler reservation on shared hosts:
 ```bash
 gpu status
 gpu run --gpu-ids <available-id> --timeout 30m --note "Ouro HTTP serving" -- \
-  python -m vllm_lt.entrypoints.serve \
+  python -m vllm_rlt.entrypoints.serve \
   --model /path/to/prepared/ouro --tokenizer /path/to/prepared/ouro \
   --device cuda --dtype bfloat16 --attention-backend triton \
   --num-blocks 512 --max-num-seqs 8
 ```
 
 BF16 weights, ordinary activations and KV are this frontend's primary target,
-consistent with the precision policy proposed in [PR #12](https://github.com/hsliuustc0106/vllm-lt/pull/12).
+consistent with the precision policy proposed in [PR #12](https://github.com/hsliuustc0106/vllm-rlt/pull/12).
 That policy is pending and is not yet part of this branch.
 The current model uses FP32 RMSNorm/RoPE intermediates and gate/sampling
 probabilities; Triton attention uses FP32 internal accumulation. Record the
@@ -162,7 +162,7 @@ concurrency semaphore and ends at the last choice event, excluding client-side
 queueing and the usage/`[DONE]` tail. The historical offline M1 harness instead timestamps
 engine enqueue/steps and excludes HTTP/tokenization; the values are not
 interchangeable. The M1 harness has been removed; see the
-[archived baseline report](https://github.com/hsliuustc0106/vllm-lt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
+[archived baseline report](https://github.com/hsliuustc0106/vllm-rlt/blob/5bee22950357d93e3f7a3c6c87b8fbed004c9296/docs/benchmarks/m1-20260910.md)
 for its measurement scope.
 
 ## Validation

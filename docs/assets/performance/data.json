@@ -1,7 +1,7 @@
 {
   "sources": {
-    "pr30": "https://github.com/hsliuustc0106/vllm-lt/pull/30",
-    "pr31": "https://github.com/hsliuustc0106/vllm-lt/pull/31"
+    "pr30": "https://github.com/hsliuustc0106/vllm-rlt/pull/30",
+    "pr31": "https://github.com/hsliuustc0106/vllm-rlt/pull/31"
   },
   "stages": [
     "P1",

@@ -1,4 +1,4 @@
-# vllm-lt engine design
+# vllm-rlt engine design
 
 The engine schedules one traversal of Ouro's shared transformer layers at a time. It owns request state and depth-aware KV allocation.
 

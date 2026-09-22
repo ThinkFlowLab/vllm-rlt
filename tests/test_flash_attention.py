@@ -5,11 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.kernels.flash_attention import FlashPagedAttention, select_version
-from vllm_lt.kernels.paged_attention import torch_paged_attention
-from vllm_lt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.kernels.flash_attention import FlashPagedAttention, select_version
+from vllm_rlt.kernels.paged_attention import torch_paged_attention
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
 
 
 @pytest.mark.parametrize(
@@ -22,7 +22,7 @@ def test_architecture_selection(sm, expected):
 @pytest.mark.parametrize("sm", [(12, 0), (12, 1)])
 @pytest.mark.parametrize("backend", ["flash_attn", "flash_attn_4"])
 def test_sm12_paged_backend_rejected_before_import(monkeypatch, sm, backend):
-    from vllm_lt.kernels import flash_attention
+    from vllm_rlt.kernels import flash_attention
 
     monkeypatch.setattr(torch.version, "hip", None)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: sm)
@@ -122,7 +122,7 @@ def test_flash_sync_async_mixed_depths(layout, static):
 def test_packed_prefill_metadata_groups_queries_and_rejects_gaps():
     from types import SimpleNamespace
 
-    from vllm_lt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
 
     cache = KVCacheManager(1, 1, 8, 32, 4, 2)
     cache.attention = SimpleNamespace(generation=4)
@@ -146,7 +146,7 @@ def test_packed_prefill_metadata_groups_queries_and_rejects_gaps():
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_flash_prefill_ragged_prefixes_depths_and_causal_mask(dtype):
-    from vllm_lt.core.kv_cache_manager import KVCacheManager
+    from vllm_rlt.core.kv_cache_manager import KVCacheManager
 
     torch.manual_seed(712)
     cache = KVCacheManager(2, 2, 64, 80, 16, 4, "cuda", dtype, "flash_attn")

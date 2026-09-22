@@ -23,7 +23,7 @@ This implements runtime mechanisms. It does not reproduce the paper's complete a
 ## Configuration
 
 ```python
-from vllm_lt import CacheConfig, ExecutionConfig, ExitConfig, LLM, SchedulerConfig
+from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, LLM, SchedulerConfig
 
 llm = LLM(
     model,
@@ -49,7 +49,7 @@ Async execution requires `ouro_delayed`, `random_lookahead` or `trace`. It autom
 CLI flags are shared by offline and serving entrypoints:
 
 ```bash
-OMP_NUM_THREADS=1 python -m vllm_lt.entrypoints.cli --toy --dtype float32 \
+OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
   --max-tokens 4 --exit-mode random_lookahead --lookahead-seed 7 \
   --exit-threshold 0.5 --async-scheduling --static-buffers \
   --pad-to-power-of-two --kv-layout shared --prefill-chunk-size 2
@@ -139,8 +139,8 @@ Fish startup with the local checkpoint (GPU 0 must be available):
 ```fish
 cd /home/zjy/code/david/b_workspace
 source .b_rdma/bin/activate.fish
-cd vllm-lt
-env CUDA_VISIBLE_DEVICES=0 python -m vllm_lt.entrypoints.serve \
+cd vllm-rlt
+env CUDA_VISIBLE_DEVICES=0 python -m vllm_rlt.entrypoints.serve \
   --model /home/zjy/code/david/b_workspace/models/Ouro-1.4B \
   --served-model-name ouro --device cuda --dtype bfloat16 \
   --attention-backend triton --exit-mode ouro_delayed --async-scheduling \

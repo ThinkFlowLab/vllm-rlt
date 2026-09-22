@@ -2,10 +2,10 @@
 
 This note documents the first Scheduler-focused increment of the M3 refactor:
 
-- [scheduler.py](../vllm_lt/core/scheduler.py): request registration, termination, admission, and batch construction.
-- [scheduling_policy.py](../vllm_lt/core/scheduling_policy.py): refill/no-refill stage selection and fairness state.
-- [request.py](../vllm_lt/request.py): request stages, termination reasons, and output conversion.
-- [preemption.py](../vllm_lt/engine/preemption.py): preemption and restoration callbacks.
+- [scheduler.py](../vllm_rlt/core/scheduler.py): request registration, termination, admission, and batch construction.
+- [scheduling_policy.py](../vllm_rlt/core/scheduling_policy.py): refill/no-refill stage selection and fairness state.
+- [request.py](../vllm_rlt/request.py): request stages, termination reasons, and output conversion.
+- [preemption.py](../vllm_rlt/engine/preemption.py): preemption and restoration callbacks.
 
 ## Design rationale
 

@@ -6,9 +6,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from vllm_lt.core.kv_cache_manager import KVCacheManager
-from vllm_lt.models import OURO_REVISION, OuroConfig, OuroForCausalLM
-from vllm_lt.models.reference import dense_reference
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.models import OURO_REVISION, OuroConfig, OuroForCausalLM
+from vllm_rlt.models.reference import dense_reference
 
 
 def make_cache(config, *, blocks=64):

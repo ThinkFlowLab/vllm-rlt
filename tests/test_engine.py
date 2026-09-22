@@ -3,10 +3,10 @@ import math
 import pytest
 import torch
 
-from vllm_lt import LLM, CacheConfig, SamplingParams, SchedulerConfig
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.request import FinishReason, RequestOutput, Stage
+from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.request import FinishReason, RequestOutput, Stage
 
 
 def tiny_model():

@@ -4,7 +4,7 @@ import torch
 from lm_eval.models.utils import postprocess_generated_text, stop_sequences_criteria
 from transformers import AutoModelForCausalLM, DynamicCache, LogitsProcessor
 
-from vllm_lt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
 
 
 def check_logits(logits):

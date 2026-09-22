@@ -5,13 +5,13 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_lt import LLM, CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
-from vllm_lt.core.kv_cache_manager import KVCacheManager
-from vllm_lt.core.memory import budget_blocks
-from vllm_lt.engine.llm_engine import LLMEngine
-from vllm_lt.models import OuroConfig, OuroForCausalLM
-from vllm_lt.request import Stage
-from vllm_lt.worker.model_runner import Submission
+from vllm_rlt import LLM, CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.kv_cache_manager import KVCacheManager
+from vllm_rlt.core.memory import budget_blocks
+from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.request import Stage
+from vllm_rlt.worker.model_runner import Submission
 
 
 def model():
