@@ -1,0 +1,108 @@
+{
+  "code_sha": "d9fca507e766e81f5d89f90d598881c12d7d8397",
+  "model_revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+  "case_index": 4,
+  "trial_index": 0,
+  "request_index": 2,
+  "output_index_zero_based": 23,
+  "native_token_id": 7071,
+  "speculative_token_id": 314,
+  "case": {
+    "prompt_tokens": 32,
+    "output_tokens": 32,
+    "concurrency": 8,
+    "k": 1
+  },
+  "native_first_divergence_margins": [
+    {
+      "request_index": 2,
+      "output_index_zero_based": 23,
+      "native_output_token_id": 7071,
+      "replayed_native_top1": 7071,
+      "native_top1_top2_margin": 0.125
+    }
+  ],
+  "fixed_chain": {
+    "positions_compared": 2,
+    "candidate_ids": [
+      314
+    ],
+    "hidden_by_depth": {
+      "0": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 4096
+      },
+      "1": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 4096
+      },
+      "2": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 4096
+      },
+      "3": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 4096
+      }
+    },
+    "kv_by_depth": {
+      "0": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 5505024
+      },
+      "1": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 5505024
+      },
+      "2": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 5505024
+      },
+      "3": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 5505024
+      }
+    },
+    "logits": {
+      "max_abs": 0.0,
+      "rms": 0.0,
+      "elements": 98304
+    },
+    "logit_rows": [
+      {
+        "position": 54,
+        "reuse_top1": 314,
+        "oracle_top1": 314,
+        "oracle_margin": 0.0,
+        "error": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 49152
+        }
+      },
+      {
+        "position": 55,
+        "reuse_top1": 4345,
+        "oracle_top1": 4345,
+        "oracle_margin": 0.625,
+        "error": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 49152
+        }
+      }
+    ],
+    "argmax_mismatches": 0,
+    "minimum_native_top1_top2_margin": 0.0
+  },
+  "replay_input_tokens": 55,
+  "replay_caveat": "serial fixed-chain oracle may differ numerically from batched native prefill"
+}

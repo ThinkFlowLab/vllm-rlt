@@ -17,6 +17,7 @@ an environment to receiving the first generated response. The
 | [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
+| [Synchronous speculation evaluation](speculative_evaluation.md) | Reproducible BF16/FA4 accuracy, decode, and serving measurements for RFC #43 |
 
 ## Support and Runtime Notes
 

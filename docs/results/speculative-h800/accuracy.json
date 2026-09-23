@@ -1,0 +1,473 @@
+{
+  "code_sha": "d9fca507e766e81f5d89f90d598881c12d7d8397",
+  "model_revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+  "gpu": "NVIDIA H800 PCIe",
+  "torch": "2.9.1+cu128",
+  "cuda": "12.8",
+  "flash_attn_4": "4.0.0b30",
+  "dtype": "bfloat16",
+  "backend": "flash_attn_4",
+  "prefix_tokens": 8,
+  "cases": [
+    {
+      "k": 1,
+      "positions_compared": 2,
+      "candidate_ids": [
+        284
+      ],
+      "hidden_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 4096
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 4096
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 4096
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 4096
+        }
+      },
+      "kv_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 983040
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 983040
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 983040
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 983040
+        }
+      },
+      "logits": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 98304
+      },
+      "logit_rows": [
+        {
+          "position": 8,
+          "reuse_top1": 284,
+          "oracle_top1": 284,
+          "oracle_margin": 0.5,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 9,
+          "reuse_top1": 1701,
+          "oracle_top1": 1701,
+          "oracle_margin": 1.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        }
+      ],
+      "argmax_mismatches": 0,
+      "minimum_native_top1_top2_margin": 0.5
+    },
+    {
+      "k": 2,
+      "positions_compared": 3,
+      "candidate_ids": [
+        284,
+        1701
+      ],
+      "hidden_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 6144
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 6144
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 6144
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 6144
+        }
+      },
+      "kv_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1081344
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1081344
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1081344
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1081344
+        }
+      },
+      "logits": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 147456
+      },
+      "logit_rows": [
+        {
+          "position": 8,
+          "reuse_top1": 284,
+          "oracle_top1": 284,
+          "oracle_margin": 0.5,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 9,
+          "reuse_top1": 1701,
+          "oracle_top1": 1701,
+          "oracle_margin": 1.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 10,
+          "reuse_top1": 260,
+          "oracle_top1": 260,
+          "oracle_margin": 0.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        }
+      ],
+      "argmax_mismatches": 0,
+      "minimum_native_top1_top2_margin": 0.0
+    },
+    {
+      "k": 4,
+      "positions_compared": 5,
+      "candidate_ids": [
+        284,
+        1701,
+        357,
+        4541
+      ],
+      "hidden_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 10240
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 10240
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 10240
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 10240
+        }
+      },
+      "kv_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1277952
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1277952
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1277952
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1277952
+        }
+      },
+      "logits": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 245760
+      },
+      "logit_rows": [
+        {
+          "position": 8,
+          "reuse_top1": 284,
+          "oracle_top1": 284,
+          "oracle_margin": 0.5,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 9,
+          "reuse_top1": 1701,
+          "oracle_top1": 1701,
+          "oracle_margin": 1.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 10,
+          "reuse_top1": 260,
+          "oracle_top1": 260,
+          "oracle_margin": 0.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 11,
+          "reuse_top1": 4541,
+          "oracle_top1": 4541,
+          "oracle_margin": 3.875,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 12,
+          "reuse_top1": 2382,
+          "oracle_top1": 2382,
+          "oracle_margin": 3.25,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        }
+      ],
+      "argmax_mismatches": 0,
+      "minimum_native_top1_top2_margin": 0.0
+    },
+    {
+      "k": 8,
+      "positions_compared": 9,
+      "candidate_ids": [
+        284,
+        1701,
+        357,
+        4541,
+        2382,
+        981,
+        29780,
+        284
+      ],
+      "hidden_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 18432
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 18432
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 18432
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 18432
+        }
+      },
+      "kv_by_depth": {
+        "0": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1671168
+        },
+        "1": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1671168
+        },
+        "2": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1671168
+        },
+        "3": {
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "elements": 1671168
+        }
+      },
+      "logits": {
+        "max_abs": 0.0,
+        "rms": 0.0,
+        "elements": 442368
+      },
+      "logit_rows": [
+        {
+          "position": 8,
+          "reuse_top1": 284,
+          "oracle_top1": 284,
+          "oracle_margin": 0.5,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 9,
+          "reuse_top1": 1701,
+          "oracle_top1": 1701,
+          "oracle_margin": 1.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 10,
+          "reuse_top1": 260,
+          "oracle_top1": 260,
+          "oracle_margin": 0.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 11,
+          "reuse_top1": 4541,
+          "oracle_top1": 4541,
+          "oracle_margin": 3.875,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 12,
+          "reuse_top1": 2382,
+          "oracle_top1": 2382,
+          "oracle_margin": 3.25,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 13,
+          "reuse_top1": 981,
+          "oracle_top1": 981,
+          "oracle_margin": 1.75,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 14,
+          "reuse_top1": 29780,
+          "oracle_top1": 29780,
+          "oracle_margin": 1.0,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 15,
+          "reuse_top1": 284,
+          "oracle_top1": 284,
+          "oracle_margin": 1.125,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        },
+        {
+          "position": 16,
+          "reuse_top1": 21822,
+          "oracle_top1": 21822,
+          "oracle_margin": 8.625,
+          "error": {
+            "max_abs": 0.0,
+            "rms": 0.0,
+            "elements": 49152
+          }
+        }
+      ],
+      "argmax_mismatches": 0,
+      "minimum_native_top1_top2_margin": 0.0
+    }
+  ]
+}
