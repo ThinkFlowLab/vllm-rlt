@@ -256,6 +256,14 @@ Batching](https://arxiv.org/abs/2608.09444)
 The paper's measurements are separate from the vllm-rlt performance baselines
 reported above.
 
+## Contributing with Codex
+
+Use [$vllm-lt-contribute](.agents/skills/vllm-lt-contribute/SKILL.md) to plan,
+implement and validate a contribution. Use
+[$vllm-lt-review-pr](.agents/skills/vllm-lt-review-pr/SKILL.md) for a standalone
+review or requested self-review. Both skills live in this repository and share
+the detailed review criteria.
+
 ## License
 
 [Apache License 2.0](LICENSE).

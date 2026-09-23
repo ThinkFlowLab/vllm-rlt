@@ -1,0 +1,4 @@
+interface:
+  display_name: "vllm-lt Contribution"
+  short_description: "Implement and validate focused vllm-lt contributions"
+  default_prompt: "Use $vllm-lt-contribute to implement this vllm-lt change with appropriate validation and a reviewable handoff."
