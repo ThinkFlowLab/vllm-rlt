@@ -467,35 +467,39 @@ class KVCacheManager:
             table = allocation.block_tables[self._plane(depth)][:width]
             tables.append(list(table) + [-1] * (width - len(table)))
         allocations = dict(zip(request_ids, (allocation for allocation, _, _ in rows)))
+        # Stage all metadata in two pinned host tensors and copy them without
+        # blocking: a pageable H2D copy would wait for all queued GPU work. The
+        # caching host allocator keeps each staging block alive until its copy ends.
+        n, t = len(rows), len(table_rows)
+        wide = self._stage(
+            [position for _, _, position in rows]
+            + [block for block, _ in addresses]
+            + [offset for _, offset in addresses],
+            torch.long,
+        )
+        narrow = self._stage(
+            [value for table in tables for value in table]
+            + [position + 1 for _, _, position in table_rows]
+            + (cumulative or []),
+            torch.int32,
+        )
         return _PreparedKVBatch(
             owner=self,
             rows=rows,
             allocations=tuple(allocations.items()),
-            position_ids=torch.tensor(
-                [position for _, _, position in rows], device=self.device, dtype=torch.long
-            ),
-            write_blocks=torch.tensor(
-                [block for block, _ in addresses], device=self.device, dtype=torch.long
-            ),
-            write_offsets=torch.tensor(
-                [offset for _, offset in addresses], device=self.device, dtype=torch.long
-            ),
-            block_tables=torch.tensor(tables, device=self.device, dtype=torch.int32).reshape(
-                len(table_rows), width
-            ),
-            context_lengths=torch.tensor(
-                [position + 1 for _, _, position in table_rows],
-                device=self.device,
-                dtype=torch.int32,
-            ),
+            position_ids=wide[:n],
+            write_blocks=wide[n : 2 * n],
+            write_offsets=wide[2 * n : 3 * n],
+            block_tables=narrow[: t * width].reshape(t, width),
+            context_lengths=narrow[t * width : t * width + t],
             writable=for_write,
-            cu_seqlens_q=(
-                torch.tensor(cumulative, device=self.device, dtype=torch.int32)
-                if cumulative is not None
-                else None
-            ),
+            cu_seqlens_q=narrow[t * width + t :] if cumulative is not None else None,
             max_seqlen_q=max_query,
         )
+
+    def _stage(self, values, dtype):
+        host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
+        return host.to(self.device, non_blocking=True)
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
         if batch.owner is not self:

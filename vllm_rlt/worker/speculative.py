@@ -79,7 +79,7 @@ class SpeculativeRunner:
                 items[i].request.input_token_id if offset == 0 else candidates[i][-1]
                 for i in active
             ]
-            hidden = self.model.prelude(torch.tensor(tokens, device=self.device, dtype=torch.long))
+            hidden = self.model.prelude(self.cache._stage(tokens, torch.long))
             for depth in range(self.config.draft_loops):
                 hidden = self._core(hidden, ids, positions, depth)
             drafting = []
