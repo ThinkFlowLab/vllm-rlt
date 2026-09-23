@@ -271,7 +271,7 @@ class ModelRunner:
 
     def _prefill_tokens(self, ids, positions, tokens):
         cache = self.cache_manager
-        if cache.layout == "last_exited" and getattr(cache.attention, "generation", None) == 4:
+        if cache.layout == "last_exited" and cache.attention_capabilities.packed_prefill:
             # Prefill has genuinely ragged query sequences. Do not pad token rows
             # or reuse decode's per-query, model-max-width static page tables.
             bank = None

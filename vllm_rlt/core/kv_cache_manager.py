@@ -15,8 +15,14 @@ from numbers import Integral
 
 import torch
 
-from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
-from vllm_rlt.kernels.paged_attention import torch_paged_attention, triton_paged_attention
+from vllm_rlt.attention import (
+    AttentionRows,
+    BackendCapabilities,
+    backend_capabilities,
+    build_attention_metadata,
+    create_backend,
+    validate_backend_name,
+)
 
 
 @dataclass
@@ -106,8 +112,7 @@ class KVCacheManager:
             if not isinstance(value, Integral) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
             setattr(self, name, int(value))
-        if backend not in {"torch", "triton", *FLASH_BACKENDS}:
-            raise ValueError("unknown attention backend")
+        validate_backend_name(backend)
         if dtype not in {torch.float32, torch.float16, torch.bfloat16}:
             raise ValueError("KV dtype must be float32, float16, or bfloat16")
         if layout not in {"last_exited", "shared"}:
@@ -117,17 +122,7 @@ class KVCacheManager:
         self.device = torch.device(device)
         self.dtype = dtype
         self.backend = backend
-        if backend == "triton" and self.device.type != "cuda":
-            raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
-        if backend == "triton" and self.head_dim > 256:
-            raise ValueError("the Triton attention backend supports head_dim <= 256")
-        self.attention = (
-            FlashPagedAttention(self.device, dtype, head_dim, block_size, backend)
-            if backend in FLASH_BACKENDS
-            else triton_paged_attention
-            if backend == "triton"
-            else torch_paged_attention
-        )
+        self.attention = create_backend(backend, self.device, dtype, head_dim, block_size)
         self.attention_info = getattr(self.attention, "info", {"backend": backend})
         shape = (num_blocks, num_layers, block_size, num_kv_heads, head_dim)
         self.key_cache = torch.empty(shape, device=self.device, dtype=dtype)
@@ -145,6 +140,10 @@ class KVCacheManager:
         self.prefix_hits = self.prefix_queries = 0
         if enable_prefix_caching and layout != "last_exited":
             raise ValueError("prefix caching requires last_exited KV")
+
+    @property
+    def attention_capabilities(self) -> BackendCapabilities:
+        return backend_capabilities(self.attention)
 
     @property
     def num_free_blocks(self) -> int:
@@ -406,75 +405,52 @@ class KVCacheManager:
     ) -> _PreparedKVBatch:
         """Build layer-independent addresses once; do not initialize any KV slot."""
         rows = tuple(self._validate_rows(request_ids, depths, positions))
+        selected_tables = [
+            allocation.block_tables[self._plane(depth)] for allocation, depth, _ in rows
+        ]
+        position_values = [position for _, _, position in rows]
         addresses = [
-            (
-                allocation.block_tables[self._plane(depth)][position // self.block_size],
-                position % self.block_size,
-            )
-            for allocation, depth, position in rows
+            (table[position // self.block_size], position % self.block_size)
+            for table, position in zip(selected_tables, position_values)
         ]
         if for_write and len(set(addresses)) != len(addresses):
             raise ValueError(
                 "a write batch cannot contain duplicate request/depth/position addresses"
             )
-        width = max((position // self.block_size + 1 for _, _, position in rows), default=0)
-        table_rows = rows
-        cumulative = None
-        max_query = 1
         if packed_prefill:
-            if self.layout != "last_exited" or getattr(self.attention, "generation", None) != 4:
+            if self.layout != "last_exited" or not self.attention_capabilities.packed_prefill:
                 raise ValueError("packed prefill requires LAST_EXITED and FlashAttention-4")
-            # Group only consecutive positions of one request/depth. The last
-            # position supplies the causal key length for the whole query chunk.
-            ends, cumulative, seen = [], [0], set()
-            for index, (allocation, depth, position) in enumerate(rows):
-                key = (id(allocation), depth)
-                if index and key == (id(rows[index - 1][0]), rows[index - 1][1]):
-                    if position != rows[index - 1][2] + 1:
-                        raise ValueError("packed prefill positions must be contiguous")
-                    ends[-1] = (allocation, depth, position)
-                    cumulative[-1] = index + 1
-                else:
-                    if key in seen:
-                        raise ValueError("packed prefill request/depth must form one sequence")
-                    seen.add(key)
-                    ends.append((allocation, depth, position))
-                    cumulative.append(index + 1)
-            table_rows = ends
-            max_query = max((b - a for a, b in zip(cumulative, cumulative[1:])), default=1)
-        tables = []
-        for allocation, depth, _ in table_rows:
-            table = allocation.block_tables[self._plane(depth)][:width]
-            tables.append(list(table) + [-1] * (width - len(table)))
+        attention_metadata = build_attention_metadata(
+            AttentionRows(
+                block_tables=selected_tables,
+                positions=position_values,
+                sequence_keys=(
+                    [(id(allocation), depth) for allocation, depth, _ in rows]
+                    if packed_prefill
+                    else None
+                ),
+            ),
+            block_size=self.block_size,
+            device=self.device,
+            packed_prefill=packed_prefill,
+        )
         allocations = dict(zip(request_ids, (allocation for allocation, _, _ in rows)))
         return _PreparedKVBatch(
             owner=self,
             rows=rows,
             allocations=tuple(allocations.items()),
-            position_ids=torch.tensor(
-                [position for _, _, position in rows], device=self.device, dtype=torch.long
-            ),
+            position_ids=torch.tensor(position_values, device=self.device, dtype=torch.long),
             write_blocks=torch.tensor(
                 [block for block, _ in addresses], device=self.device, dtype=torch.long
             ),
             write_offsets=torch.tensor(
                 [offset for _, offset in addresses], device=self.device, dtype=torch.long
             ),
-            block_tables=torch.tensor(tables, device=self.device, dtype=torch.int32).reshape(
-                len(table_rows), width
-            ),
-            context_lengths=torch.tensor(
-                [position + 1 for _, _, position in table_rows],
-                device=self.device,
-                dtype=torch.int32,
-            ),
+            block_tables=attention_metadata.block_tables,
+            context_lengths=attention_metadata.context_lengths,
             writable=for_write,
-            cu_seqlens_q=(
-                torch.tensor(cumulative, device=self.device, dtype=torch.int32)
-                if cumulative is not None
-                else None
-            ),
-            max_seqlen_q=max_query,
+            cu_seqlens_q=attention_metadata.cu_seqlens_q,
+            max_seqlen_q=attention_metadata.max_seqlen_q,
         )
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
