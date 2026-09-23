@@ -599,9 +599,6 @@ class ModelRunner:
             if stream is not None:
                 stream.synchronize()
 
-    def _sample(self, logits: torch.Tensor, request: Request) -> int:
-        return int(self._sample_tensor(logits, request).item())
-
     def _sample_tensor(self, logits: torch.Tensor, request: Request):
         # Thin delegate kept for the async path and for tests that monkeypatch
         # this method; the algorithm lives in Sampler.
