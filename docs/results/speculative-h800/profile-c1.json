@@ -1,0 +1,130 @@
+{
+  "code_sha": "d9fca507e766e81f5d89f90d598881c12d7d8397",
+  "model_revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+  "gpu": "NVIDIA H800 PCIe",
+  "torch": "2.9.1+cu128",
+  "flash_attn_4": "4.0.0b30",
+  "prompt_tokens": 128,
+  "output_tokens": 64,
+  "concurrency": 1,
+  "k": 4,
+  "measurement": "out-of-band instrumentation; CUDA event spans can include host gaps and overlap CPU wall times",
+  "trial": {
+    "seconds": 3.373952364549041,
+    "decode_tokens": 63,
+    "tokens_per_second": 18.672462795253637,
+    "token_ids": [
+      [
+        4896,
+        536,
+        634,
+        701,
+        1042,
+        357,
+        4285,
+        288,
+        2915,
+        260,
+        808,
+        355,
+        1596,
+        3723,
+        281,
+        253,
+        1398,
+        47,
+        4896,
+        536,
+        634,
+        701,
+        1042,
+        357,
+        4285,
+        288,
+        2915,
+        260,
+        808,
+        355,
+        1596,
+        3723,
+        281,
+        253,
+        1398,
+        47,
+        4896,
+        536,
+        634,
+        701,
+        1042,
+        357,
+        4285,
+        288,
+        2915,
+        260,
+        808,
+        355,
+        1596,
+        3723,
+        281,
+        253,
+        1398,
+        47,
+        4896,
+        536,
+        634,
+        701,
+        1042,
+        357,
+        4285,
+        288,
+        2915,
+        260
+      ]
+    ],
+    "peak_allocated_bytes": 3708802560,
+    "speculative_stats": {
+      "rounds": 15,
+      "drafted_tokens": 57,
+      "accepted_tokens": 48,
+      "committed_tokens": 63,
+      "verified_rows": 72
+    }
+  },
+  "phases": {
+    "prelude": {
+      "calls": 72,
+      "cpu_wall_ms": 2.387147396802902,
+      "cuda_event_ms": 3.5452480129897594
+    },
+    "draft_core": {
+      "calls": 114,
+      "cpu_wall_ms": 2176.2543227523565,
+      "cuda_event_ms": 2181.2932529449463
+    },
+    "coda": {
+      "calls": 72,
+      "cpu_wall_ms": 2.531427890062332,
+      "cuda_event_ms": 10.502335995435715
+    },
+    "final_shallow_core": {
+      "calls": 30,
+      "cpu_wall_ms": 571.4557114988565,
+      "cuda_event_ms": 572.7342128753662
+    },
+    "target_core": {
+      "calls": 30,
+      "cpu_wall_ms": 580.2152492105961,
+      "cuda_event_ms": 581.5052146911621
+    },
+    "execute_wall": {
+      "calls": 15,
+      "cpu_wall_ms": 3370.0271137058735,
+      "cuda_event_ms": 3370.294189453125
+    },
+    "commit": {
+      "calls": 15,
+      "cpu_wall_ms": 1.725839450955391,
+      "cuda_event_ms": 1.98847995698452
+    }
+  }
+}

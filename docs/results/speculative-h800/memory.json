@@ -1,0 +1,77 @@
+{
+  "started_utc": "2026-09-23T12:38:33.802628+00:00",
+  "code_sha": "d9fca507e766e81f5d89f90d598881c12d7d8397",
+  "model_revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+  "model_path": "/root/autodl-tmp/vllm-rlt/artifacts/models/Ouro-1.4B",
+  "gpu": "NVIDIA H800 PCIe",
+  "driver": "595.71.05",
+  "torch": "2.9.1+cu128",
+  "cuda": "12.8",
+  "flash_attn_4": "4.0.0b30",
+  "trials_per_case": 1,
+  "timing_boundary": "after every request's first coda; excludes matched prefill and first token",
+  "execution": "synchronous eager, fixed D=4, last_exited, BF16, greedy, ignore_eos",
+  "cases": [
+    {
+      "prompt_tokens": 128,
+      "output_tokens": 128,
+      "concurrency": 8,
+      "k": 1,
+      "memory": {
+        "native": {
+          "model_allocated_bytes": 2869306368,
+          "engine_resident_allocated_bytes": 4563805184,
+          "peak_allocated_bytes": 4564661760,
+          "decode_tokens": 1016
+        },
+        "speculative": {
+          "model_allocated_bytes": 2902860800,
+          "engine_resident_allocated_bytes": 4563805184,
+          "peak_allocated_bytes": 4566328832,
+          "decode_tokens": 1016
+        }
+      }
+    },
+    {
+      "prompt_tokens": 128,
+      "output_tokens": 128,
+      "concurrency": 8,
+      "k": 4,
+      "memory": {
+        "native": {
+          "model_allocated_bytes": 2902860800,
+          "engine_resident_allocated_bytes": 4664468480,
+          "peak_allocated_bytes": 4665325056,
+          "decode_tokens": 1016
+        },
+        "speculative": {
+          "model_allocated_bytes": 2902860800,
+          "engine_resident_allocated_bytes": 4664468480,
+          "peak_allocated_bytes": 4669810176,
+          "decode_tokens": 1016
+        }
+      }
+    },
+    {
+      "prompt_tokens": 128,
+      "output_tokens": 128,
+      "concurrency": 8,
+      "k": 8,
+      "memory": {
+        "native": {
+          "model_allocated_bytes": 2902860800,
+          "engine_resident_allocated_bytes": 4664468480,
+          "peak_allocated_bytes": 4665325056,
+          "decode_tokens": 1016
+        },
+        "speculative": {
+          "model_allocated_bytes": 2902860800,
+          "engine_resident_allocated_bytes": 4664468480,
+          "peak_allocated_bytes": 4672955904,
+          "decode_tokens": 1016
+        }
+      }
+    }
+  ],
+  "scope": "isolated process allocations with one engine resident at a time"
+}
