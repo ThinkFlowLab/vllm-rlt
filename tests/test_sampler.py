@@ -91,3 +91,38 @@ def test_top_p_one_does_not_truncate_the_support():
     # (p(miss) ~ 0.79**200), not the exact draw sequence: the exact sequence
     # would couple the test to torch's multinomial implementation.
     assert 3 in {token.item() for token in untruncated_tokens}
+
+
+def sequence(sampler, logits, params, count=32):
+    tokens, _ = draw(sampler, logits, params, count=count)
+    return [token.item() for token in tokens]
+
+
+def test_same_seed_reproduces_the_same_sequence():
+    sampler = Sampler(torch.device("cpu"))
+    logits = torch.linspace(1.0, -1.0, 64)
+    params = SamplingParams(temperature=0.7, top_k=8, top_p=0.9, seed=42)
+    assert sequence(sampler, logits, params) == sequence(sampler, logits, params)
+
+
+def test_different_seeds_produce_different_sequences():
+    sampler = Sampler(torch.device("cpu"))
+    logits = torch.linspace(1.0, -1.0, 64)
+    base = dict(temperature=0.7, top_k=8, top_p=0.9)
+    assert sequence(sampler, logits, SamplingParams(seed=1, **base)) != sequence(
+        sampler, logits, SamplingParams(seed=2, **base)
+    )
+
+
+def test_generator_is_reused_and_advanced_across_calls():
+    sampler = Sampler(torch.device("cpu"))
+    logits = torch.linspace(1.0, -1.0, 64)
+    params = SamplingParams(temperature=0.7, top_k=8, seed=42)
+    _, generator = draw(sampler, logits, params)
+    assert generator is not None
+    state = generator.get_state().clone()
+    # Later calls must advance the same generator instead of reseeding it, which
+    # is what makes a multi-token request reproducible.
+    _, same_generator = draw(sampler, logits, params, generator=generator)
+    assert same_generator is generator
+    assert not torch.equal(generator.get_state(), state)
