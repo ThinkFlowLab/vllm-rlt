@@ -93,7 +93,7 @@ class LLMEngine:
         if self.execution_config.prefill_uva and (
             parameter.device.type != "cuda"
             or cache_config.layout != "last_exited"
-            or getattr(self.cache_manager.attention, "generation", None) != 4
+            or not self.cache_manager.attention_capabilities.packed_prefill
         ):
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
