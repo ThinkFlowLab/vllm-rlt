@@ -1,0 +1,50 @@
+name: 🛠️ Installation
+description: Report an issue here when you hit errors during installation.
+title: "[Installation]: "
+labels: ["installation"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: Your current environment
+    description: |
+      Please paste the output of the following commands.
+      ```sh
+      python --version
+      pip list | grep -Ei "vllm[-_]rlt|torch|triton|flash|transformers|huggingface"
+      nvidia-smi
+      ```
+      If `import vllm_rlt` already works, also include:
+      ```sh
+      python -c "import vllm_rlt, torch; print(vllm_rlt.__file__); print(torch.__version__, torch.version.cuda)"
+      ```
+    value: |
+      ```text
+      The output of the commands above
+      ```
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: How you are installing vllm-rlt
+    description: |
+      Paste the full command you are trying to execute.
+    value: |
+      ```sh
+      uv pip install -e .  # from the repository root, see docs/launching.md
+      ```
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: precheck
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/ThinkFlowLab/vllm-rlt/tree/main/docs).
+        required: true
