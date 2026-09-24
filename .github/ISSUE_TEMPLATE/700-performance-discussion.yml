@@ -1,0 +1,58 @@
+name: ⚡ Discussion on the performance of vllm-rlt
+description: Submit a proposal/discussion about the performance of vllm-rlt
+title: "[Performance]: "
+labels: ["performance"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: Proposal to improve performance
+    description: >
+      How do you plan to improve vllm-rlt's performance?
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Report of performance regression
+    description: >
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts at https://github.com/ThinkFlowLab/vllm-rlt/tree/main/benchmarks .
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Misc discussion on performance
+    description: >
+      Anything about the performance.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Your current environment (if you think it is necessary)
+    description: |
+      Please paste the output of the following commands.
+      ```sh
+      python -c "import sys, torch; print(sys.version); print(torch.__version__, torch.version.cuda)"
+      pip list | grep -Ei "vllm[-_]rlt|torch|triton|flash"
+      nvidia-smi
+      ```
+    value: |
+      ```text
+      The output of the commands above
+      ```
+  validations:
+    required: false
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: precheck
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/ThinkFlowLab/vllm-rlt/tree/main/docs).
+        required: true

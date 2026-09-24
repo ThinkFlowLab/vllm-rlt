@@ -1,0 +1,55 @@
+name: 💬 Request for comments (RFC).
+description: Ask for feedback on major architectural changes or design choices.
+title: "[RFC]: "
+labels: ["RFC"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Please take a look at previous [RFCs](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=in%3Atitle%20RFC%20sort%3Aupdated-desc) for reference.
+- type: textarea
+  attributes:
+    label: Motivation.
+    description: >
+      The motivation of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Proposed Change.
+    description: >
+      The proposed change of the RFC.
+    value: |
+      Please describe the design in detail: the current behavior, the proposed change,
+      the alternatives considered, and the impact on performance, memory, and the API.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Feedback Period.
+    description: >
+      The feedback period of the RFC. Usually at least one week.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: CC List.
+    description: >
+      The list of people you want to CC.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Any Other Things.
+    description: >
+      Any other things you would like to mention.
+  validations:
+    required: false
+- type: checkboxes
+  id: precheck
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues in the [issue tracker](https://github.com/ThinkFlowLab/vllm-rlt/issues?q=is%3Aissue+sort%3Acreated-desc+), and looked for the answer in the [documentation](https://github.com/ThinkFlowLab/vllm-rlt/tree/main/docs).
+        required: true
