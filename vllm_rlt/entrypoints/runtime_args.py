@@ -47,6 +47,7 @@ def add_runtime_args(parser):
     parser.add_argument("--static-buffers", action="store_true")
     parser.add_argument("--pad-to-power-of-two", action="store_true")
     parser.add_argument("--prefill-chunk-size", type=int, default=128)
+    parser.add_argument("--wavefront-prefill", action="store_true")
     parser.add_argument("--max-prefill-batches-before-decode", type=int, default=1)
     parser.add_argument("--admission-scan-limit", type=int, default=64)
     parser.add_argument("--max-admission-bypasses", type=int, default=8)

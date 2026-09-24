@@ -29,6 +29,10 @@ class LLMEngine:
         self.model = model
         cache_config = cache_config or CacheConfig()
         scheduler_config = scheduler_config or SchedulerConfig()
+        if scheduler_config.wavefront_prefill and cache_config.layout != "last_exited":
+            raise ValueError("wavefront prefill currently requires LAST_EXITED KV")
+        if scheduler_config.wavefront_prefill and scheduler_config.enable_preemption:
+            raise ValueError("wavefront prefill does not support preemption yet")
         parameter = next(model.parameters())
         config = model.config
         self.exit_config = exit_config or ExitConfig()
@@ -267,19 +271,35 @@ class LLMEngine:
                 continue
             params = request.sampling_params
             if batch.stage == Stage.PREFILL:
-                request.num_prefilled_tokens += item.token_count
-                event = self.model_runner.events.get(request.request_id)
-                self.cache_manager.publish_prefix(
-                    request.request_id,
-                    request.prompt_token_ids,
-                    request.num_prefilled_tokens,
-                    event,
-                )
-                if request.num_prefilled_tokens == len(request.prompt_token_ids):
-                    request.loops_done = self.model.config.total_ut_steps
-                    self.scheduler.enqueue(request, Stage.CODA)
+                task = item.prefill_task
+                if task is not None:
+                    finished = self.scheduler.advance_prefill_task(task)
+                    if task.depth == self.model.config.total_ut_steps - 1:
+                        event = task.event or self.model_runner.events.get(request.request_id)
+                        self.cache_manager.publish_prefix(
+                            request.request_id,
+                            request.prompt_token_ids,
+                            request.num_prefilled_tokens,
+                            event,
+                        )
+                    if finished:
+                        request.hidden_state = task.hidden_state[-1]
+                        request.loops_done = self.model.config.total_ut_steps
+                        self.scheduler.enqueue(request, Stage.CODA)
                 else:
-                    self.scheduler.enqueue(request, Stage.PREFILL)
+                    request.num_prefilled_tokens += item.token_count
+                    event = self.model_runner.events.get(request.request_id)
+                    self.cache_manager.publish_prefix(
+                        request.request_id,
+                        request.prompt_token_ids,
+                        request.num_prefilled_tokens,
+                        event,
+                    )
+                    if request.num_prefilled_tokens == len(request.prompt_token_ids):
+                        request.loops_done = self.model.config.total_ut_steps
+                        self.scheduler.enqueue(request, Stage.CODA)
+                    else:
+                        self.scheduler.enqueue(request, Stage.PREFILL)
             elif batch.stage == Stage.PRELUDE:
                 request.loops_done = 0
                 request.remaining_probability = 1.0

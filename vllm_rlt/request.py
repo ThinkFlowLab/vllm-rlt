@@ -35,6 +35,9 @@ class Request:
     num_output_placeholders: int = 0
     input_token_tensor: torch.Tensor | None = field(default=None, repr=False)
     num_prefilled_tokens: int = 0
+    # LAST-EXITED wavefront prefill may finish chunks out of order. Store final
+    # depth completions until the contiguous prompt frontier can advance.
+    prefill_completed_chunks: dict[int, int] = field(default_factory=dict, repr=False)
     # Host progress; in async mode an event confirms submitted GPU work is done.
     loops_done: int = 0
     pending_exit_depth: int | None = None

@@ -44,6 +44,7 @@ def load_engine(args):
             admission_scan_limit=getattr(args, "admission_scan_limit", 64),
             max_admission_bypasses=getattr(args, "max_admission_bypasses", 8),
             min_coda_batch_size=getattr(args, "min_coda_batch_size", 1),
+            wavefront_prefill=getattr(args, "wavefront_prefill", False),
         ),
         attention_backend=args.attention_backend,
     )

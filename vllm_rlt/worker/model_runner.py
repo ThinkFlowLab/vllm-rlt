@@ -315,22 +315,82 @@ class ModelRunner:
             # Same workspace metadata can be refilled only once previous DMA is done.
             if workspace:
                 workspace.acquire()
-            hidden, _ = self._core(hidden, ids, [depth] * len(ids), positions, workspace, size)
+            hidden, _ = self._core(
+                hidden, ids, [depth] * len(ids), positions, workspace, size
+            )
             if workspace:
                 workspace.release()
         return hidden
 
+    def _prefill_wavefront(self, batch):
+        """Run one depth for each ready prefill task, with mixed-depth rows."""
+        cache = self.cache_manager
+        ids, depths, positions, rows = [], [], [], []
+        embedded_tokens = []
+        for item in batch.items:
+            task = item.prefill_task
+            if task is None:
+                raise RuntimeError("wavefront prefill batch contains a legacy item")
+            ids.extend([item.request.request_id] * item.token_count)
+            depths.extend([task.depth] * item.token_count)
+            positions.extend(range(item.token_start, item.token_start + item.token_count))
+            if task.depth == 0:
+                embedded_tokens.extend(
+                    item.request.prompt_token_ids[
+                        item.token_start : item.token_start + item.token_count
+                    ]
+                )
+                rows.append(None)
+            else:
+                if task.hidden_state is None:
+                    raise RuntimeError("prefill depth task has no input hidden state")
+                rows.append(task.hidden_state)
+
+        embedded = None
+        if embedded_tokens:
+            tokens = torch.tensor(embedded_tokens, device=self.device, dtype=torch.long)
+            embedded = self.model.prelude(tokens)
+        hidden_rows = []
+        token_offset = 0
+        for row, item in zip(rows, batch.items):
+            if row is None:
+                hidden_rows.append(embedded[token_offset : token_offset + item.token_count])
+                token_offset += item.token_count
+            else:
+                hidden_rows.append(row)
+        hidden = torch.cat(hidden_rows, dim=0)
+        packed = cache.layout == "last_exited" and getattr(cache.attention, "generation", None) == 4
+        metadata = cache._prepare_batch(ids, depths, positions, packed_prefill=packed)
+        hidden, _ = self.model.recurrent_prepared(
+            hidden, metadata, cache, compute_gate=False
+        )
+        offset = 0
+        for item in batch.items:
+            end = offset + item.token_count
+            item.prefill_task.hidden_state = hidden[offset:end].clone()
+            offset = end
+
     def prepare(self, batch):
         """Snapshot CPU routing/addresses while the preceding GPU work runs."""
         requests = [i.request for i in batch.items]
-        depths = tuple(r.loops_done for r in requests)
-        positions = tuple(r.position for r in requests)
+        wavefront = batch.stage == Stage.PREFILL and all(
+            item.prefill_task is not None for item in batch.items
+        )
+        depths = tuple(
+            item.prefill_task.depth if wavefront else item.request.loops_done
+            for item in batch.items
+        )
+        positions = tuple(
+            item.token_start if wavefront else item.request.position for item in batch.items
+        )
         indices = tuple(r.num_scheduled_outputs for r in requests)
         tokens = ()
         if batch.stage == Stage.PRELUDE:
             tokens = tuple(r.input_token_tensor for r in requests)
             if any(t is None for t in tokens):
                 raise RuntimeError("async prelude requires the preceding device sample")
+        if wavefront:
+            return PreparedExecution(batch, depths, positions, indices)
         if self.async_state is not None:
             routing, kv = self.async_state.prepare(
                 requests,
@@ -351,7 +411,10 @@ class ModelRunner:
     def _execute(self, batch, prepared=None):
         requests = [i.request for i in batch.items]
         if batch.stage == Stage.PREFILL:
-            self._prefill(batch)
+            if batch.items and batch.items[0].prefill_task is not None:
+                self._prefill_wavefront(batch)
+            else:
+                self._prefill(batch)
             return None
         size = self._size(len(requests))
         group = "core" if batch.stage == Stage.RECURRENT else "boundary"
@@ -459,16 +522,32 @@ class ModelRunner:
         if prepared.routing is not None:
             if prepared.routing.imports:
                 self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                for item in batch.items:
+                    dependency = (
+                        item.prefill_task.event
+                        if item.prefill_task is not None
+                        else self.events.get(item.request.request_id)
+                    )
+                    if dependency is not None:
+                        self.copy_stream.wait_event(dependency)
             with torch.cuda.stream(self.copy_stream):
                 kv = prepared.routing.transfer(prepared.kv)
             stream.wait_event(prepared.routing.ready_event)
             prepared = replace(prepared, kv=kv)
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             for item in batch.items:
-                event = self.events.get(item.request.request_id)
-                if stream is not None and event is not None:
-                    stream.wait_event(event)
-                hidden = item.request.hidden_state
+                dependency = (
+                    item.prefill_task.event
+                    if item.prefill_task is not None
+                    else self.events.get(item.request.request_id)
+                )
+                if stream is not None and dependency is not None:
+                    stream.wait_event(dependency)
+                hidden = (
+                    item.prefill_task.hidden_state
+                    if item.prefill_task is not None
+                    else item.request.hidden_state
+                )
                 if stream is not None and hidden is not None:
                     hidden.record_stream(stream)
             try:
@@ -491,6 +570,8 @@ class ModelRunner:
                     slot.event = event
                 for item in batch.items:
                     self.events[item.request.request_id] = event
+                    if item.prefill_task is not None:
+                        item.prefill_task.event = event
                 self.submission_events.append(event)
             return Submission(
                 batch,
