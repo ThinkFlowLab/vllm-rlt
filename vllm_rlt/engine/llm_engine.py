@@ -3,8 +3,8 @@ from dataclasses import replace
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
-from vllm_rlt.core.scheduler import Scheduler
-from vllm_rlt.engine.preemption import PreemptionManager
+from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
+from vllm_rlt.engine.preemption import PreemptionManager, RequestMigration
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
@@ -14,6 +14,9 @@ from vllm_rlt.worker.speculative import SpeculativeRunner
 
 class LLMEngine:
     """Single-device loop-level engine with synchronous or pipelined scheduling."""
+
+    _spec_drafted = None
+    _spec_interleaved = False
 
     def __init__(
         self,
@@ -41,14 +44,10 @@ class LLMEngine:
                 raise ValueError("speculative target_loops must equal the model full depth")
             if self.exit_config.mode != "ouro":
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
-            if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
-                raise ValueError(
-                    "speculative decoding currently requires synchronous eager execution"
-                )
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
-                raise ValueError(
-                    "speculative decoding requires refill scheduling without preemption"
-                )
+            if self.execution_config.async_scheduling:
+                raise ValueError("speculative decoding currently requires synchronous execution")
+            if scheduler_config.mode != "refill":
+                raise ValueError("speculative decoding requires refill scheduling")
             # Retained q distributions and sampling scratch coexist with target
             # logits. Reserve beyond ordinary prefill/core profiling, even when
             # requests later choose sampling rather than greedy.
@@ -98,7 +97,7 @@ class LLMEngine:
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
         self.speculative_runner = (
-            SpeculativeRunner(model, self.cache_manager, speculative_config)
+            SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)
             if speculative_config is not None
             else None
         )
@@ -119,6 +118,8 @@ class LLMEngine:
         self._inflight = []
         self._overlap_boundary = False
         self.last_schedule = None
+        self._spec_drafted = None
+        self._spec_interleaved = False
         self.preemption = PreemptionManager(self)
         if scheduler_config.enable_preemption:
             self.scheduler.preempt_callback = self.preemption.preempt
@@ -186,7 +187,18 @@ class LLMEngine:
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests
 
+    def export_request(self, request_id: str) -> RequestMigration:
+        return self.preemption.export_request(request_id)
+
+    def import_request(self, packet: RequestMigration) -> bool:
+        return self.preemption.import_request(packet)
+
     def abort_request(self, request_id: str) -> RequestOutput:
+        if self._spec_drafted is not None:
+            self._spec_drafted = [
+                entry for entry in self._spec_drafted if entry.item.request.request_id != request_id
+            ]
+        self.preemption.inflight_ids.discard(request_id)
         self.preemption.discard_snapshot(request_id)
         self.model_runner.release(request_id)
         self._pending_exit_signals.pop(request_id, None)
@@ -206,24 +218,73 @@ class LLMEngine:
                 self._pending_coda.clear()
                 self._inflight.clear()
                 raise
-        batch = self.scheduler.schedule()
+        if self._spec_drafted is not None and self._spec_interleaved:
+            return self._complete_speculative()
+        batch = (
+            self.scheduler.schedule_intra_round()
+            if self._spec_drafted is not None
+            else self.scheduler.schedule()
+        )
         self.last_schedule = batch
         if batch is None:
+            if self._spec_drafted is not None:
+                return self._complete_speculative()
             # PD imports wait for external KV completion; yield to the IPC loop.
             if any(r.stage != Stage.RECEIVING for r in self.scheduler.requests.values()):
                 raise RuntimeError("scheduler made no progress")
             return []
         try:
             if batch.stage == Stage.SPECULATIVE:
-                return self._update_speculative(batch, self.speculative_runner.execute(batch))
-            result = self.model_runner.execute(batch)
-            return self._update(batch, result)
+                if self.speculative_config.interleave_round:
+                    self._spec_drafted = self.speculative_runner.draft(batch)
+                    self._spec_interleaved = False
+                    self.preemption.inflight_ids.update(
+                        item.request.request_id for item in batch.items
+                    )
+                    outputs = []
+                else:
+                    outputs = self._update_speculative(
+                        batch, self.speculative_runner.execute(batch)
+                    )
+            else:
+                outputs = self._update(batch, self.model_runner.execute(batch))
+                if self._spec_drafted is not None:
+                    self._spec_interleaved = True
+            self.scheduler.selected_request_ids.clear()
+            return outputs
         except Exception:
             # A failed execution may have partially written KV; invalidate the affected requests.
             for item in batch.items:
                 if item.request.request_id in self.scheduler.requests:
                     self.abort_request(item.request.request_id)
             raise
+
+    def _complete_speculative(self) -> list[RequestOutput]:
+        drafted = self._spec_drafted
+        self._spec_drafted = None
+        self._spec_interleaved = False
+        live = [
+            entry
+            for entry in drafted
+            if self.scheduler.requests.get(entry.item.request.request_id) is entry.item.request
+        ]
+        batch = SchedulerOutput(Stage.SPECULATIVE, [entry.item for entry in live])
+        self.last_schedule = batch
+        try:
+            if not live:
+                return []
+            return self._update_speculative(batch, self.speculative_runner.verify(live))
+        except Exception:
+            for entry in live:
+                rid = entry.item.request.request_id
+                if self.scheduler.requests.get(rid) is entry.item.request:
+                    self.abort_request(rid)
+            raise
+        finally:
+            self.preemption.inflight_ids.difference_update(
+                entry.item.request.request_id for entry in drafted
+            )
+            self.scheduler.selected_request_ids.clear()
 
     def _update_speculative(self, batch, results):
         outputs = []

@@ -137,9 +137,12 @@ class SpeculativeConfig:
     num_speculative_tokens: int
     draft_loops: int = 2
     target_loops: int = 4
+    interleave_round: bool = False
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
             _positive(name, getattr(self, name))
         if self.draft_loops >= self.target_loops:
             raise ValueError("draft_loops must be smaller than target_loops")
+        if type(self.interleave_round) is not bool:
+            raise ValueError("interleave_round must be a boolean")

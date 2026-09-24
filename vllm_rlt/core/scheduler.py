@@ -240,9 +240,15 @@ class Scheduler:
         admission increments earlier blocked requests' bypass counts; reaching
         the limit stops further bypasses so active work can drain.
         """
+        if not self.queues[Stage.WAITING]:
+            return
         active_count = sum(
             r.stage not in (Stage.WAITING, Stage.RECEIVING) for r in self.requests.values()
         )
+        if active_count >= self.config.max_num_seqs and (
+            self.config.policy != "priority" or self.preempt_callback is None
+        ):
+            return
         waiting = self._order_waiting_requests()
         deferred = []
         scan_count = min(len(waiting), self.config.admission_scan_limit)
@@ -366,3 +372,13 @@ class Scheduler:
         if not self.requests:
             return None
         return self.policy.schedule(self, prefer_recurrent=prefer_recurrent)
+
+    def schedule_intra_round(self) -> SchedulerOutput | None:
+        """Run one independent boundary batch while a draft awaits verification."""
+        self.selected_request_ids.clear()
+        if self.queues[Stage.CODA]:
+            return self._take(Stage.CODA)
+        self._admit()
+        if self.queues[Stage.PREFILL]:
+            return self._take(Stage.PREFILL)
+        return None
