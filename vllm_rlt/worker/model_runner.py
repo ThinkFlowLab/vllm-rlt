@@ -12,7 +12,6 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import RecurrentGraphs
-from vllm_rlt.worker.sampling import sample_logits
 from vllm_rlt.worker.sampler import Sampler
 
 
