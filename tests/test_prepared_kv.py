@@ -273,7 +273,8 @@ def test_one_preparation_and_position_tensor_per_core_across_24_layers(monkeypat
     finally:
         for handle in handles:
             handle.remove()
-    assert metadata_counts == [5] * 4
+    # Two staged host tensors (int64 addresses, int32 tables/lengths) per core traversal.
+    assert metadata_counts == [2] * 4
     assert len(layer_ids) == 96
     for traversal in range(4):
         group = layer_ids[traversal * 24 : (traversal + 1) * 24]

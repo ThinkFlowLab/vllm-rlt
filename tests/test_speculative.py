@@ -19,6 +19,7 @@ from vllm_rlt.models import OuroConfig, OuroForCausalLM
 from vllm_rlt.models.reference import dense_reference
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.sampling import probabilities, rejection_sample
+from vllm_rlt.worker.speculative import greedy_accept
 
 
 def model(seed=123, dtype=torch.float32):
@@ -190,6 +191,17 @@ def test_each_rejection_position_and_bonus_commit_correct_frontier(rejected, mon
     )[0]
     final = drain(e)["r"]
     assert final.token_ids[len(out.token_ids) :] == expected.token_ids
+
+
+@pytest.mark.parametrize("k", [0, 1, 2, 4, 8])
+def test_greedy_accept_commits_target_prefix_through_first_mismatch(k):
+    candidates = list(range(100, 100 + k))
+    for rejected in range(k + 1):
+        # Rows before `rejected` agree; row `rejected` is the correction, or the bonus.
+        targets = candidates[:rejected] + [7] + list(range(200, 200 + k - rejected))
+        tokens, accepted = greedy_accept(candidates, targets)
+        assert accepted == rejected
+        assert tokens == candidates[:rejected] + [7]
 
 
 def test_eos_in_accepted_prefix_never_delivers_following_tokens(monkeypatch):
