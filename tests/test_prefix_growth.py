@@ -96,13 +96,26 @@ def test_lossless_preemption_preserves_looped_history():
         while len(e.scheduler.requests["a"].generated_token_ids) < 3:
             e.step()
         if suspend:
+            request = e.scheduler.requests["a"]
+            generator = request.generator
+            assert generator is not None
+            state = generator.get_state().clone()
             e.add_request("b", [5], SamplingParams(max_tokens=1))
             e.scheduler.selected_request_ids.clear()
             assert e.preemption.preempt(e.scheduler.requests["b"])
             assert "a" in e.preemption.snapshots
+            # Suspension shares release() with termination, and the RNG survives
+            # only because the Request object is retained: it is not part of the
+            # KV/hidden snapshot.
+            assert request.generator is generator
+            assert torch.equal(generator.get_state(), state)
         results.append(finish(e)["a"])
         if suspend:
             assert e.preemption.resumptions == 1
+            # Sampling continued from the preserved state instead of reseeding,
+            # and termination then released the RNG slot.
+            assert not torch.equal(generator.get_state(), state)
+            assert request.generator is None
     assert results[0].token_ids == results[1].token_ids
     assert results[0].exit_depths == results[1].exit_depths
 

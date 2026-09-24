@@ -154,6 +154,42 @@ def test_sampled_generation_is_batch_invariant():
     assert serial.token_ids == batched.token_ids
 
 
+def test_same_id_after_finish_starts_from_a_fresh_generator():
+    params = SamplingParams(max_tokens=3, temperature=0.8, seed=17, ignore_eos=True)
+    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine.add_request("r", [2, 4], params)
+    request = engine.scheduler.requests["r"]
+    for _ in range(20):
+        if request.generator is not None:
+            break
+        engine.step()
+    assert request.generator is not None
+    first, _ = drain(engine)
+    # finish() pops the request from scheduler.requests, but this local name is
+    # still a live reference to the same object, so it can observe the released
+    # RNG: reusing the ID must not continue the previous stream.
+    assert request.generator is None
+    engine.add_request("r", [2, 4], params)
+    assert engine.scheduler.requests["r"] is not request
+    second, _ = drain(engine)
+    assert second["r"].token_ids == first["r"].token_ids
+    assert second["r"].exit_depths == first["r"].exit_depths
+
+
+def test_greedy_requests_never_create_a_generator():
+    engine = LLMEngine(tiny_model(), cache_config=CacheConfig(64, 2))
+    engine.add_request("g", [2, 4], SamplingParams(max_tokens=3, ignore_eos=True))
+    request = engine.scheduler.requests["g"]
+    for _ in range(1000):
+        if not engine.has_unfinished_requests():
+            break
+        engine.step()
+        assert request.generator is None
+    else:
+        pytest.fail("engine failed to finish within bounded scheduler steps")
+    assert request.generator is None
+
+
 def test_execution_failure_releases_affected_requests(monkeypatch):
     engine = LLMEngine(tiny_model())
     engine.add_request("one", [2], SamplingParams(max_tokens=2))
