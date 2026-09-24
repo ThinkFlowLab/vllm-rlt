@@ -10,11 +10,14 @@ import pytest
 from benchmarks import gsm8k
 from benchmarks.gsm8k import (
     DEFAULT_CASE,
+    FIXED_EXIT,
     baseline_fingerprint,
     baseline_result,
     build_records,
     compare,
+    depth_summary,
     digest,
+    exit_settings,
     file_digest,
     make_task,
     score,
@@ -299,3 +302,70 @@ def test_invalid_comparisons_rejected(tmp_path, change):
     message = "Missing or duplicate examples" if change == "duplicate" else None
     with pytest.raises(ValueError, match=message):
         compare(args)
+
+
+def test_default_exit_is_the_fixed_recipe():
+    assert exit_settings("native") == FIXED_EXIT
+    assert exit_settings("transformers") == FIXED_EXIT
+
+
+@pytest.mark.parametrize(
+    "backend,options",
+    [
+        ("native", dict(mode="ouro", threshold=0.5, min_loops=2)),
+        ("native", dict(mode="ouro_delayed", threshold=0.2, min_loops=2, async_scheduling=True)),
+        ("transformers", dict(mode="ouro", threshold=0.9, min_loops=1)),
+    ],
+)
+def test_adaptive_exit_settings(backend, options):
+    settings = exit_settings(backend, **options)
+    assert settings["max_loops"] == 4
+    assert settings["threshold"] == options["threshold"]
+    assert settings["min_loops"] == options["min_loops"]
+    assert settings["async_scheduling"] == options.get("async_scheduling", False)
+    assert settings != FIXED_EXIT
+
+
+@pytest.mark.parametrize(
+    "backend,options,message",
+    [
+        ("native", dict(threshold=1.5), "\\[0, 1\\]"),
+        ("native", dict(threshold=0.5), "--min-loops"),
+        ("native", dict(threshold=0.5, min_loops=5), "--min-loops"),
+        # Loop and scheduling options would be silently ignored at fixed depth.
+        ("native", dict(min_loops=2), "below 1"),
+        ("native", dict(mode="ouro_delayed"), "below 1"),
+        ("native", dict(threshold=0.5, min_loops=2, async_scheduling=True), "ouro_delayed"),
+        ("transformers", dict(threshold=0.5, min_loops=2), "min-loops 1"),
+        ("transformers", dict(mode="ouro_delayed", threshold=0.5, min_loops=1), "min-loops 1"),
+    ],
+)
+def test_invalid_exit_settings_rejected(backend, options, message):
+    with pytest.raises(ValueError, match=message):
+        exit_settings(backend, **options)
+
+
+def test_depth_summary_excludes_the_prefill_token():
+    rows = [{"exit_depths": [4, 2, 3]}, {"exit_depths": [4, 4]}, {"exit_depths": [4]}]
+    summary = depth_summary(rows)
+    assert summary["decode_tokens"] == 3
+    assert summary["mean_decode_depth"] == pytest.approx(3.0)
+    assert summary["decode_depth_histogram"] == {"2": 1, "3": 1, "4": 1}
+    assert summary["decode_loops_per_question_mean"] == pytest.approx(3.0)
+    assert depth_summary([{"token_ids": [1]}]) is None
+
+
+def test_compare_reports_exit_policies_between_native_runs(tmp_path):
+    args = comparison_fixture(tmp_path)
+    adaptive = exit_settings("native", mode="ouro", threshold=0.5, min_loops=2)
+    depth = depth_summary([{"exit_depths": [4, 2]}])
+    for backend, extra in (
+        ("transformers", {"backend": "native"}),
+        ("native", {"exit": adaptive, "depth": depth}),
+    ):
+        path = tmp_path / backend / "summary.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), **extra}))
+    result = compare(args)
+    # A summary without exit settings predates them and used the fixed recipe.
+    assert result["reference"] == {"backend": "native", "exit": FIXED_EXIT, "depth": None}
+    assert result["candidate"] == {"backend": "native", "exit": adaptive, "depth": depth}

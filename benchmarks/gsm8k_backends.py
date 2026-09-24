@@ -4,7 +4,15 @@ import torch
 from lm_eval.models.utils import postprocess_generated_text, stop_sequences_criteria
 from transformers import AutoModelForCausalLM, DynamicCache, LogitsProcessor
 
-from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from benchmarks.gsm8k import FIXED_EXIT
+from vllm_rlt import (
+    LLM,
+    CacheConfig,
+    ExecutionConfig,
+    ExitConfig,
+    SamplingParams,
+    SchedulerConfig,
+)
 
 
 def check_logits(logits):
@@ -19,8 +27,8 @@ class FiniteLogits(LogitsProcessor):
 
 
 class Generator:
-    def __init__(self, backend, model_path, tokenizer, max_length):
-        self.backend, self.tokenizer = backend, tokenizer
+    def __init__(self, backend, model_path, tokenizer, max_length, exit_policy=FIXED_EXIT):
+        self.backend, self.tokenizer, self.exit = backend, tokenizer, exit_policy
         if backend == "transformers":
             self.model = (
                 AutoModelForCausalLM.from_pretrained(
@@ -47,6 +55,8 @@ class Generator:
                 attention_backend="triton",
                 cache_config=CacheConfig(num_blocks=4 * ((max_length + 15) // 16)),
                 scheduler_config=SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=128),
+                exit_config=ExitConfig(exit_policy["mode"]),
+                execution_config=ExecutionConfig(async_scheduling=exit_policy["async_scheduling"]),
             )
             # Observe the existing sampling boundary without changing arithmetic.
             self.model = self.llm.engine.model
@@ -72,7 +82,13 @@ class Generator:
                 logits_processor=[FiniteLogits()],
                 use_cache=True,
                 past_key_values=cache,
-                exit_at_step=3,
+                # The release selects the exited loop's hidden state after running
+                # every loop, so its KV stays full-depth even when exiting early.
+                **(
+                    {"exit_at_step": 3}
+                    if self.exit == FIXED_EXIT
+                    else {"exit_threshold": self.exit["threshold"]}
+                ),
                 use_weighted_exit=False,
                 logits_to_keep=1,
             )[0, len(prompt_ids) :].tolist()
@@ -85,17 +101,20 @@ class Generator:
                 prompt_ids,
                 SamplingParams(
                     max_tokens=max_new_tokens,
-                    min_loops=4,
-                    max_loops=4,
+                    min_loops=self.exit["min_loops"],
+                    max_loops=self.exit["max_loops"],
+                    exit_threshold=self.exit["threshold"],
                     temperature=0,
                 ),
             )
             ids = []
+            depths = []
             try:
                 while engine.has_unfinished_requests():
                     for output in engine.step():
                         ids = output.token_ids
-                        if any(depth != 4 for depth in output.exit_depths):
+                        depths = output.exit_depths
+                        if self.exit == FIXED_EXIT and any(depth != 4 for depth in depths):
                             raise RuntimeError("Expected fixed-four-loop generation")
                         sequence = torch.tensor([prompt_ids + ids], device="cuda")
                         if not output.finished and criteria(sequence, None).all().item():
@@ -107,4 +126,8 @@ class Generator:
         text = postprocess_generated_text(raw, stop=stops, think_end_token=None)
         eos = bool(ids and ids[-1] == self.tokenizer.eos_token_id)
         reason = "eos" if eos else "stop" if any(s in raw for s in stops) else "length"
-        return {"token_ids": ids, "raw_text": raw, "text": text, "finish_reason": reason}
+        result = {"token_ids": ids, "raw_text": raw, "text": text, "finish_reason": reason}
+        if self.backend == "native":
+            # The first output comes from full-depth prefill; later entries are decode depths.
+            result["exit_depths"] = list(depths)
+        return result
