@@ -5,8 +5,6 @@ Full-depth replay of generated tokens is deliberately avoided: it changes RLT
 semantics. Snapshots are bounded by the admitted request population.
 """
 
-from copy import deepcopy
-
 import torch
 
 from vllm_rlt.request import Stage
@@ -37,7 +35,7 @@ class PreemptionManager:
             or request.request_id in e.scheduler.selected_request_ids
         ):
             return False
-        if e.cache_manager._get_allocation(request.request_id).transfer_leases:
+        if e.cache_manager.has_transfer_lease(request.request_id):
             return False
         return not priority_only or (
             request.sampling_params.priority > requester.sampling_params.priority
@@ -78,22 +76,9 @@ class PreemptionManager:
         e = self.engine
         e.model_runner.synchronize()
         cache = e.cache_manager
-        allocation = cache._get_allocation(victim.request_id)
-        blocks = [b for table in allocation.block_tables for b in table]
-        # Copy views one page at a time: a pressure recovery must not allocate
-        # another request-sized temporary on an already full GPU.
-        keys = torch.empty((len(blocks), *cache.key_cache.shape[1:]), dtype=cache.dtype)
-        values = torch.empty_like(keys)
-        for row, block in enumerate(blocks):
-            keys[row].copy_(cache.key_cache[block])
-            values[row].copy_(cache.value_cache[block])
         snapshot = dict(
             stage=victim.stage,
-            maximum=allocation.max_tokens,
-            pages=len(allocation.block_tables[0]),
-            written=deepcopy(allocation.written),
-            keys=keys,
-            values=values,
+            kv=cache.snapshot(victim.request_id),
             hidden=None if victim.hidden_state is None else victim.hidden_state.cpu().clone(),
             token=None
             if victim.input_token_tensor is None
@@ -122,15 +107,11 @@ class PreemptionManager:
         if state is None:
             return None
         e, cache = self.engine, self.engine.cache_manager
-        frontier = min(state["maximum"], state["pages"] * cache.block_size)
-        if not cache.allocate(request.request_id, state["maximum"], initial_tokens=frontier):
+        kv = state["kv"]
+        frontier = min(kv.max_tokens, kv.pages * cache.block_size)
+        if not cache.allocate(request.request_id, kv.max_tokens, initial_tokens=frontier):
             return False
-        allocation = cache._get_allocation(request.request_id)
-        blocks = [b for table in allocation.block_tables for b in table]
-        for row, block in enumerate(blocks):
-            cache.key_cache[block].copy_(state["keys"][row])
-            cache.value_cache[block].copy_(state["values"][row])
-        allocation.written = state["written"]
+        cache.restore(request.request_id, kv)
         request.hidden_state = None if state["hidden"] is None else state["hidden"].to(cache.device)
         request.input_token_tensor = (
             None if state["token"] is None else state["token"].to(cache.device)

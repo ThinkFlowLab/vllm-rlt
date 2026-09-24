@@ -10,6 +10,7 @@ import hashlib
 import struct
 from collections import OrderedDict
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from numbers import Integral
 
@@ -48,6 +49,24 @@ class _Allocation:
     written: list[list[_WrittenPositions]]
     transfer_leases: set[str] = field(default_factory=set)
     release_requested: bool = False
+
+
+@dataclass(frozen=True)
+class KVSnapshot:
+    """What preemption keeps for one request: its pages and its written state.
+
+    ``keys`` and ``values`` hold every page of every plane, in block-table
+    order, as ``[pages * planes, layer, token, kv_head, dim]`` host tensors.
+    Leases are not captured because a leased allocation cannot be preempted.
+    """
+
+    max_tokens: int
+    pages: int
+    # Written-position state per plane and layer. Opaque: hand it back to
+    # ``restore`` and do not read or modify it.
+    written: list[list[_WrittenPositions]]
+    keys: torch.Tensor
+    values: torch.Tensor
 
 
 @dataclass(frozen=True, eq=False)
@@ -180,6 +199,15 @@ class KVCacheManager:
                 self._free_blocks.append(b)
 
     def _claim(self, count):
+        """Take ``count`` free blocks, evicting prefix entries only if that is enough.
+
+        ``num_free_blocks`` already includes every block eviction could
+        release. If it is still short, return ``None`` without evicting, so a
+        failed admission, growth, resumption, or PD reservation does not
+        throw away prefixes it could not use anyway.
+        """
+        if self.num_free_blocks < count:
+            return None
         while len(self._free_blocks) < count and self._prefixes:
             _, blocks = self._prefixes.popitem(last=False)
             self._drop_refs(blocks)
@@ -363,9 +391,123 @@ class KVCacheManager:
             for written in plane:
                 written.prefix = length
 
+    # Other modules learn about allocations only through the methods below.
+    # They return plain facts, never _Allocation objects or reference counts.
+
+    def has_allocation(self, request_id: str) -> bool:
+        return request_id in self._allocations
+
+    def allocated_blocks(self, request_id: str) -> int:
+        """How many physical blocks this request holds, counting every plane."""
+        return len(self._get_allocation(request_id).block_tables[0]) * self.storage_depths
+
     def get_block_table(self, request_id: str, depth: int) -> tuple[int, ...]:
         self._validate_depth(depth)
         return self._get_allocation(request_id).block_tables[self._plane(depth)]
+
+    def plane_block_tables(self, request_id: str) -> tuple[tuple[int, ...], ...]:
+        """One block table per plane.
+
+        This tuple is indexed by plane, not by loop depth. LAST_EXITED has
+        ``max_loops`` planes and SHARED has one, so ``tables[2]`` fails under
+        SHARED while ``get_block_table(rid, 2)`` works under both layouts.
+        """
+        return self._get_allocation(request_id).block_tables
+
+    def has_transfer_lease(self, request_id: str) -> bool:
+        return bool(self._get_allocation(request_id).transfer_leases)
+
+    def exclusive_prefix_blocks(self, prefix: Sequence[Sequence[int]]) -> int:
+        """How many blocks of a prefix hit are held only by the prefix cache.
+
+        ``num_free_blocks`` counts those blocks as free because they could be
+        evicted. Claiming them makes them non-evictable, so admission has to
+        budget them on top of the fresh blocks it needs.
+        """
+        return sum(self._refs[b] == 1 for group in prefix for b in group)
+
+    def token_written(self, request_id: str, position: int, depth: int) -> bool:
+        """Whether every layer has written KV for ``position`` at ``depth``."""
+        allocation = self._get_allocation(request_id)
+        self._validate_depth(depth)
+        self._validate_position(allocation, position)
+        return self._token_written(allocation, position, depth)
+
+    def _token_written(self, allocation: _Allocation, position: int, depth: int) -> bool:
+        plane = allocation.written[self._plane(depth)]
+        return all(position in plane[layer] for layer in range(self.num_layers))
+
+    def mark_finalized(self, request_id: str, position: int, exit_depth: int) -> None:
+        """Mark the token written at every depth deeper than ``exit_depth``.
+
+        This is the bookkeeping half of ``finalize_token``. The asynchronous
+        finalize kernel copies the KV itself and then calls this. It must only
+        be called after the copies are queued on the stream, or attention at
+        those depths will read garbage. SHARED has nothing to record.
+        """
+        allocation = self._require_exit_written(request_id, position, exit_depth)
+        self._record_finalized(allocation, position, exit_depth)
+
+    def _require_exit_written(self, request_id, position, exit_depth) -> _Allocation:
+        allocation = self._get_allocation(request_id)
+        self._validate_depth(exit_depth)
+        self._validate_position(allocation, position)
+        if not self._token_written(allocation, position, exit_depth):
+            raise RuntimeError(
+                "cannot finalize a token before every layer has written its exit depth"
+            )
+        return allocation
+
+    def _record_finalized(self, allocation, position, exit_depth) -> None:
+        if self.layout == "shared":
+            return
+        for depth in range(exit_depth + 1, self.max_loops):
+            for layer in range(self.num_layers):
+                allocation.written[self._plane(depth)][layer].add(position)
+
+    def snapshot(self, request_id: str) -> KVSnapshot:
+        """Copy a request's pages and written state to the host, page by page.
+
+        The caller must have finished all device work on these pages first.
+        Copying page by page avoids a request-sized temporary on a device
+        that is already full, which is exactly when preemption happens.
+        """
+        allocation = self._get_allocation(request_id)
+        if allocation.transfer_leases:
+            raise RuntimeError("cannot snapshot KV during a transfer")
+        blocks = [b for table in allocation.block_tables for b in table]
+        keys = torch.empty((len(blocks), *self.key_cache.shape[1:]), dtype=self.dtype)
+        values = torch.empty_like(keys)
+        for row, block in enumerate(blocks):
+            keys[row].copy_(self.key_cache[block])
+            values[row].copy_(self.value_cache[block])
+        return KVSnapshot(
+            max_tokens=allocation.max_tokens,
+            pages=len(allocation.block_tables[0]),
+            written=deepcopy(allocation.written),
+            keys=keys,
+            values=values,
+        )
+
+    def restore(self, request_id: str, snapshot: KVSnapshot) -> None:
+        """Load a snapshot back into a fresh allocation of the same size.
+
+        ``allocate`` stays a separate step because it can fail and that
+        decision belongs to the scheduler. The copies go on the current
+        stream; the caller decides when other streams may read them.
+        """
+        allocation = self._get_allocation(request_id)
+        if allocation.max_tokens != snapshot.max_tokens:
+            raise ValueError("snapshot capacity does not match the allocation")
+        if len(allocation.block_tables[0]) != snapshot.pages:
+            raise ValueError("snapshot page count does not match the allocation")
+        if any(w.prefix or w.pending for plane in allocation.written for w in plane):
+            raise RuntimeError("cannot restore into an allocation that already holds KV")
+        blocks = [b for table in allocation.block_tables for b in table]
+        for row, block in enumerate(blocks):
+            self.key_cache[block].copy_(snapshot.keys[row])
+            self.value_cache[block].copy_(snapshot.values[row])
+        allocation.written = deepcopy(snapshot.written)
 
     def _plane(self, depth: int) -> int:
         return depth if self.layout == "last_exited" else 0
@@ -608,14 +750,7 @@ class KVCacheManager:
     @torch.no_grad()
     def finalize_token(self, request_id: str, position: int, exit_depth: int) -> None:
         """Propagate the final executed depth's K/V into every unexecuted depth."""
-        allocation = self._get_allocation(request_id)
-        self._validate_depth(exit_depth)
-        self._validate_position(allocation, position)
-        for layer in range(self.num_layers):
-            if position not in allocation.written[self._plane(exit_depth)][layer]:
-                raise RuntimeError(
-                    "cannot finalize a token before every layer has written its exit depth"
-                )
+        allocation = self._require_exit_written(request_id, position, exit_depth)
         if self.layout == "shared":
             return
         logical_page, offset = divmod(position, self.block_size)
@@ -629,9 +764,7 @@ class KVCacheManager:
         for destination in destinations:
             self.key_cache[destination, :, offset].copy_(self.key_cache[source, :, offset])
             self.value_cache[destination, :, offset].copy_(self.value_cache[source, :, offset])
-        for depth in range(exit_depth + 1, self.max_loops):
-            for layer in range(self.num_layers):
-                allocation.written[self._plane(depth)][layer].add(position)
+        self._record_finalized(allocation, position, exit_depth)
 
     @torch.no_grad()
     def read(self, layer: int, request_id: str, depth: int, length: int | None = None):

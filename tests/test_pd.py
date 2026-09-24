@@ -59,7 +59,7 @@ def test_segment_ranges_cover_only_valid_tokens_and_all_layers_depths():
         key_ptr=0,
         value_ptr=10**9,
     )
-    tables = c._get_allocation("a").block_tables
+    tables = c.plane_block_tables("a")
     expected = set()
     for table in tables:
         for token in range(2, 9):

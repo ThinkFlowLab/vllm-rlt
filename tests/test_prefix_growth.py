@@ -51,8 +51,8 @@ def test_prefix_refcounts_and_eviction():
     c.publish_prefix("a", [1, 2, 3, 4, 5], 5)
     hit = c.lookup_prefix([1, 2, 3, 4, 9])
     assert c.allocate("b", 5, prefix=hit)
-    a = c._get_allocation("a").block_tables
-    b = c._get_allocation("b").block_tables
+    a = c.plane_block_tables("a")
+    b = c.plane_block_tables("b")
     assert a[0][:2] == b[0][:2]
     c.free("a")
     assert c._refs[b[0][0]] == 2  # cache + live request

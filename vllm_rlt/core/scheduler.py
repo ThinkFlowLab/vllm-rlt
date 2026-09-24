@@ -164,10 +164,7 @@ class Scheduler:
             tokens = len(request.prompt_token_ids)
             if reserve_outputs:
                 tokens += request.sampling_params.max_tokens - 1
-            allocated = (
-                len(cache._get_allocation(request.request_id).block_tables[0])
-                * cache.storage_depths
-            )
+            allocated = cache.allocated_blocks(request.request_id)
             reserved += max(0, cache.required_blocks(tokens) - allocated)
         return reserved
 
@@ -205,7 +202,7 @@ class Scheduler:
         # blocks makes them non-evictable: do not count the same capacity twice.
         # Example: free=8 fresh + 4 cached, demand=12 with a 4-block prefix.
         # New demand is 8, but the cached claim is 4: admission costs 12, not 8.
-        cached_claim = sum(cache._refs[b] == 1 for group in prefix for b in group)
+        cached_claim = cache.exclusive_prefix_blocks(prefix)
         return AdmissionPlan(
             capacity_tokens=capacity,
             initial_tokens=initial_tokens,

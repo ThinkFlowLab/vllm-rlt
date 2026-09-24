@@ -107,7 +107,7 @@ class PDWorker:
         self.engine.model_runner.release(w.tid)
         if w.tid in self.engine.scheduler.requests:
             self.engine.scheduler.abort(w.tid)
-        if w.tid in self.cache._allocations:
+        if self.cache.has_allocation(w.tid):
             self.cache.free(w.tid)
             self.cache.unpin_transfer(w.tid, w.tid)
         self.free_slots.append(w.slot)
@@ -146,7 +146,7 @@ class PDWorker:
             self.send(
                 "reserved",
                 tid=tid,
-                tables=self.cache._get_allocation(tid).block_tables,
+                tables=self.cache.plane_block_tables(tid),
                 slot=w.slot,
                 cached_tokens=hit,
             )
@@ -209,7 +209,7 @@ class PDWorker:
 
     def queue_chunk(self, w, start, end, event, final):
         peer = self.connector.peers[w.peer]
-        tables = self.cache._get_allocation(w.tid).block_tables
+        tables = self.cache.plane_block_tables(w.tid)
         start = max(start, w.target_cached_tokens)
         source = list(kv_segments(self.connector.info, tables, start, end)) if start < end else []
         target = list(kv_segments(peer, w.target_tables, start, end)) if start < end else []
