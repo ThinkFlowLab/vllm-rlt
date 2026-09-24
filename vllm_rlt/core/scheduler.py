@@ -81,11 +81,19 @@ class Scheduler:
         request.stage = stage
         self.queues[stage].append(request.request_id)
 
+    def _remove_from_queues(self, request_id: str) -> None:
+        for queue in self.queues.values():
+            while request_id in queue:
+                queue.remove(request_id)
+
+    def suspend_preempted(self, request: Request) -> None:
+        """Move a snapshotted request out of execution and into admission."""
+        self._remove_from_queues(request.request_id)
+        self.enqueue(request, Stage.WAITING)
+
     def finish(self, request: Request, reason: FinishReason):
         # A delayed EOS can stop a request already queued for its next stage.
-        for queue in self.queues.values():
-            while request.request_id in queue:
-                queue.remove(request.request_id)
+        self._remove_from_queues(request.request_id)
         self.cache_manager.free(request.request_id)
         request.stage = Stage.FINISHED
         request.finish_reason = reason

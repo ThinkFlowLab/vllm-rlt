@@ -102,12 +102,9 @@ class PreemptionManager:
         e.model_runner.release(victim.request_id)
         cache.poll_prefixes()
         cache.free(victim.request_id)
-        for q in e.scheduler.queues.values():
-            while victim.request_id in q:
-                q.remove(victim.request_id)
         victim.hidden_state = victim.input_token_tensor = None
         self.snapshots[victim.request_id] = snapshot
-        e.scheduler.enqueue(victim, Stage.WAITING)
+        e.scheduler.suspend_preempted(victim)
         self.preemptions += 1
         return True
 
