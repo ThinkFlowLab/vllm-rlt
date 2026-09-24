@@ -2,7 +2,9 @@
 
 This note documents the M7 (Sampling) increment of RFC
 [#32](https://github.com/hsliuustc0106/vllm-rlt/issues/32). It covers
-[`worker/sampler.py`](../vllm_rlt/worker/sampler.py) and the sampling call sites in
+[`worker/sampler.py`](../vllm_rlt/worker/sampler.py), the shared helpers in
+[`worker/sampling.py`](../vllm_rlt/worker/sampling.py), the speculative call sites in
+[`worker/speculative.py`](../vllm_rlt/worker/speculative.py) and the sampling call sites in
 [`worker/model_runner.py`](../vllm_rlt/worker/model_runner.py),
 [`request.py`](../vllm_rlt/request.py),
 [`core/scheduler.py`](../vllm_rlt/core/scheduler.py),
@@ -11,11 +13,17 @@ This note documents the M7 (Sampling) increment of RFC
 [`pd/worker.py`](../vllm_rlt/pd/worker.py).
 
 M7 is split into three increments: `M7 1/3` extracts the algorithm and pins it with CPU
-contract tests, `M7 2/3` migrates RNG ownership and splits the release path, and
-`M7 3/3` adds GPU validation. This document is written during `M7 1/3`; sections that
-describe later increments say so explicitly.
+contract tests, `M7 2/3` collapses `worker/sampling.py` into `Sampler`, migrates RNG
+ownership and splits the release path, and `M7 3/3` adds GPU validation. This document is
+written during `M7 1/3`; sections that describe later increments say so explicitly.
 
 ## 1. Baseline and boundary
+
+Pinned baseline: `upstream/main @ 3314c1b`, the merge of PR #44. PR #44 added
+`worker/sampling.py` and routed `ModelRunner._sample_tensor` through
+`sampling.sample_logits()`; this increment replaces that one-line delegate with `Sampler`
+and leaves the speculative decoding path on `sampling.py`. Both modules therefore coexist
+until `M7 2/3` (section 6).
 
 ### Call chain
 
@@ -29,6 +37,9 @@ Scheduler.schedule() -> CODA batch
   -> ModelRunner.submit()                     # async path
      -> _execute() samples on the device
      -> routing.scatter(result, tokens=True)  # sampled IDs stay on the device
+  -> SpeculativeRunner.execute()              # speculative path, sync eager only
+     -> sampling.probabilities(logits, ...)   # worker/sampling.py:6
+     -> sampling.draw() / rejection_sample()  # worker/sampling.py:28, :40
 ```
 
 The async path requires the sampled value to remain a 0-dim device tensor: it is
@@ -41,21 +52,25 @@ The async path requires the sampled value to remain a 0-dim device tensor: it is
 | File | Role |
 | --- | --- |
 | `vllm_rlt/sampling_params.py` | Parameter contract and validation |
-| `vllm_rlt/worker/sampler.py` | Greedy / top-k / top-p algorithm for one logits row |
+| `vllm_rlt/worker/sampler.py` | Greedy / top-k / top-p algorithm for one logits row; the M7 boundary |
+| `vllm_rlt/worker/sampling.py` | Distribution helpers and rejection sampling added by PR #44; unchanged here |
+| `vllm_rlt/worker/speculative.py` | Draft/verify loop that calls `sampling.py` directly; unchanged here |
 | `vllm_rlt/worker/model_runner.py` | Sampling call site and RNG storage (`_sample_tensor`) |
 | `vllm_rlt/request.py` | Current RNG location (`Request.generator`) |
 | `vllm_rlt/core/scheduler.py` | RNG release on termination |
 | `vllm_rlt/engine/preemption.py` | Preemption contract that must preserve the RNG |
 | `tests/test_sampler.py` | Algorithm, seed and generator contracts |
 | `tests/test_engine.py`, `tests/test_prefix_growth.py` | RNG lifecycle across termination and preemption |
+| `tests/test_speculative.py` | Speculative-path distribution, replay and rejection-sampling contracts |
 
 ### Out of scope
 
 Exit policy and stage transitions (M3), KV allocation and prepared metadata (M4),
 attention backends (M8), the PD connector protocol (M9), new sampling features
 (`min_p`, `repetition_penalty`, `logprobs`, `n > 1`), any change to the sampling
-arithmetic or to user-visible defaults, and the batched rewrite of the per-row CODA
-loop (see "Known limitation" below).
+arithmetic or to user-visible defaults, the batched rewrite of the per-row CODA loop
+(see "Known limitation" below), and collapsing `worker/sampling.py` into `Sampler`
+(M7 2/3).
 
 ## 2. Classes and state
 
@@ -75,15 +90,29 @@ per-request state: `sample()` receives the generator and returns the possibly cr
 one, so "where the RNG lives" stays visible at the call site. This is what lets
 `M7 2/3` move RNG storage without touching the algorithm or its tests.
 
+### `worker/sampling.py` (unchanged by this increment)
+
+The same arithmetic also exists as module-level helpers, introduced by PR #44:
+`probabilities()` builds the temperature/top-k/top-p distribution, `draw()` performs one
+multinomial draw, and `generator_for()` performs the lazy generator creation for the
+speculative path. `rejection_sample()` is speculative-only and has no counterpart in
+`Sampler`.
+
 ### RNG lifecycle today
 
 | Event | Current behavior | Location |
 | --- | --- | --- |
-| First random sample | Lazily creates `torch.Generator(device=...)` seeded from `params.seed` | `sampler.py:43-44` |
+| First random sample (CODA) | Lazily creates `torch.Generator(device=...)` seeded from `params.seed` | `sampler.py:43-44` |
+| First random sample (speculative) | Lazily creates the same kind of generator on the `Request` | `sampling.py:22-25` |
 | Greedy sample | `argmax`, no generator created or advanced | `sampler.py:31-32` |
-| Request finishes | `scheduler.finish` sets `request.generator = None` | `scheduler.py:94` |
+| Request finishes | `scheduler.finish` sets `request.generator = None` | `scheduler.py:95` |
 | Request preempted | Not reset; the `Request` object and its generator are retained | `preemption.py:3`, `preemption.py:102` |
 | Request resumed | Not rebuilt; sampling continues on the same generator | `preemption.py:114-144` |
+
+Both modules write the same `Request.generator` slot, so the two creation sites must stay
+consistent until `M7 2/3` moves the RNG behind the runner (section 6). Speculative
+decoding requires synchronous eager execution, refill scheduling and no preemption
+(`llm_engine.py:37-50`), so only the CODA path exercises the preemption rows above.
 
 ## 3. Functions and parameters
 
@@ -91,11 +120,14 @@ one, so "where the RNG lives" stays visible at the call site. This is what lets
 class Sampler:
     def __init__(self, device: torch.device): ...
 
+    # logits: [vocab] 1-dim device tensor, any float dtype; caller guarantees ndim == 1
+    # params: validated by SamplingParams.__post_init__
+    # generator: None on the greedy path
     def sample(
         self,
-        logits: torch.Tensor,                 # [vocab] 1-dim device tensor, any float dtype; caller guarantees ndim == 1
-        params: SamplingParams,               # validated by __post_init__
-        generator: torch.Generator | None,    # None on the greedy path
+        logits: torch.Tensor,
+        params: SamplingParams,
+        generator: torch.Generator | None,
     ) -> tuple[torch.Tensor, torch.Generator | None]:
         """Return a 0-dim long device tensor and the possibly created generator."""
 ```
@@ -131,6 +163,16 @@ def _sample_tensor(self, logits: torch.Tensor, request: Request):
 | `425` | CODA calls `_sample_tensor` once per request row and `torch.stack`s the results. |
 | `601-606` | Delegate: reads `request.generator`, calls `Sampler.sample`, stores the result back. |
 
+`worker/sampling.py` (unchanged; kept for the speculative path):
+
+| Lines | Behavior |
+| --- | --- |
+| `6-19` | `probabilities`: the same temperature/top-k/top-p statements as `Sampler.sample`, returning the normalized distribution. |
+| `22-25` | `generator_for`: lazily creates `request.generator` from `params.seed`. |
+| `28-29` | `draw`: one `torch.multinomial` draw followed by `squeeze(0)`. |
+| `32-37` | `sample_logits`: greedy short circuit or `draw`. This was `_sample_tensor`'s body before this increment, and it has no caller now. |
+| `40-56` | `rejection_sample`: exact speculative rejection with residual resampling. |
+
 ### Documented project difference
 
 `sampler.py:33` promotes logits to FP32 before dividing by temperature. The pinned
@@ -142,15 +184,17 @@ sampling path to compare against. The FP32 promotion is therefore a project choi
 awaiting comparison with a real reference sampling path, not a difference from a
 pinned sampling implementation. This is the "record the sampling implementation
 separately" item required by [precision policy](precision-policy.md). `M7 1/3`
-preserves it unchanged.
+preserves it unchanged; the speculative path repeats the same promotion in
+`sampling.py:9`.
 
 ### Known limitation
 
 `model_runner.py:424-426` samples each request row in a Python loop, so every row pays
-its own `sort`/`topk` over the model vocabulary (`vocab_size = 49152` in `config.py`). vLLM instead batches the multinomial
-across the batch. This is recorded as a known limitation and is deliberately not
-optimized in M7; any batched rewrite must keep the arithmetic order
-`float()/temperature → top_k → top_p → multinomial` and the no-host-sync guarantee.
+its own `sort`/`topk` over the model vocabulary (`vocab_size = 49152` in `config.py`).
+vLLM instead batches the multinomial across the batch. This is recorded as a known
+limitation and is deliberately not optimized in M7; any batched rewrite must keep the
+arithmetic order `float()/temperature → top_k → top_p → multinomial` and the
+no-host-sync guarantee.
 
 ## 5. Evidence-based findings
 
@@ -158,16 +202,26 @@ optimized in M7; any batched rewrite must keep the arithmetic order
 only the definition, no call site; tests monkeypatch `_sample_tensor`
 (`tests/test_async_pipeline.py:138`). Removed in `M7 1/3`.
 
+**Sampling exists in two modules after PR #44 (structural finding).**
+`worker/sampling.py` arrived with the speculative decoding change, and its
+`probabilities()`/`draw()` carry the same statements this increment moved into
+`Sampler.sample`; `_sample_tensor` was a one-line delegate to `sampling.sample_logits()`
+before it. This increment deliberately keeps both: `Sampler` becomes the M7 boundary for
+the CODA path and is pinned by the new tests, while `sampling.py` keeps serving the
+speculative path untouched. The cost is one duplicated distribution construction for one
+increment, and `sample_logits()` loses its only caller, so its import is dropped here and
+the function itself is removed in `M7 2/3` (section 6).
+
 **RNG ownership disagrees with the RFC state table.** The RFC assigns "RNG objects
 and their execution/snapshot state" to the worker, while the generator currently lives
-on the scheduler-side `Request` dataclass (`request.py:43`). Behavior is correct today
+on the scheduler-side `Request` dataclass (`request.py:44`). Behavior is correct today
 because `Request` is a shared handle and preemption/resumption happens to retain it,
 but ownership is implicit: any change that treats `release()` as "termination releases
 everything" can silently reset the RNG.
 
 **Preemption and termination share `model_runner.release()` (the key design
 constraint).** `preemption.py:102` calls `release()` when suspending a victim;
-`llm_engine.py:155` (abort) and `llm_engine.py:261` (finish) call the same method, and
+`llm_engine.py:191` (abort) and `llm_engine.py:332` (finish) call the same method, and
 `pd/worker.py:107` (removal) and `pd/worker.py:305` (prefill compute release) do as
 well. Moving the RNG into the runner and deleting it inside `release()` would reset it
 on preemption, changing the token sequence after restoration. That would violate the
@@ -203,17 +257,27 @@ stacks the sampled results and scatters them with `tokens=True`
 
 `M7 1/3` (this increment) only moves the algorithm into `Sampler` and pins behavior.
 RNG ownership is unchanged: `request.generator` is still read and written by the
-delegate, and `release()` still does not touch it.
+`_sample_tensor` delegate and by `sampling.generator_for` on the speculative path, and
+`release()` still does not touch it.
 
 `M7 2/3` will, in order:
 
-1. Add a runner-side RNG registry (`dict[str, torch.Generator]`) and have
-   `_sample_tensor` read and write it instead of `request.generator`.
-2. Split the release path: `suspend(request_id)` synchronizes the event and frees the
+1. Collapse `worker/sampling.py` into `Sampler`: move `probabilities()`, `draw()` and
+   `generator_for()` onto the class, retarget the `speculative.py` call sites, and delete
+   `sample_logits()`.
+2. Add a runner-side RNG registry (`dict[str, torch.Generator]`) and have both sampling
+   paths read and write it instead of `request.generator`.
+3. Split the release path: `suspend(request_id)` synchronizes the event and frees the
    state slot but keeps the RNG (called by preemption); `release(request_id)` does the
    same and additionally drops the RNG (called by abort, finish and PD removal).
-3. Remove `Request.generator` and the `scheduler.finish` assignment, then delete the
+4. Remove `Request.generator` and the `scheduler.finish` assignment, then delete the
    temporary adapters.
+
+The unification must keep each path's RNG call order: the CODA path draws one
+`multinomial` per token, while the speculative path additionally draws draft candidates,
+`torch.rand` acceptance uniforms and residual resamples. The two paths therefore produce
+different sequences from the same seed today, and only their distributions agree; `M7 2/3`
+must preserve that rather than align the streams.
 
 The target RNG contract:
 
@@ -222,6 +286,7 @@ The target RNG contract:
 | First random sample | Create the generator from `params.seed` in the request's RNG slot |
 | Later samples | Reuse and advance the same generator (ordering semantics unchanged) |
 | Greedy request | Never create or advance a generator |
+| Speculative request | Same slot; draft draws, acceptance uniforms and residual draws all come from it |
 | Preemption | Keep the generator (or snapshot `get_state()`) and continue from it on resume |
 | Termination (stop/length/abort/PD removal) | Drop the RNG slot so a new request with the same ID starts fresh |
 | Late async result | Must not write into a new request's RNG; the existing object-identity check covers results, and "release on termination" covers the RNG |
@@ -230,7 +295,7 @@ The target RNG contract:
 
 `ModelRunner._sample_tensor` exists so that `tests/test_async_pipeline.py:138` keeps
 working. It can be removed once that test patches `Sampler` instead, which is planned
-for `M7 2/3` when the runner-side registry lands.
+for `M7 2/3` when the runner-side registry lands and both sampling paths read it.
 
 ## 7. Validation
 
@@ -238,13 +303,14 @@ for `M7 2/3` when the runner-side registry lands.
 
 | Suite | Result |
 | --- | --- |
-| `main @ 60af1cf` baseline (`test_engine.py test_prefix_growth.py test_async_pipeline.py`) | 47 passed, 15 skipped |
+| `upstream/main @ 3314c1b` baseline (`test_engine.py test_prefix_growth.py test_async_pipeline.py`) | 47 passed, 15 skipped |
 | Same three files after this increment (baseline 47 + 2 new engine tests) | 49 passed, 15 skipped |
 | With `test_sampler.py` and `test_serving.py` added | 59 passed, 16 skipped |
-| Full CPU suite (`tests/`) | 211 passed, 115 skipped |
+| `upstream/main @ 3314c1b` full CPU suite | 240 passed, 121 skipped |
+| Full CPU suite (`tests/`) | 252 passed, 121 skipped |
 
 ```bash
-# main @ 60af1cf baseline (checkout 60af1cf first)
+# upstream/main @ 3314c1b baseline (checkout 3314c1b first)
 OMP_NUM_THREADS=1 python -m pytest -q tests/test_engine.py tests/test_prefix_growth.py tests/test_async_pipeline.py
 # same three files after this increment
 OMP_NUM_THREADS=1 python -m pytest -q tests/test_engine.py tests/test_prefix_growth.py tests/test_async_pipeline.py
@@ -254,11 +320,14 @@ OMP_NUM_THREADS=1 python -m pytest -q tests/test_sampler.py tests/test_engine.py
 # full CPU suite
 OMP_NUM_THREADS=1 python -m pytest -q tests/
 # lint
-python -m ruff check vllm_rlt/worker/sampler.py vllm_rlt/worker/model_runner.py tests/test_sampler.py
+python -m ruff check .
 python -m ruff format --check vllm_rlt/worker/sampler.py vllm_rlt/worker/model_runner.py tests/test_sampler.py
 ```
 
-Ruff: all checks passed; 3 files already formatted.
+The full suite grows by 12 tests over the baseline: 10 in `tests/test_sampler.py` and the
+2 new engine tests. Ruff: `ruff check .` passes and the touched Python files are already
+formatted. Three pre-existing markdown files are not `ruff format` clean on the baseline
+either, so the documentation check stays scoped to the touched Python files.
 
 The extraction changes no arithmetic, so no new precision or performance evidence is
 required. Sampling sequences depend on `torch.multinomial`; the numbers above are with
