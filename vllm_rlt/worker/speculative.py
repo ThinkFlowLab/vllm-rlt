@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
 from vllm_rlt.worker.sampling import (
     draw,
     generator_for,
@@ -33,20 +34,34 @@ class SpeculativeStats:
 
 
 class SpeculativeRunner:
-    def __init__(self, model, cache, config):
+    def __init__(self, model, cache, config, execution):
         self.model, self.cache, self.config = model, cache, config
         self.device = next(model.parameters()).device
         self.stats = SpeculativeStats()
+        self.graphs = (
+            RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
+        )
+        self.coda_graphs = CodaGraphs(model, execution) if execution.cuda_graphs else None
 
     def _core(self, hidden, ids, positions, depth, *, packed=False):
         batch = self.cache._prepare_batch(
             ids,
             [depth] * len(ids),
             positions,
-            packed_prefill=packed and getattr(self.cache.attention, "generation", None) == 4,
+            packed_prefill=packed and self.cache.attention_info.get("generation") == 4,
         )
-        hidden, _ = self.model.recurrent_prepared(hidden, batch, self.cache, compute_gate=False)
+        if self.graphs is not None:
+            hidden, _ = self.graphs.run(hidden, batch)
+        else:
+            hidden, _ = self.model.recurrent_prepared(hidden, batch, self.cache, compute_gate=False)
         return hidden
+
+    def _coda(self, hidden):
+        return (
+            self.coda_graphs.run(hidden)
+            if self.coda_graphs is not None
+            else self.model.coda(hidden)
+        )
 
     @torch.inference_mode()
     def execute(self, batch):
@@ -74,7 +89,7 @@ class SpeculativeRunner:
                     drafting.append((row, i))
             if not drafting:
                 continue
-            logits = self.model.coda(torch.stack([hidden[row] for row, _ in drafting]))
+            logits = self._coda(torch.stack([hidden[row] for row, _ in drafting]))
             for row, (_, i) in enumerate(drafting):
                 request = items[i].request
                 if request.sampling_params.temperature == 0:
@@ -92,7 +107,7 @@ class SpeculativeRunner:
         hidden = torch.stack([h for request_states in states for h in request_states])
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._core(hidden, ids, positions, depth, packed=True)
-        logits = self.model.coda(hidden)
+        logits = self._coda(hidden)
         results, start = [], 0
         for i, item in enumerate(items):
             rows = logits[start : start + item.token_count]

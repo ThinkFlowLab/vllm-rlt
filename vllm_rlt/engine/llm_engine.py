@@ -41,10 +41,8 @@ class LLMEngine:
                 raise ValueError("speculative target_loops must equal the model full depth")
             if self.exit_config.mode != "ouro":
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
-            if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
-                raise ValueError(
-                    "speculative decoding currently requires synchronous eager execution"
-                )
+            if self.execution_config.async_scheduling:
+                raise ValueError("speculative decoding currently requires synchronous execution")
             if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
@@ -98,7 +96,7 @@ class LLMEngine:
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
         self.speculative_runner = (
-            SpeculativeRunner(model, self.cache_manager, speculative_config)
+            SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)
             if speculative_config is not None
             else None
         )

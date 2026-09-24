@@ -302,7 +302,6 @@ def test_probability_filters_match_expected_and_keep_boundary_ties():
     [
         dict(cache_config=CacheConfig(layout="shared")),
         dict(execution_config=ExecutionConfig(async_scheduling=True)),
-        dict(execution_config=ExecutionConfig(cuda_graphs=True)),
         dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
         dict(scheduler_config=SchedulerConfig(mode="no_refill")),
     ],
@@ -375,3 +374,38 @@ def test_gpu_sampling_and_greedy_match_replay_with_ragged_requests(backend):
     greedy = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [8, 5, 3]]
     a, b = run(True, greedy), run(False, greedy)
     assert [o.token_ids for o in a] == [o.token_ids for o in b]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("max_graph_rows", [2, 8])
+def test_speculative_cuda_graph_matches_eager_with_ragged_replay(max_graph_rows):
+    m = model(dtype=torch.bfloat16).to("cuda")
+    prompts = [[2, 3, 4], [7, 8]]
+    params = SamplingParams(max_tokens=9, ignore_eos=True)
+
+    def run(graphs):
+        llm = LLM(
+            m,
+            speculative_config=SpeculativeConfig(3),
+            cache_config=CacheConfig(128, 16),
+            attention_backend="triton",
+            execution_config=ExecutionConfig(
+                cuda_graphs=graphs, cuda_graph_max_batch_size=max_graph_rows
+            ),
+        )
+        outputs = [llm.generate(prompts, params) for _ in range(2)]
+        assert llm.engine.cache_manager.num_used_blocks == 0
+        return llm.engine.speculative_runner, [
+            [(out.token_ids, out.exit_depths) for out in batch] for batch in outputs
+        ]
+
+    _, eager = run(False)
+    runner, graphed = run(True)
+    assert graphed == eager
+    assert runner.graphs.captures > 0
+    assert runner.graphs.replays > runner.graphs.captures
+    assert runner.coda_graphs.captures > 0
+    if max_graph_rows == 2:
+        assert runner.graphs.fallbacks > 0
+    else:
+        assert any(rows > 2 for rows, _, _, _ in runner.graphs.entries)
