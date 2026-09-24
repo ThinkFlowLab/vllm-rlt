@@ -137,9 +137,19 @@ class SpeculativeConfig:
     num_speculative_tokens: int
     draft_loops: int = 2
     target_loops: int = 4
+    # None keeps the plain runner. A finite margin in [0, 1] enables the optional
+    # single-fallback branch runner, which is greedy-only.
+    fallback_margin: float | None = None
 
     def __post_init__(self):
         for name in ("num_speculative_tokens", "draft_loops", "target_loops"):
             _positive(name, getattr(self, name))
         if self.draft_loops >= self.target_loops:
             raise ValueError("draft_loops must be smaller than target_loops")
+        if self.fallback_margin is not None:
+            if isinstance(self.fallback_margin, bool) or not isinstance(
+                self.fallback_margin, (int, float)
+            ):
+                raise ValueError("fallback_margin must be a finite number in [0, 1] or None")
+            if not math.isfinite(self.fallback_margin) or not 0 <= self.fallback_margin <= 1:
+                raise ValueError("fallback_margin must be in [0, 1]")

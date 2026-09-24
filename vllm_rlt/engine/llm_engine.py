@@ -8,6 +8,7 @@ from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.worker.branch_speculative import BranchSpeculativeRunner
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.speculative import SpeculativeRunner
 
@@ -35,6 +36,12 @@ class LLMEngine:
         self.execution_config = execution_config or ExecutionConfig()
         self.speculative_config = speculative_config
         if speculative_config is not None:
+            # Keep this guard separate: graph support for the plain runner does
+            # not make the fallback's cache copies safe to capture.
+            if speculative_config.fallback_margin is not None and (
+                self.execution_config.async_scheduling or self.execution_config.cuda_graphs
+            ):
+                raise ValueError("fallback branch speculation requires synchronous eager execution")
             if cache_config.layout != "last_exited":
                 raise ValueError("speculative decoding requires last_exited KV")
             if speculative_config.target_loops != config.total_ut_steps:
@@ -97,11 +104,16 @@ class LLMEngine:
         ):
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
-        self.speculative_runner = (
-            SpeculativeRunner(model, self.cache_manager, speculative_config)
-            if speculative_config is not None
-            else None
-        )
+        if speculative_config is None:
+            self.speculative_runner = None
+        elif speculative_config.fallback_margin is None:
+            self.speculative_runner = SpeculativeRunner(
+                model, self.cache_manager, speculative_config
+            )
+        else:
+            self.speculative_runner = BranchSpeculativeRunner(
+                model, self.cache_manager, speculative_config
+            )
         self.model_runner = ModelRunner(
             model,
             self.cache_manager,
@@ -147,6 +159,12 @@ class LLMEngine:
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
             raise ValueError("speculative requests require fixed target depth and exit_threshold=1")
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.fallback_margin is not None
+            and params.temperature != 0
+        ):
+            raise ValueError("fallback branch speculation is greedy-only; temperature must be 0")
         if trace_id is not None:
             if not isinstance(trace_id, str) or not trace_id:
                 raise ValueError("trace_id must be a nonempty string")

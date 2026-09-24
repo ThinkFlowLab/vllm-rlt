@@ -123,6 +123,45 @@ create an environment, download the model, start the server, and send your first
 request. The guide also covers command-line inference and the Python API. Browse the [documentation](docs/README.md) for runtime
 configuration, optional backends, and design notes.
 
+
+### Experimental fallback proposals
+
+Fixed-depth greedy speculation can optionally draft one alternate suffix when
+the shallow top-1/top-2 softmax probabilities are close. The full-depth verifier
+must confirm the alternate token before its suffix is reused.
+
+```python
+from vllm_rlt import LLM, SamplingParams, SpeculativeConfig
+
+llm = LLM(
+    "ByteDance/Ouro-1.4B",
+    device="cuda",
+    attention_backend="triton",
+    speculative_config=SpeculativeConfig(
+        num_speculative_tokens=4,
+        draft_loops=2,
+        target_loops=4,
+        fallback_margin=0.2,
+    ),
+)
+outputs = llm.generate(
+    ["Explain how a rainbow forms."],
+    SamplingParams(temperature=0, max_tokens=64),
+)
+```
+
+`fallback_margin=None` (the default) uses the original speculative runner.
+A value in [0, 1] enables the branch; even zero can open a branch on a tie.
+The branch path requires synchronous eager execution and greedy requests,
+along with the existing fixed-depth, last-exited KV and refill restrictions.
+If spare KV blocks are unavailable, the round continues on the primary path.
+
+This is experimental: branch rows add computation and occupy extra KV blocks.
+BF16 greedy sequences can differ from the plain runner; FP32 tests do not
+establish real-model BF16 losslessness. FA4 and real-model natural-EOS or
+online-serving performance have not been validated for this path.
+
+
 ## Performance Baselines
 
 The current performance baselines are recorded in
