@@ -601,9 +601,37 @@ class ModelRunner:
 
     def _sample_tensor(self, logits: torch.Tensor, request: Request):
         params = request.sampling_params
-        if params.temperature == 0:
+        logits = logits.float().clone()
+
+        rep_penalty = getattr(params, "repetition_penalty", 1.0)
+        if rep_penalty > 1.0:
+            prompt_tokens = getattr(request, "prompt_token_ids", [])
+            generated_tokens = getattr(request, "generated_token_ids", [])
+            context_tokens = prompt_tokens + generated_tokens
+            if context_tokens:
+                prev_tokens = torch.tensor(
+                    list(set(context_tokens)),
+                    device=logits.device,
+                    dtype=torch.long,
+                )
+                prev_logits = logits[prev_tokens]
+                logits[prev_tokens] = torch.where(
+                    prev_logits > 0,
+                    prev_logits / rep_penalty,
+                    prev_logits * rep_penalty,
+                )
+
+        temp = params.temperature
+        if getattr(params, "dynamic_depth_temp", False) and temp > 0:
+            depth = getattr(request, "loops_done", 0)
+            if 0 < depth <= 2:
+                temp = max(temp * 0.7, 0.1)
+            elif depth >= 4:
+                temp = temp * 1.2
+
+        if temp == 0:
             return logits.argmax()
-        logits = logits.float() / params.temperature
+        logits = logits / temp
         if params.top_k > 0:
             threshold = logits.topk(min(params.top_k, logits.numel())).values[-1]
             logits = logits.masked_fill(logits < threshold, -torch.inf)
@@ -613,6 +641,6 @@ class ModelRunner:
             remove[1:] = remove[:-1].clone()
             remove[0] = False
             logits = logits.scatter(0, indices, sorted_logits.masked_fill(remove, -torch.inf))
-        if request.generator is None:
-            request.generator = torch.Generator(device=self.device).manual_seed(params.seed)
+        if getattr(request, "generator", None) is None:
+            request.generator = torch.Generator(device=logits.device).manual_seed(params.seed)
         return torch.multinomial(logits.softmax(-1), 1, generator=request.generator).squeeze(0)
