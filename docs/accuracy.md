@@ -129,13 +129,21 @@ python -m benchmarks.gsm8k run --backend native \
 - The Transformers release accepts `--exit-mode ouro --min-loops 1` only: it has no
   minimum loop count or delayed mode. It runs every loop and selects the exited
   loop's hidden state, so its KV stays full-depth, while native execution skips the
-  remaining loops and uses the configured KV layout.
+  remaining loops and uses the configured KV layout. The release would also apply the
+  threshold to the prefill forward; the harness forces that call to full depth, as
+  native prefill always is, so the first output token is chosen the same way.
+- The release computes the exit rule in BF16 and compares it with the threshold
+  rounded to BF16 (0.2 becomes 0.2002); native uses FP32 gate scores. Comparisons of
+  the two backends therefore include exit-arithmetic and kernel differences, not only
+  the KV layout.
 
-Metadata and summaries record the exit settings. Native summaries add `depth`: decode
+Metadata and summaries record the exit settings. Adaptive summaries add `depth`: decode
 token count, mean decode depth, a depth histogram and mean decode loops per
-question. The first output token comes from full-depth prefill and is excluded
-from these statistics. The stored GSM8K-87 baseline describes fixed-depth
-generation, so adaptive native runs report no `baseline_comparison` and no gate.
+question. For the Transformers release these are the selected exit loops, recorded
+with its own rule; it still computes all four loops for every token. The first output
+token comes from full-depth prefill and is excluded from these statistics. The stored
+GSM8K-87 baseline describes fixed-depth generation, so adaptive native runs report no
+`baseline_comparison` and no gate.
 
 `compare --reference A --candidate B` (aliases of `--transformers`/`--native`)
 accepts any pair of backends from the same protocol and reports each side's backend,

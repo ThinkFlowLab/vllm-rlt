@@ -116,11 +116,16 @@ def test_failure_releases_request(generator, failure):
 class ReleaseModel:
     config = SimpleNamespace(num_hidden_layers=1, total_ut_steps=4)
 
-    def __init__(self):
+    def __init__(self, depths=None, recorded=(4, 2)):
         self.kwargs = None
+        self.depths = depths
+        self.recorded = recorded
 
     def generate(self, inputs, **kwargs):
         self.kwargs = kwargs
+        if self.depths is not None:
+            # Stands in for ReleaseExitHooks, which records one depth per forward.
+            self.depths.depths.extend(self.recorded)
         return torch.cat([inputs.cpu(), torch.tensor([[10, 11]])], dim=1)
 
 
@@ -137,7 +142,8 @@ def test_transformers_exit_arguments(generator, monkeypatch, adaptive):
 
     monkeypatch.setattr(backends, "DynamicCache", Cache)
     generator.backend = "transformers"
-    generator.model = ReleaseModel()
+    generator.exit_hooks = SimpleNamespace(depths=["stale"]) if adaptive else None
+    generator.model = ReleaseModel(generator.exit_hooks)
     generator.cache_slots = 4
     generator.exit = ADAPTIVE_EXIT if adaptive else backends.FIXED_EXIT
     result = generator.generate([1, 2], 8, ["STOP"])
@@ -147,5 +153,63 @@ def test_transformers_exit_arguments(generator, monkeypatch, adaptive):
     else:
         assert kwargs["exit_at_step"] == 3 and "exit_threshold" not in kwargs
     assert result["token_ids"] == [10, 11]
-    # The release does not report per-token exit depths.
-    assert "exit_depths" not in result
+    if adaptive:
+        # Depths from the previous question are cleared before generation.
+        assert result["exit_depths"] == [4, 2]
+    else:
+        assert "exit_depths" not in result
+
+
+def test_transformers_depth_count_must_match_tokens(generator, monkeypatch):
+    from benchmarks import gsm8k_backends as backends
+
+    class Cache:
+        layers = [None] * 4
+
+        def append_new_layers(self, index):
+            pass
+
+    monkeypatch.setattr(backends, "DynamicCache", Cache)
+    generator.backend = "transformers"
+    generator.exit_hooks = SimpleNamespace(depths=[])
+    generator.model = ReleaseModel(generator.exit_hooks, recorded=(4,))
+    generator.cache_slots = 4
+    generator.exit = ADAPTIVE_EXIT
+    with pytest.raises(RuntimeError, match="exit depths"):
+        generator.generate([1, 2], 8, ["STOP"])
+
+
+class GateModel(torch.nn.Module):
+    """Minimal stand-in for the release: the inner model returns (outputs, hidden, gates)."""
+
+    config = SimpleNamespace(total_ut_steps=4)
+
+    def __init__(self, hazards):
+        super().__init__()
+        logits = torch.logit(torch.tensor(hazards, dtype=torch.float32))
+
+        class Inner(torch.nn.Module):
+            def forward(self, length):
+                return None, None, [value.expand(1, length, 1) for value in logits]
+
+        self.model = Inner()
+        self.exit_at_step = []
+
+    def forward(self, length, cache_position=None, exit_at_step=None):
+        self.exit_at_step.append(exit_at_step)
+        return self.model(length)
+
+
+@pytest.mark.parametrize("threshold,depth", [(0.05, 1), (0.2, 2), (0.5, 3), (0.9, 4), (1.0, 4)])
+def test_release_exit_hooks(threshold, depth):
+    pytest.importorskip("lm_eval")
+    from benchmarks.gsm8k_backends import ReleaseExitHooks
+
+    # Hazards 0.1, 0.3, 0.5 give cumulative exit probabilities 0.1, 0.37, 0.685, then 1.
+    model = GateModel([0.1, 0.3, 0.5, 0.9])
+    hooks = ReleaseExitHooks(model, threshold)
+    model(3, cache_position=torch.tensor([0, 1, 2]))
+    model(1, cache_position=torch.tensor([3]))
+    # Prefill is forced to full depth like native; decode follows the release's rule.
+    assert model.exit_at_step == [3, None]
+    assert hooks.depths == [4, depth]
