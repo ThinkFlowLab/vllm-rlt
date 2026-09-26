@@ -9,6 +9,7 @@ an environment to receiving the first generated response. The
 | [First-run user guide](launching.md) | Environment setup, model download, server startup, first request, CLI, Python API, and troubleshooting |
 | [Engine design](design.md) | Model stages, scheduling, and KV ownership |
 | [Scheduler walkthrough](scheduler_walkthrough.md) | Responsibilities, admission cases, control flow, and refactoring checklist |
+| [Sampling walkthrough](sampling_walkthrough.md) | Sampling algorithm, RNG lifecycle across preemption and termination, and known limits |
 | [KV layout examples](kv_layout_computation.md) | SHARED and LAST_EXITED semantics and worked attention examples |
 | [Runtime configuration](cdb_runtime.md) | Exit policies, KV layouts, execution options, and CUDA Graphs |
 | [Asynchronous scheduling](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | CPU/GPU pipelining and single-stream or multi-stream execution |
