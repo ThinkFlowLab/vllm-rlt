@@ -369,3 +369,15 @@ def test_compare_reports_exit_policies_between_native_runs(tmp_path):
     # A summary without exit settings predates them and used the fixed recipe.
     assert result["reference"] == {"backend": "native", "exit": FIXED_EXIT, "depth": None}
     assert result["candidate"] == {"backend": "native", "exit": adaptive, "depth": depth}
+    assert (result["reference_correct"], result["candidate_correct"]) == (1, 1)
+    # Backend-named keys would mislabel a native-vs-native comparison, so they are omitted.
+    assert not any(key.startswith(("transformers_", "native_")) for key in result)
+    assert "reference_correct_native_wrong" not in result
+
+
+def test_compare_keeps_backend_named_keys_for_hf_vs_native(tmp_path):
+    result = compare(comparison_fixture(tmp_path, native_correct=False))
+    assert result["reference_correct_candidate_wrong"] == 1
+    assert result["transformers_correct"] == result["reference_correct"] == 1
+    assert result["native_correct"] == result["candidate_correct"] == 0
+    assert result["native_accuracy_pct"] == result["candidate_accuracy_pct"] == 0

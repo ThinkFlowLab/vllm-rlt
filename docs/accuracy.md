@@ -139,7 +139,9 @@ generation, so adaptive native runs report no `baseline_comparison` and no gate.
 
 `compare --reference A --candidate B` (aliases of `--transformers`/`--native`)
 accepts any pair of backends from the same protocol and reports each side's backend,
-exit settings and depth summary alongside the paired accuracy result.
+exit settings and depth summary alongside the paired accuracy result. Result keys use
+`reference_*`/`candidate_*`; the earlier `transformers_*`/`native_*` keys are also
+written only when the reference is the Transformers release and the candidate is native.
 
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not

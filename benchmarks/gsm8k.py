@@ -461,16 +461,16 @@ def compare(args):
             "exit": b.get("exit", FIXED_EXIT),
             "depth": b.get("depth"),
         },
-        "transformers_accuracy_pct": 100 * a["accuracy"],
-        "native_accuracy_pct": 100 * b["accuracy"],
-        "transformers_correct": a["correct"],
-        "native_correct": b["correct"],
+        "reference_accuracy_pct": 100 * a["accuracy"],
+        "candidate_accuracy_pct": 100 * b["accuracy"],
+        "reference_correct": a["correct"],
+        "candidate_correct": b["correct"],
         "delta_pp": delta,
         "paired_delta_stderr_pp": 100 * statistics.stdev(differences) / len(pairs) ** 0.5
         if len(pairs) > 1
         else None,
-        "reference_correct_native_wrong": sum(d == -1 for d in differences),
-        "reference_wrong_native_correct": sum(d == 1 for d in differences),
+        "reference_correct_candidate_wrong": sum(d == -1 for d in differences),
+        "reference_wrong_candidate_correct": sum(d == 1 for d in differences),
         "answer_disagreements": [x["id"] for x, y in pairs if x["answer"] != y["answer"]],
         "max_regression_pp": a["max_regression_pp"],
         "passes_observed_accuracy_gate": (
@@ -482,6 +482,16 @@ def compare(args):
         ),
         "min_reference_accuracy_pct": a["min_reference_accuracy_pct"],
     }
+    if (a["backend"], b["backend"]) == ("transformers", "native"):
+        # Earlier key names, kept only for the original pairing where they are accurate.
+        result.update(
+            transformers_accuracy_pct=result["reference_accuracy_pct"],
+            native_accuracy_pct=result["candidate_accuracy_pct"],
+            transformers_correct=result["reference_correct"],
+            native_correct=result["candidate_correct"],
+            reference_correct_native_wrong=result["reference_correct_candidate_wrong"],
+            reference_wrong_native_correct=result["reference_wrong_candidate_correct"],
+        )
     write_json(args.output, result)
     print(json.dumps(result, indent=2))
     return result
