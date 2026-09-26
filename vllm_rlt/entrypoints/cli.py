@@ -29,8 +29,8 @@ def main():
     )
     parser.add_argument("--mode", choices=["refill", "no_refill"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--max-loops", type=int, default=4)
-    parser.add_argument("--min-loops", type=int, default=2)
+    parser.add_argument("--max-loops", type=int, default=None)
+    parser.add_argument("--min-loops", type=int, default=None)
     parser.add_argument("--exit-threshold", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=-1)
@@ -47,11 +47,19 @@ def main():
     if not args.toy and not args.prompt:
         parser.error("provide --prompt or use --toy for a CPU smoke test")
     torch.manual_seed(args.seed)
-    model = (
-        OuroForCausalLM(OuroConfig.tiny()).to(device=args.device, dtype=getattr(torch, args.dtype))
-        if args.toy
-        else args.model
-    )
+    if args.toy:
+        if "nanbeige" in args.model.lower():
+            from vllm_rlt.models import NanbeigeConfig, NanbeigeForCausalLM
+
+            model = NanbeigeForCausalLM(NanbeigeConfig.tiny()).to(
+                device=args.device, dtype=getattr(torch, args.dtype)
+            )
+        else:
+            model = OuroForCausalLM(OuroConfig.tiny()).to(
+                device=args.device, dtype=getattr(torch, args.dtype)
+            )
+    else:
+        model = args.model
     llm = LLM(
         model,
         revision=args.revision,
@@ -72,10 +80,12 @@ def main():
         ),
         attention_backend=args.attention_backend,
     )
+    model_depth = llm.engine.model.config.total_ut_steps
+    min_loops = args.min_loops if args.min_loops is not None else min(2, model_depth)
     params = SamplingParams(
         max_tokens=args.max_tokens,
         max_loops=args.max_loops,
-        min_loops=args.min_loops,
+        min_loops=min_loops,
         exit_threshold=args.exit_threshold,
         temperature=args.temperature,
         top_k=args.top_k,
