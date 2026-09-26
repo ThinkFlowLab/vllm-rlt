@@ -111,6 +111,46 @@ revision, split, seed and source row ID, independent of answers. In particular,
 `--limit 87` samples a different set from the fixed default case. Custom protocols
 do not reuse the stored 59/87 baseline: run HF and native, then use `compare`.
 
+## Adaptive-exit runs
+
+The default recipe runs all four loops for every token. `run` also accepts an
+adaptive exit policy, so accuracy can be measured under the same protocol:
+
+```bash
+python -m benchmarks.gsm8k run --backend native \
+  --protocol /path/to/gsm8k-87-protocol.json --output /path/to/native-ouro-t05 \
+  --exit-mode ouro --exit-threshold 0.5 --min-loops 1
+```
+
+- `--exit-threshold` is the cumulative exit probability. `1` (the default) keeps
+  the fixed four-loop recipe, and the loop/mode options are rejected with it.
+- Below 1, `--min-loops` is required. `--exit-mode ouro_delayed` selects the delayed
+  gate, and `--async-scheduling` (native only) requires it.
+- The Transformers release accepts `--exit-mode ouro --min-loops 1` only: it has no
+  minimum loop count or delayed mode. It runs every loop and selects the exited
+  loop's hidden state, so its KV stays full-depth, while native execution skips the
+  remaining loops and uses the configured KV layout. The release would also apply the
+  threshold to the prefill forward; the harness forces that call to full depth, as
+  native prefill always is, so the first output token is chosen the same way.
+- The release computes the exit rule in BF16 and compares it with the threshold
+  rounded to BF16 (0.2 becomes 0.2002); native uses FP32 gate scores. Comparisons of
+  the two backends therefore include exit-arithmetic and kernel differences, not only
+  the KV layout.
+
+Metadata and summaries record the exit settings. Adaptive summaries add `depth`: decode
+token count, mean decode depth, a depth histogram and mean decode loops per
+question. For the Transformers release these are the selected exit loops, recorded
+with its own rule; it still computes all four loops for every token. The first output
+token comes from full-depth prefill and is excluded from these statistics. The stored
+GSM8K-87 baseline describes fixed-depth generation, so adaptive native runs report no
+`baseline_comparison` and no gate.
+
+`compare --reference A --candidate B` (aliases of `--transformers`/`--native`)
+accepts any pair of backends from the same protocol and reports each side's backend,
+exit settings and depth summary alongside the paired accuracy result. Result keys use
+`reference_*`/`candidate_*`; the earlier `transformers_*`/`native_*` keys are also
+written only when the reference is the Transformers release and the candidate is native.
+
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not
 pin the exact harness revision, demonstrations or token limits, so the settings

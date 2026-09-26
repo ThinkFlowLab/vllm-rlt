@@ -14,6 +14,14 @@ MODEL_REVISION = "574fa66cb8bf5abdc979642d01cf2b79b16bfab1"
 DATA_REVISION = "740312add88f781978c0658806c59bc2815b9866"
 PACKAGES = ("torch", "transformers", "lm-eval", "datasets", "tokenizers", "triton")
 DEFAULT_CASE = Path(__file__).parent / "fixtures/gsm8k-87.json"
+# The original recipe: every output token uses all four loops.
+FIXED_EXIT = {
+    "mode": "ouro",
+    "threshold": 1.0,
+    "min_loops": 4,
+    "max_loops": 4,
+    "async_scheduling": False,
+}
 
 
 def digest(value):
@@ -238,6 +246,49 @@ def prepare(args):
     )
 
 
+def exit_settings(backend, mode="ouro", threshold=1.0, min_loops=None, async_scheduling=False):
+    """Validate one run's exit policy; the default reproduces the fixed-depth recipe."""
+    if not 0 <= threshold <= 1:
+        raise ValueError("--exit-threshold must be in [0, 1]")
+    if threshold == 1:
+        if (mode, min_loops, async_scheduling) != ("ouro", None, False):
+            raise ValueError("Exit options require --exit-threshold below 1")
+        return dict(FIXED_EXIT)
+    if min_loops is None or not 1 <= min_loops <= 4:
+        raise ValueError("Adaptive exit requires an explicit --min-loops between 1 and 4")
+    if async_scheduling and mode != "ouro_delayed":
+        raise ValueError("--async-scheduling requires --exit-mode ouro_delayed")
+    if backend == "transformers" and (mode, min_loops) != ("ouro", 1):
+        # The release applies its threshold from the first loop and has no delayed mode.
+        raise ValueError("Transformers adaptive exit supports only --exit-mode ouro --min-loops 1")
+    return {
+        "mode": mode,
+        "threshold": threshold,
+        "min_loops": min_loops,
+        "max_loops": 4,
+        "async_scheduling": async_scheduling,
+    }
+
+
+def depth_summary(rows):
+    """Summarize native exit depths; the first output token is produced by prefill."""
+    if any("exit_depths" not in row for row in rows):
+        return None
+    decode = [row["exit_depths"][1:] for row in rows]
+    tokens = sum(len(depths) for depths in decode)
+    loops = [sum(depths) for depths in decode]
+    histogram = {}
+    for depths in decode:
+        for depth in depths:
+            histogram[str(depth)] = histogram.get(str(depth), 0) + 1
+    return {
+        "decode_tokens": tokens,
+        "mean_decode_depth": sum(loops) / tokens if tokens else None,
+        "decode_depth_histogram": dict(sorted(histogram.items())),
+        "decode_loops_per_question_mean": statistics.mean(loops),
+    }
+
+
 def score(task, row, text):
     from lm_eval.api.instance import Instance
 
@@ -311,12 +362,15 @@ def run(args):
         "expected_examples": len(protocol["records"]),
         "max_regression_pp": protocol["max_regression_pp"],
         "min_reference_accuracy_pct": protocol["min_reference_accuracy_pct"],
+        "exit": args.exit,
     }
     write_json(output / "metadata.json", metadata)
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"])
+    generator = Generator(
+        args.backend, str(model), tokenizer, protocol["max_length"], exit_policy=args.exit
+    )
     load_seconds = time.monotonic() - start
     rows = []
     with (output / "samples.jsonl").open("x", buffering=1) as stream:
@@ -345,11 +399,14 @@ def run(args):
         "correct": sum(r["correct"] for r in rows),
         "unparseable": sum(r["unparseable"] for r in rows),
         "length_limited": sum(r["finish_reason"] == "length" for r in rows),
+        "generated_tokens_per_question_mean": statistics.mean(len(r["token_ids"]) for r in rows),
+        "depth": depth_summary(rows),
         "load_seconds": load_seconds,
         "generation_and_scoring_seconds": sum(r["seconds"] for r in rows),
         "samples_sha256": file_digest(output / "samples.jsonl"),
     }
-    if args.backend == "native" and "baseline" in protocol:
+    # The stored baseline describes fixed-depth generation only.
+    if args.backend == "native" and "baseline" in protocol and args.exit == FIXED_EXIT:
         summary["baseline_comparison"] = baseline_result(protocol, rows)
     write_json(output / "summary.json", summary)
     print(json.dumps(summary, indent=2))
@@ -360,8 +417,8 @@ def compare(args):
     paths = [Path(args.transformers), Path(args.native)]
     summaries = [json.loads((p / "summary.json").read_text()) for p in paths]
     a, b = summaries
-    if (a["backend"], b["backend"]) != ("transformers", "native"):
-        raise ValueError("Expected Transformers reference and native candidate")
+    if {a["backend"], b["backend"]} - {"transformers", "native"}:
+        raise ValueError("Unknown backend")
     for key in (
         "protocol_sha256",
         "expected_examples",
@@ -393,16 +450,27 @@ def compare(args):
     result = {
         "examples": a["examples"],
         "split": a["split"],
-        "transformers_accuracy_pct": 100 * a["accuracy"],
-        "native_accuracy_pct": 100 * b["accuracy"],
-        "transformers_correct": a["correct"],
-        "native_correct": b["correct"],
+        # Summaries written before exit options existed used the fixed recipe.
+        "reference": {
+            "backend": a["backend"],
+            "exit": a.get("exit", FIXED_EXIT),
+            "depth": a.get("depth"),
+        },
+        "candidate": {
+            "backend": b["backend"],
+            "exit": b.get("exit", FIXED_EXIT),
+            "depth": b.get("depth"),
+        },
+        "reference_accuracy_pct": 100 * a["accuracy"],
+        "candidate_accuracy_pct": 100 * b["accuracy"],
+        "reference_correct": a["correct"],
+        "candidate_correct": b["correct"],
         "delta_pp": delta,
         "paired_delta_stderr_pp": 100 * statistics.stdev(differences) / len(pairs) ** 0.5
         if len(pairs) > 1
         else None,
-        "reference_correct_native_wrong": sum(d == -1 for d in differences),
-        "reference_wrong_native_correct": sum(d == 1 for d in differences),
+        "reference_correct_candidate_wrong": sum(d == -1 for d in differences),
+        "reference_wrong_candidate_correct": sum(d == 1 for d in differences),
         "answer_disagreements": [x["id"] for x, y in pairs if x["answer"] != y["answer"]],
         "max_regression_pp": a["max_regression_pp"],
         "passes_observed_accuracy_gate": (
@@ -414,6 +482,16 @@ def compare(args):
         ),
         "min_reference_accuracy_pct": a["min_reference_accuracy_pct"],
     }
+    if (a["backend"], b["backend"]) == ("transformers", "native"):
+        # Earlier key names, kept only for the original pairing where they are accurate.
+        result.update(
+            transformers_accuracy_pct=result["reference_accuracy_pct"],
+            native_accuracy_pct=result["candidate_accuracy_pct"],
+            transformers_correct=result["reference_correct"],
+            native_correct=result["candidate_correct"],
+            reference_correct_native_wrong=result["reference_correct_candidate_wrong"],
+            reference_wrong_native_correct=result["reference_wrong_candidate_correct"],
+        )
     write_json(args.output, result)
     print(json.dumps(result, indent=2))
     return result
@@ -448,11 +526,28 @@ def main():
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
+    p.add_argument(
+        "--exit-threshold",
+        type=float,
+        default=1.0,
+        help="Cumulative exit probability; 1 keeps the fixed four-loop recipe",
+    )
+    p.add_argument("--min-loops", type=int, help="Required when --exit-threshold is below 1")
+    p.add_argument("--async-scheduling", action="store_true", help="Native ouro_delayed only")
     p = commands.add_parser("compare")
-    p.add_argument("--transformers", required=True)
-    p.add_argument("--native", required=True)
+    p.add_argument("--transformers", "--reference", dest="transformers", required=True)
+    p.add_argument("--native", "--candidate", dest="native", required=True)
     p.add_argument("--output", required=True)
     args = parser.parse_args()
+    if args.command == "run":
+        args.exit = exit_settings(
+            args.backend,
+            args.exit_mode,
+            args.exit_threshold,
+            args.min_loops,
+            args.async_scheduling,
+        )
     result = {"prepare": prepare, "run": run, "compare": compare}[args.command](args)
     if args.command == "compare" and not result["passes_observed_accuracy_gate"]:
         raise SystemExit(1)
