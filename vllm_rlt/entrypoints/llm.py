@@ -3,7 +3,7 @@ from dataclasses import replace
 import torch
 
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models.ouro import OuroForCausalLM
+from vllm_rlt.models import AutoModelForCausalLM
 from vllm_rlt.sampling_params import SamplingParams
 
 
@@ -28,7 +28,7 @@ class LLM:
         self._tokenizer_source = None
         if isinstance(model, str):
             model_name = model
-            model = OuroForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 model_name, revision=revision, device=device, dtype=dtype
             )
             if tokenizer is None:

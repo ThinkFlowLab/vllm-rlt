@@ -10,8 +10,8 @@ import torch
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.entrypoints.runtime_args import add_runtime_args, runtime_configs
+from vllm_rlt.models import AutoModelForCausalLM
 from vllm_rlt.models.config import OURO_MODEL_ID, OURO_REVISION
-from vllm_rlt.models.ouro import OuroForCausalLM
 
 
 def load_engine(args):
@@ -27,7 +27,7 @@ def load_engine(args):
     decoder = tokenizer.backend_tokenizer.decoder
     if not isinstance(decoder, ByteLevel):
         raise ValueError("serving requires the Ouro byte-level tokenizer")
-    model = OuroForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.model, revision=revision, device=args.device, dtype=getattr(torch, args.dtype)
     )
     engine = LLMEngine(
