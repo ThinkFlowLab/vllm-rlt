@@ -157,9 +157,21 @@ along with the existing fixed-depth, last-exited KV and refill restrictions.
 If spare KV blocks are unavailable, the round continues on the primary path.
 
 This is experimental: branch rows add computation and occupy extra KV blocks.
-BF16 greedy sequences can differ from the plain runner; FP32 tests do not
-establish real-model BF16 losslessness. FA4 and real-model natural-EOS or
-online-serving performance have not been validated for this path.
+BF16 greedy sequences can differ from the plain runner; FP32 checks do not
+establish BF16 losslessness. On Ouro-1.4B with Triton, bounded checks cover
+natural EOS, later request admission, cancellation, and cache cleanup.
+FA4 and online-serving performance remain unvalidated for this path.
+
+To run the branch and baseline regression tests on a CUDA device with Triton:
+
+```bash
+pytest -q tests/test_branch_speculative.py tests/test_speculative.py \
+    --run-gpu -k "not flash_attn_4"
+```
+
+These include fixed-input FP32/BF16 branch comparisons against a serial
+reference, alongside the CPU lifecycle tests. FA4 cases are excluded by the
+command above.
 
 
 ## Performance Baselines
