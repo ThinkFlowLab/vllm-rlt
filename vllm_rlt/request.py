@@ -33,6 +33,7 @@ class Request:
     exit_depths: list[int] = field(default_factory=list)
     # Scheduling advances before coda's CPU output delivery.
     num_output_placeholders: int = 0
+    num_speculative_rounds: int = 0
     input_token_tensor: torch.Tensor | None = field(default=None, repr=False)
     num_prefilled_tokens: int = 0
     # Host progress; in async mode an event confirms submitted GPU work is done.

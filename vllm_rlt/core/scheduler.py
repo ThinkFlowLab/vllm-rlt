@@ -92,6 +92,7 @@ class Scheduler:
         request.hidden_state = None
         request.input_token_tensor = None
         request.num_output_placeholders = 0
+        request.num_speculative_rounds = 0
         request.generator = None
         self.requests.pop(request.request_id)
 
@@ -301,7 +302,7 @@ class Scheduler:
         if stage == Stage.SPECULATIVE:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
-            remaining = request.sampling_params.max_tokens - len(request.generated_token_ids)
+            remaining = request.sampling_params.max_tokens - request.num_scheduled_outputs
             count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
             return ScheduledItem(request, request.position, count)
         return ScheduledItem(request)
@@ -335,6 +336,12 @@ class Scheduler:
         while queue and token_budget and len(items) < self.config.max_num_seqs and remaining:
             remaining -= 1
             request = self.requests[queue.popleft()]
+            if stage == Stage.SPECULATIVE and (
+                request.num_speculative_rounds >= 2
+                or request.num_scheduled_outputs >= request.sampling_params.max_tokens
+            ):
+                queue.append(request.request_id)
+                continue
             item = self._make_scheduled_item(request, stage, token_budget)
             if stage in (Stage.PREFILL, Stage.PRELUDE, Stage.RECURRENT, Stage.SPECULATIVE):
                 frontier = (

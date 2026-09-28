@@ -711,12 +711,16 @@ def test_http_trace_selection_and_concurrent_reuse(asynchronous):
     asyncio.run(run())
 
 
-def test_speculative_http_and_stream_deliver_entire_committed_suffix():
-    from vllm_rlt import SpeculativeConfig
+@pytest.mark.parametrize("asynchronous", [False, pytest.param(True, marks=pytest.mark.gpu)])
+def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronous):
+    from vllm_rlt import ExecutionConfig, SpeculativeConfig
 
     def load():
         torch.manual_seed(123)
-        m = OuroForCausalLM(OuroConfig.tiny())
+        m = OuroForCausalLM(OuroConfig.tiny()).to(
+            device="cuda" if asynchronous else "cpu",
+            dtype=torch.bfloat16 if asynchronous else torch.float32,
+        )
 
         # Force full acceptance of a printable token so this test exercises
         # multi-token chunks regardless of random tiny-model draft quality.
@@ -726,7 +730,13 @@ def test_speculative_http_and_stream_deliver_entire_committed_suffix():
             return logits
 
         m.coda = coda
-        return LLMEngine(m, speculative_config=SpeculativeConfig(4)), TinyTokenizer()
+        return LLMEngine(
+            m,
+            speculative_config=SpeculativeConfig(4),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous),
+            attention_backend="triton" if asynchronous else "torch",
+            cache_config=CacheConfig(128, 2),
+        ), TinyTokenizer()
 
     direct, tokenizer = load()
     direct.add_request("r", tokenizer.encode("abc"), SamplingParams(max_tokens=12, ignore_eos=True))

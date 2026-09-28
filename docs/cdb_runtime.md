@@ -95,8 +95,10 @@ per round; K=4 here is an example, not a universal optimum. Draft depth defaults
 to 2 and must be below target depth. Target depth must equal the full model depth
 (4 for Ouro-1.4B). K shrinks to fit the token budget and remaining output length.
 
-Requires `last_exited`, fixed-depth `ouro` exits, synchronous eager execution,
-and refill scheduling. Async, CUDA Graphs, preemption, no-refill, and PD are not
+Requires `last_exited`, fixed-depth `ouro` exits, eager execution,
+and refill scheduling. Cross-round async greedy decoding is available with CUDA
+and Triton; see [async self-speculation](async-speculative.md). CUDA Graphs,
+preemption, no-refill, and PD are not
 supported. Greedy and temperature/top-k/top-p sampling are supported; sampling
 preserves the target distribution in exact arithmetic, not identical text for
 the same seed. BF16 batch shapes can introduce numerical differences.
