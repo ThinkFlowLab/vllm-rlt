@@ -19,10 +19,13 @@ an environment to receiving the first generated response. The
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
+| [Nanbeige CUDA Graph recipe](recipes/nanbeige-cuda-graphs.md) | Pinned checkpoint, RTX 5080 correctness checks, and repeated measurements |
 
 ## Support and Runtime Notes
 
-Current model support is limited to Ouro-1.4B. CPU execution provides a Torch
+Ouro-1.4B is the qualified model. Nanbeige4.2 has an experimental native model
+and RTX 5080 CUDA Graph validation; see the README support table. Huginn-0125
+still needs native model integration. CPU execution provides a Torch
 reference backend. FlashAttention hardware validation is currently documented
 for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
 serving currently targets multiple GPUs on a single host.

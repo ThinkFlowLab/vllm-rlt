@@ -24,7 +24,8 @@
 ## About
 
 **vllm-rlt** is a standalone inference and serving engine for recurrent language
-models, currently supporting **ByteDance/Ouro-1.4B**. It brings continuous
+models, with qualified **ByteDance/Ouro-1.4B** support and an experimental native
+**Nanbeige/Nanbeige4.2-3B** integration. It brings continuous
 batching to individual recurrent loops, allowing requests at different loop
 depths to share a batch as they work toward their next token.
 
@@ -64,6 +65,12 @@ vLLM to be installed. See [Citation](#citation) for the paper's BibTeX entry.
 The default runtime uses synchronous execution and the original Ouro gate.
 Advanced execution and cache features are opt-in; see the guides below for
 supported combinations.
+
+| Architecture | Native model | Recurrent CUDA Graph | Validation scope |
+| --- | --- | --- | --- |
+| Ouro | Yes | Yes | See the Ouro performance baselines below. |
+| Nanbeige4.2 | Experimental | Yes | Fixed two-loop BF16/Triton on RTX 5080; [recipe](docs/recipes/nanbeige-cuda-graphs.md). |
+| Huginn-0125 | Not yet integrated | Not yet integrated | Native model and KV semantics are prerequisites. |
 
 ## How It Works
 

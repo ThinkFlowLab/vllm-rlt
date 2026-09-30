@@ -3,10 +3,10 @@
 import pytest
 import torch
 
-from tests.helpers import tiny_ouro_config
+from tests.helpers import tiny_nanbeige_config, tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroForCausalLM
+from vllm_rlt.models import NanbeigeForCausalLM, OuroForCausalLM
 
 
 def test_cuda_graph_validation():
@@ -101,3 +101,48 @@ def test_graph_cache_limit_fallback_and_abort():
         assert engine.cache_manager.num_used_blocks == 0
     assert engine.model_runner.graphs.captures == 1
     assert engine.model_runner.graphs.fallbacks > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_nanbeige_graph_replay_matches_eager_with_request_reuse(async_scheduling):
+    torch.manual_seed(321)
+    model = NanbeigeForCausalLM(
+        tiny_nanbeige_config(head_dim=64, hidden_size=256, intermediate_size=512)
+    ).to("cuda", torch.bfloat16)
+    results = []
+    for graphs in (False, True):
+        engine = LLMEngine(
+            model,
+            cache_config=CacheConfig(num_blocks=64, block_size=16, layout="last_exited"),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4, max_num_batched_tokens=16, prefill_chunk_size=4
+            ),
+            execution_config=ExecutionConfig(
+                async_scheduling=async_scheduling,
+                multi_stream=async_scheduling,
+                cuda_graphs=graphs,
+            ),
+            exit_config=ExitConfig("ouro_delayed"),
+            attention_backend="triton",
+        )
+        rounds = []
+        for reuse in range(2):
+            for index in range(4):
+                engine.add_request(
+                    str(index),
+                    [2 + index, 3, 4] * (1 + index % 2 + reuse),
+                    SamplingParams(max_tokens=4 + index, min_loops=2, ignore_eos=True),
+                )
+            finished = {}
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        finished[output.request_id] = (output.token_ids, output.exit_depths)
+            assert engine.cache_manager.num_used_blocks == 0
+            rounds.append(finished)
+        if graphs:
+            assert engine.model_runner.graphs.captures > 0
+            assert engine.model_runner.graphs.replays > engine.model_runner.graphs.captures
+        results.append(rounds)
+    assert results[0] == results[1]
