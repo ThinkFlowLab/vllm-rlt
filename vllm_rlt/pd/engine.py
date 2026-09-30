@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
-from vllm_rlt.models import OuroConfig, resolve_model_config
+from vllm_rlt.models import resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
@@ -149,8 +149,14 @@ class PDEngine:
             fingerprints = {p.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
+            # Store model-agnostic config fields needed for validation and scheduling
+            model_info = next(iter(self.peers.values())).info["model"]
             self.model = SimpleNamespace(
-                config=OuroConfig(**next(iter(self.peers.values())).info["model"])
+                config=SimpleNamespace(
+                    vocab_size=model_info["vocab_size"],
+                    total_ut_steps=model_info["total_ut_steps"],
+                    max_position_embeddings=model_info["max_position_embeddings"],
+                )
             )
             for peer in self.peers.values():
                 self._send(
