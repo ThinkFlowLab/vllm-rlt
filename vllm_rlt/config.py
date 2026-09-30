@@ -58,6 +58,7 @@ class SchedulerConfig:
     max_prefill_batches_before_decode: int = 1
     policy: str = "fcfs"
     enable_preemption: bool = False
+    wavefront_prefill: bool = False
 
     def __post_init__(self):
         for name in (
@@ -70,8 +71,9 @@ class SchedulerConfig:
             "max_prefill_batches_before_decode",
         ):
             _positive(name, getattr(self, name))
-        if type(self.enable_preemption) is not bool:
-            raise ValueError("enable_preemption must be a boolean")
+        for name in ("enable_preemption", "wavefront_prefill"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
         if self.policy not in ("fcfs", "priority"):
             raise ValueError("policy must be fcfs or priority")
         if self.mode not in ("refill", "no_refill"):

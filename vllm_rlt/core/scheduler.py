@@ -9,12 +9,24 @@ from vllm_rlt.core.scheduling_policy import NoRefillPolicy, RefillPolicy, Specul
 from vllm_rlt.request import FinishReason, Request, Stage
 
 
+@dataclass
+class PrefillTask:
+    task_id: int
+    request: Request
+    token_start: int
+    token_count: int
+    depth: int
+    hidden_state: object = None
+    event: object = None
+
+
 @dataclass(frozen=True)
 class ScheduledItem:
     request: Request
     # PREFILL and SPECULATIVE use a contiguous span; ordinary decode uses one row.
     token_start: int = 0
     token_count: int = 1
+    prefill_task: PrefillTask | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +76,9 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
         self.queues: dict[Stage, deque[str]] = {s: deque() for s in Stage}
         self.selected_request_ids: set[str] = set()
+        self.prefill_tasks: dict[int, PrefillTask] = {}
+        self.prefill_ready: deque[int] = deque()
+        self._next_prefill_task_id = 0
         # Bound by Engine when preemption is enabled. These callbacks can copy
         # device state and mutate queues; they are operations, not predicates.
         self.preempt_callback = None
@@ -79,13 +94,129 @@ class Scheduler:
 
     def enqueue(self, request: Request, stage: Stage):
         request.stage = stage
+        if stage == Stage.PREFILL and self.config.wavefront_prefill:
+            if request.request_id not in self.queues[Stage.PREFILL]:
+                self.queues[Stage.PREFILL].append(request.request_id)
+            if not any(
+                task.request.request_id == request.request_id
+                for task in self.prefill_tasks.values()
+            ):
+                self._enqueue_prefill_task(
+                    request,
+                    request.num_prefilled_tokens,
+                    min(
+                        self.config.prefill_chunk_size,
+                        self.config.max_num_batched_tokens,
+                        len(request.prompt_token_ids) - request.num_prefilled_tokens,
+                    ),
+                    0,
+                )
+            return
         self.queues[stage].append(request.request_id)
+
+    def _enqueue_prefill_task(
+        self, request: Request, token_start: int, token_count: int, depth: int, hidden_state=None
+    ) -> PrefillTask:
+        if token_count <= 0:
+            raise ValueError("prefill task must contain at least one token")
+        task = PrefillTask(
+            self._next_prefill_task_id,
+            request,
+            token_start,
+            token_count,
+            depth,
+            hidden_state,
+        )
+        self._next_prefill_task_id += 1
+        self.prefill_tasks[task.task_id] = task
+        self.prefill_ready.append(task.task_id)
+        if request.request_id not in self.queues[Stage.PREFILL]:
+            self.queues[Stage.PREFILL].append(request.request_id)
+        return task
+
+    def _remove_prefill_request(self, request_id: str) -> None:
+        queue = self.queues[Stage.PREFILL]
+        while request_id in queue:
+            queue.remove(request_id)
+
+    def _prefill_task_ready(self, task: PrefillTask) -> bool:
+        """Check hidden-state and same-depth causal-prefix readiness."""
+        if task.hidden_state is None and task.depth:
+            return False
+        allocation = self.cache_manager._get_allocation(task.request.request_id)
+        plane = self.cache_manager._plane(task.depth)
+        return all(
+            allocation.written[plane][layer].prefix >= task.token_start
+            for layer in range(self.cache_manager.num_layers)
+        )
+
+    def _clear_prefill_tasks(self, request_id: str) -> None:
+        removed = {
+            task_id
+            for task_id, task in self.prefill_tasks.items()
+            if task.request.request_id == request_id
+        }
+        for task_id in removed:
+            self.prefill_tasks.pop(task_id, None)
+        if removed:
+            self.prefill_ready = deque(
+                task_id for task_id in self.prefill_ready if task_id not in removed
+            )
+
+    def advance_prefill_task(self, task: PrefillTask) -> bool:
+        """Retire one depth task and enqueue its dependency successors.
+
+        Returns whether the request's entire prompt has reached the final depth.
+        The next chunk at depth zero can run as soon as the current chunk's depth
+        zero completes; deeper tasks retain the previous depth's hidden state.
+        """
+        current = self.prefill_tasks.pop(task.task_id, None)
+        if current is not task:
+            raise RuntimeError("stale prefill task completion")
+        request = task.request
+        if task.depth + 1 < self.cache_manager.max_loops:
+            self._enqueue_prefill_task(
+                request,
+                task.token_start,
+                task.token_count,
+                task.depth + 1,
+                task.hidden_state,
+            )
+        if task.depth == 0:
+            next_start = task.token_start + task.token_count
+            if next_start < len(request.prompt_token_ids):
+                self._enqueue_prefill_task(
+                    request,
+                    next_start,
+                    min(
+                        self.config.prefill_chunk_size,
+                        self.config.max_num_batched_tokens,
+                        len(request.prompt_token_ids) - next_start,
+                    ),
+                    0,
+                )
+        if task.depth != self.cache_manager.max_loops - 1:
+            return False
+        request.prefill_completed_chunks[task.token_start] = (
+            task.token_start + task.token_count
+        )
+        while request.num_prefilled_tokens in request.prefill_completed_chunks:
+            request.num_prefilled_tokens = request.prefill_completed_chunks.pop(
+                request.num_prefilled_tokens
+            )
+        if request.num_prefilled_tokens == len(request.prompt_token_ids):
+            self._remove_prefill_request(request.request_id)
+            return True
+        return False
 
     def finish(self, request: Request, reason: FinishReason):
         # A delayed EOS can stop a request already queued for its next stage.
         for queue in self.queues.values():
             while request.request_id in queue:
                 queue.remove(request.request_id)
+        if self.config.wavefront_prefill:
+            self._clear_prefill_tasks(request.request_id)
+            self._remove_prefill_request(request.request_id)
         self.cache_manager.free(request.request_id)
         request.stage = Stage.FINISHED
         request.finish_reason = reason
@@ -230,7 +361,20 @@ class Scheduler:
         ):
             return False
         request.num_prefilled_tokens = plan.cached_tokens
-        self.enqueue(request, Stage.PREFILL)
+        if self.config.wavefront_prefill:
+            self._enqueue_prefill_task(
+                request,
+                plan.cached_tokens,
+                min(
+                    self.config.prefill_chunk_size,
+                    self.config.max_num_batched_tokens,
+                    len(request.prompt_token_ids) - plan.cached_tokens,
+                ),
+                0,
+            )
+            request.stage = Stage.PREFILL
+        else:
+            self.enqueue(request, Stage.PREFILL)
         return True
 
     def _admit(self):
@@ -285,13 +429,22 @@ class Scheduler:
         waiting.extendleft(reversed(deferred))
 
     def _make_scheduled_item(
-        self, request: Request, stage: Stage, token_budget: int
+        self, request: Request, stage: Stage, token_budget: int, task: PrefillTask | None = None
     ) -> ScheduledItem:
         """Bound one request's work without advancing its completed progress.
 
         Prompt length 10, prefilled 4, chunk 4, budget 6 -> range [4, 8).
         Decode stages contribute one position; its loop may differ by request.
         """
+        if stage == Stage.PREFILL and task is not None:
+            if task.token_count > token_budget:
+                raise ValueError("prefill task exceeds the available token budget")
+            return ScheduledItem(
+                request,
+                task.token_start,
+                task.token_count,
+                task,
+            )
         if stage == Stage.PREFILL:
             start = request.num_prefilled_tokens
             count = min(
@@ -330,12 +483,43 @@ class Scheduler:
         """
         token_budget = self.config.max_num_batched_tokens
         items = []
-        queue = self.queues[stage]
+        if stage == Stage.PREFILL and self.config.wavefront_prefill:
+            for request_id in tuple(self.queues[Stage.PREFILL]):
+                if not any(
+                    task.request.request_id == request_id for task in self.prefill_tasks.values()
+                ):
+                    request = self.requests[request_id]
+                    if request.num_prefilled_tokens < len(request.prompt_token_ids):
+                        self._enqueue_prefill_task(
+                            request,
+                            request.num_prefilled_tokens,
+                            min(
+                                self.config.prefill_chunk_size,
+                                self.config.max_num_batched_tokens,
+                                len(request.prompt_token_ids) - request.num_prefilled_tokens,
+                            ),
+                            0,
+                        )
+            queue = self.prefill_ready
+        else:
+            queue = self.queues[stage]
         remaining = len(queue)
         while queue and token_budget and len(items) < self.config.max_num_seqs and remaining:
             remaining -= 1
-            request = self.requests[queue.popleft()]
-            item = self._make_scheduled_item(request, stage, token_budget)
+            entry = queue.popleft()
+            task = (
+                self.prefill_tasks[entry]
+                if stage == Stage.PREFILL and self.config.wavefront_prefill
+                else None
+            )
+            request = task.request if task is not None else self.requests[entry]
+            if task is not None and not self._prefill_task_ready(task):
+                queue.append(entry)
+                continue
+            if task is not None and task.token_count > token_budget:
+                queue.append(entry)
+                continue
+            item = self._make_scheduled_item(request, stage, token_budget, task)
             if stage in (Stage.PREFILL, Stage.PRELUDE, Stage.RECURRENT, Stage.SPECULATIVE):
                 frontier = (
                     item.token_start + item.token_count
@@ -343,7 +527,7 @@ class Scheduler:
                     else request.position + 1
                 )
                 if not self._ensure_execution_capacity(request, frontier):
-                    queue.append(request.request_id)
+                    queue.append(entry)
                     continue
             # Selecting A must prevent B's later capacity check from evicting A.
             self.selected_request_ids.add(request.request_id)
