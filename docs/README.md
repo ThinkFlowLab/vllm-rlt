@@ -22,10 +22,23 @@ an environment to receiving the first generated response. The
 
 ## Support and Runtime Notes
 
-Current model support is limited to Ouro-1.4B. CPU execution provides a Torch
-reference backend. FlashAttention hardware validation is currently documented
+Current model support includes:
+- **Ouro-1.4B/2.6B**: Full feature support including adaptive exit, PD, and speculative decoding
+- **Nanbeige4.2-3B**: Basic implementation with fixed 2-loop execution; PD support available (1P1D configuration)
+
+CPU execution provides a Torch reference backend. FlashAttention hardware validation is currently documented
 for FA4 on B300; FA2/FA3 require validation on their target devices. Disaggregated
 serving currently targets multiple GPUs on a single host.
+
+### Nanbeige4.2 PD Configuration
+
+Nanbeige4.2 supports Prefill/Decode disaggregation with the following configuration:
+- **Workers**: 1 Prefill + 1 Decode worker (1P1D)
+- **Loop semantics**: Fixed 2-loop execution (total_ut_steps=2)
+- **Requirements**: 2 GPUs with NIXL transport support
+- **Limitations**: Multi-worker configurations not yet supported; adaptive exit not available in PD mode
+
+Test validation: `pytest tests/test_pd.py::test_pd_nanbeige_1p1d_matches_single_engine -v` (requires GPU+NIXL)
 
 `ouro_delayed` reuses the trained Ouro gate with a one-loop delay; it changes
 the exit policy. The `random_lookahead` mode uses an untrained head for runtime

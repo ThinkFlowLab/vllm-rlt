@@ -339,4 +339,85 @@ def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cach
     )
     if d_cache:
         assert p["bytes_sent"] < full_bytes
-    assert all(x["used_blocks"] == 0 for x in stats)
+
+
+@pytest.mark.gpu
+def test_pd_nanbeige_1p1d_matches_single_engine():
+    """Verify Nanbeige4.2 fixed 2-loop execution in 1P1D PD configuration."""
+    pytest.importorskip("nixl")
+    from tests.helpers import tiny_nanbeige_config
+    from vllm_rlt.models import NanbeigeForCausalLM
+    from vllm_rlt.pd.engine import PDEngine
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 visible GPUs")
+    
+    config = tiny_nanbeige_config(head_dim=16)
+    params = SamplingParams(max_tokens=4, temperature=0.0)  # greedy
+    
+    # Nanbeige fixed 2-loop: prefill uses depth=2, decode also uses depth=2
+    # Trace needs: [prefill_depth, decode_token1, decode_token2, ...]
+    trace_depths = [2] * (1 + params.max_tokens)  # 1 prefill + max_tokens decode
+    
+    # Create PD engine with Nanbeige
+    pd_engine = PDEngine(
+        config,
+        pd_config=PDConfig(
+            prefill_devices=(0,),
+            decode_devices=(1,),
+            transfer_chunk_bytes=4096,
+            max_inflight_bytes=16384,
+            request_timeout=90,
+            startup_timeout=90,
+        ),
+        prefill_cache_config=CacheConfig(64, 4, "last_exited"),
+        decode_cache_config=CacheConfig(64, 4, "last_exited"),
+        prefill_scheduler_config=SchedulerConfig(
+            max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=8
+        ),
+        decode_scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=2),
+        exit_config=ExitConfig("trace", depths_by_request={"pd_0": trace_depths, "pd_1": trace_depths}),
+        execution_config=ExecutionConfig(async_scheduling=True),
+        attention_backend="triton",
+        seed=42,
+    )
+    
+    # Create single-engine reference
+    torch.manual_seed(42)
+    model = NanbeigeForCausalLM(config).to("cuda:0", torch.bfloat16)
+    reference_engine = LLMEngine(
+        model,
+        cache_config=CacheConfig(64, 4, "last_exited"),
+        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
+        exit_config=ExitConfig("trace", depths_by_request={"ref_0": trace_depths, "ref_1": trace_depths}),
+        attention_backend="triton",
+    )
+    
+    prompts = [[1, 2, 3, 4, 5], [5, 4, 3]]
+    
+    try:
+        for i, prompt in enumerate(prompts):
+            pd_engine.add_request(f"pd_{i}", prompt, params, trace_id=f"pd_{i}")
+            reference_engine.add_request(f"ref_{i}", prompt, params, trace_id=f"ref_{i}")
+        
+        pd_outputs = drain(pd_engine)
+        ref_outputs = drain(reference_engine)
+        
+        # Compare outputs
+        for i in range(len(prompts)):
+            pd_out = pd_outputs[f"pd_{i}"]
+            ref_out = ref_outputs[f"ref_{i}"]
+            assert pd_out.token_ids == ref_out.token_ids, (
+                f"Token mismatch for prompt {i}: PD={pd_out.token_ids}, Ref={ref_out.token_ids}"
+            )
+            assert pd_out.finished == ref_out.finished
+        
+        # Verify resource cleanup
+        assert all(p.slots == 0 and p.blocks == 0 for p in pd_engine.peers.values())
+        
+    finally:
+        pd_engine.close()
+    
+    assert all(not p.process.is_alive() for p in pd_engine.peers.values())
+    stats = pd_engine.worker_metrics.values()
+    assert all(m["used_blocks"] == 0 for m in stats)
