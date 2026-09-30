@@ -123,6 +123,57 @@ create an environment, download the model, start the server, and send your first
 request. The guide also covers command-line inference and the Python API. Browse the [documentation](docs/README.md) for runtime
 configuration, optional backends, and design notes.
 
+
+### Experimental fallback proposals
+
+Fixed-depth greedy speculation can optionally draft one alternate suffix when
+the shallow top-1/top-2 softmax probabilities are close. The full-depth verifier
+must confirm the alternate token before its suffix is reused.
+
+```python
+from vllm_rlt import LLM, SamplingParams, SpeculativeConfig
+
+llm = LLM(
+    "ByteDance/Ouro-1.4B",
+    device="cuda",
+    attention_backend="triton",
+    speculative_config=SpeculativeConfig(
+        num_speculative_tokens=4,
+        draft_loops=2,
+        target_loops=4,
+        fallback_margin=0.2,
+    ),
+)
+outputs = llm.generate(
+    ["Explain how a rainbow forms."],
+    SamplingParams(temperature=0, max_tokens=64),
+)
+```
+
+`fallback_margin=None` (the default) uses the original speculative runner.
+A value in [0, 1] enables the branch; even zero can open a branch on a tie.
+The branch path requires synchronous eager execution and greedy requests,
+along with the existing fixed-depth, last-exited KV and refill restrictions.
+If spare KV blocks are unavailable, the round continues on the primary path.
+
+This is experimental: branch rows add computation and occupy extra KV blocks.
+BF16 greedy sequences can differ from the plain runner; FP32 checks do not
+establish BF16 losslessness. On Ouro-1.4B with Triton, bounded checks cover
+natural EOS, later request admission, cancellation, and cache cleanup.
+FA4 and online-serving performance remain unvalidated for this path.
+
+To run the branch and baseline regression tests on a CUDA device with Triton:
+
+```bash
+pytest -q tests/test_branch_speculative.py tests/test_speculative.py \
+    --run-gpu -k "not flash_attn_4"
+```
+
+These include fixed-input FP32/BF16 branch comparisons against a serial
+reference, alongside the CPU lifecycle tests. FA4 cases are excluded by the
+command above.
+
+
 ## Performance Baselines
 
 The current performance baselines are recorded in
