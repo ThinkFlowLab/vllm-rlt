@@ -3,7 +3,12 @@ from dataclasses import replace
 import torch
 
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models.ouro import OuroForCausalLM
+from vllm_rlt.models import (
+    AutoModelForCausalLM,
+    load_tokenizer,
+    resolve_model_config,
+    resolve_model_source,
+)
 from vllm_rlt.sampling_params import SamplingParams
 
 
@@ -27,17 +32,16 @@ class LLM:
     ):
         self._tokenizer_source = None
         if isinstance(model, str):
-            model_name = model
-            model = OuroForCausalLM.from_pretrained(
-                model_name, revision=revision, device=device, dtype=dtype
+            tokenizer_source = resolve_model_source(model)
+            model_name, revision, _ = resolve_model_config(model, revision=revision)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                revision=revision,
+                device=device,
+                dtype=dtype,
             )
             if tokenizer is None:
-                from vllm_rlt.models.ouro import OURO_REVISION
-
-                self._tokenizer_source = (
-                    model_name,
-                    revision or (OURO_REVISION if model_name == "ByteDance/Ouro-1.4B" else None),
-                )
+                self._tokenizer_source = (tokenizer_source, revision)
         self.tokenizer = tokenizer
         self.engine = LLMEngine(
             model,
@@ -64,11 +68,10 @@ class LLM:
             for prompt, request_params in zip(prompts, all_params):
                 if isinstance(prompt, str):
                     if self.tokenizer is None and self._tokenizer_source is not None:
-                        from transformers import AutoTokenizer
-
                         source, revision = self._tokenizer_source
-                        self.tokenizer = AutoTokenizer.from_pretrained(
-                            source, revision=revision, trust_remote_code=False
+                        self.tokenizer = load_tokenizer(
+                            source,
+                            revision=revision,
                         )
                     if self.tokenizer is None:
                         raise ValueError(
@@ -97,3 +100,24 @@ class LLM:
                 if request_id in self.engine.scheduler.requests:
                     self.engine.abort_request(request_id)
             raise
+
+    def start_profile(self, config, *, scheduled=False):
+        return self.engine.start_profile(config, scheduled=scheduled)
+
+    def stop_profile(self):
+        return self.engine.stop_profile()
+
+    def profile_status(self):
+        return self.engine.profile_status()
+
+    def wait_for_profile_artifacts(self, timeout=None):
+        return self.engine.wait_for_profile_artifacts(timeout)
+
+    def close(self):
+        self.engine.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()

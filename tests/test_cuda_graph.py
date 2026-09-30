@@ -1,13 +1,12 @@
 """Graph replay must update KV addresses, request identities and host progress."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 
 
 def test_cuda_graph_validation():
@@ -17,7 +16,7 @@ def test_cuda_graph_validation():
         ExecutionConfig(cuda_graphs=1)
     with pytest.raises(ValueError, match="CUDA graphs require CUDA"):
         LLMEngine(
-            OuroForCausalLM(OuroConfig.tiny()), execution_config=ExecutionConfig(cuda_graphs=True)
+            OuroForCausalLM(tiny_ouro_config()), execution_config=ExecutionConfig(cuda_graphs=True)
         )
 
 
@@ -28,7 +27,7 @@ def test_cuda_graph_validation():
 @pytest.mark.parametrize("static", [False, True])
 def test_graph_replay_matches_eager_and_reuses_requests(backend, mode, layout, static):
     torch.manual_seed(321)
-    model = OuroForCausalLM(replace(OuroConfig.tiny(), head_dim=64)).to("cuda", torch.bfloat16)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
     outputs = []
     for graphs in [False, True]:
         engine = LLMEngine(
@@ -74,7 +73,7 @@ def test_graph_replay_matches_eager_and_reuses_requests(backend, mode, layout, s
 @pytest.mark.gpu
 def test_graph_cache_limit_fallback_and_abort():
     torch.manual_seed(19)
-    model = OuroForCausalLM(replace(OuroConfig.tiny(), head_dim=64)).to("cuda", torch.bfloat16)
+    model = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to("cuda", torch.bfloat16)
     engine = LLMEngine(
         model,
         cache_config=CacheConfig(num_blocks=64, block_size=16),

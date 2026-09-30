@@ -6,6 +6,7 @@ from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS
+from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.branch_speculative import BranchSpeculativeRunner
@@ -28,6 +29,7 @@ class LLMEngine:
         speculative_config=None,
     ):
         self.model = model
+        self.profiling = Profiler(next(model.parameters()).device)
         cache_config = cache_config or CacheConfig()
         scheduler_config = scheduler_config or SchedulerConfig()
         parameter = next(model.parameters())
@@ -48,10 +50,8 @@ class LLMEngine:
                 raise ValueError("speculative target_loops must equal the model full depth")
             if self.exit_config.mode != "ouro":
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
-            if self.execution_config.async_scheduling or self.execution_config.cuda_graphs:
-                raise ValueError(
-                    "speculative decoding currently requires synchronous eager execution"
-                )
+            if self.execution_config.async_scheduling:
+                raise ValueError("speculative decoding currently requires synchronous execution")
             if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
@@ -108,11 +108,11 @@ class LLMEngine:
             self.speculative_runner = None
         elif speculative_config.fallback_margin is None:
             self.speculative_runner = SpeculativeRunner(
-                model, self.cache_manager, speculative_config
+                model, self.cache_manager, speculative_config, self.execution_config
             )
         else:
             self.speculative_runner = BranchSpeculativeRunner(
-                model, self.cache_manager, speculative_config
+                model, self.cache_manager, speculative_config, self.execution_config
             )
         self.model_runner = ModelRunner(
             model,
@@ -210,7 +210,33 @@ class LLMEngine:
         self._pending_exit_signals.pop(request_id, None)
         return RequestOutput.from_request(self.scheduler.abort(request_id))
 
+    def start_profile(self, config, *, scheduled=False, **identity):
+        return self.profiling.start(config, scheduled=scheduled, **identity)
+
+    def stop_profile(self):
+        return self.profiling.stop()
+
+    def profile_status(self):
+        return self.profiling.status()
+
+    def wait_for_profile_artifacts(self, timeout=None):
+        return self.profiling.wait(timeout)
+
+    def close(self):
+        self.profiling.close()
+
     def step(self) -> list[RequestOutput]:
+        if not self.profiling.recording:
+            return self._step()
+        try:
+            outputs = self._step()
+            self.profiling.step()
+            return outputs
+        except BaseException:
+            self.profiling.stop()
+            raise
+
+    def _step(self) -> list[RequestOutput]:
         if self.execution_config.async_scheduling:
             try:
                 return self._step_async()
@@ -233,7 +259,8 @@ class LLMEngine:
             return []
         try:
             if batch.stage == Stage.SPECULATIVE:
-                return self._update_speculative(batch, self.speculative_runner.execute(batch))
+                result = self.speculative_runner.execute(batch)
+                return self._update_speculative(batch, result)
             result = self.model_runner.execute(batch)
             return self._update(batch, result)
         except Exception:

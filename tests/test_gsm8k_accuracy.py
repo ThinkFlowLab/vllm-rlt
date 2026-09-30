@@ -13,12 +13,17 @@ from benchmarks.gsm8k import (
     baseline_fingerprint,
     baseline_result,
     build_records,
+    checkpoint_loops,
     compare,
+    depth_summary,
     digest,
+    exit_settings,
     file_digest,
+    fixed_exit,
     make_task,
     score,
     select_doc_ids,
+    sequence_differences,
 )
 
 
@@ -151,7 +156,8 @@ def test_baseline_fingerprint_tracks_recipe_not_checkout():
     changed_length = {**protocol, "max_new_tokens": 512}
     changed_packages = deepcopy(protocol)
     changed_packages["source"]["packages"]["transformers"] = "different"
-    for changed in (changed_prompt, changed_length, changed_packages):
+    changed_depth = {**protocol, "loops": 6}
+    for changed in (changed_prompt, changed_length, changed_packages, changed_depth):
         assert baseline_fingerprint(changed) != expected
 
 
@@ -299,3 +305,224 @@ def test_invalid_comparisons_rejected(tmp_path, change):
     message = "Missing or duplicate examples" if change == "duplicate" else None
     with pytest.raises(ValueError, match=message):
         compare(args)
+
+
+@pytest.mark.parametrize("loops", [4, 6])
+def test_default_exit_is_the_fixed_recipe(loops):
+    fixed = {"mode": "ouro", "threshold": 1.0, "min_loops": loops, "max_loops": loops}
+    for backend in ("native", "transformers"):
+        assert exit_settings(backend, loops) == {**fixed, "async_scheduling": False}
+        assert fixed_exit(loops) == exit_settings(backend, loops)
+
+
+@pytest.mark.parametrize("loops", [4, 6])
+@pytest.mark.parametrize(
+    "backend,options",
+    [
+        ("native", dict(mode="ouro", threshold=0.5, min_loops=2)),
+        ("native", dict(mode="ouro_delayed", threshold=0.2, min_loops=2, async_scheduling=True)),
+        ("transformers", dict(mode="ouro", threshold=0.9, min_loops=1)),
+    ],
+)
+def test_adaptive_exit_settings(backend, options, loops):
+    settings = exit_settings(backend, loops, **options)
+    assert settings["max_loops"] == loops
+    assert settings["threshold"] == options["threshold"]
+    assert settings["min_loops"] == options["min_loops"]
+    assert settings["async_scheduling"] == options.get("async_scheduling", False)
+    assert settings != fixed_exit(loops)
+
+
+def test_min_loops_is_validated_against_the_checkpoint_depth():
+    assert exit_settings("native", 6, threshold=0.5, min_loops=6)["min_loops"] == 6
+    with pytest.raises(ValueError, match="between 1 and 6"):
+        exit_settings("native", 6, threshold=0.5, min_loops=7)
+
+
+@pytest.mark.parametrize(
+    "config,loops",
+    [
+        ({"model_type": "ouro", "total_ut_steps": 4}, 4),
+        ({"model_type": "ouro", "total_ut_steps": 6}, 6),
+        ({"model_type": "llama", "total_ut_steps": 4}, None),
+        ({"model_type": "ouro"}, None),
+        ({"model_type": "ouro", "total_ut_steps": 0}, None),
+        ({"model_type": "ouro", "total_ut_steps": 4.0}, None),
+    ],
+)
+def test_checkpoint_loops_come_from_config(config, loops):
+    if loops is None:
+        with pytest.raises(ValueError, match="total_ut_steps"):
+            checkpoint_loops(config)
+    else:
+        assert checkpoint_loops(config) == loops
+
+
+def test_run_refuses_the_stored_baseline_at_another_depth(tmp_path, monkeypatch):
+    pytest.importorskip("lm_eval")
+    case = json.loads(DEFAULT_CASE.read_text())
+    protocol = {
+        "model_revision": "pinned",
+        "model_files": {},
+        "task_config": {},
+        "records": [],
+        "max_new_tokens": 1024,
+        "max_length": 2048,
+        "dtype": "bfloat16",
+        "loops": 4,
+        "batch_size": 1,
+        "add_special_tokens": False,
+        "apply_chat_template": False,
+        "source": {"packages": case["baseline"]["packages"]},
+    }
+    baseline = {**case["baseline"], "protocol_fingerprint": baseline_fingerprint(protocol)}
+
+    class PassedTheGuard(Exception):
+        pass
+
+    def stop():
+        raise PassedTheGuard
+
+    # The package check follows the baseline guard; stop there instead of loading a model.
+    monkeypatch.setattr(gsm8k, "source", stop)
+    for loops in (4, 6):
+        path = tmp_path / f"protocol-{loops}.json"
+        path.write_text(json.dumps({**protocol, "loops": loops, "baseline": baseline}))
+        args = SimpleNamespace(
+            protocol=str(path),
+            backend="native",
+            exit_mode="ouro",
+            exit_threshold=1.0,
+            min_loops=None,
+            async_scheduling=False,
+        )
+        if loops == 4:
+            with pytest.raises(PassedTheGuard):
+                gsm8k.run(args)
+        else:
+            # Another depth changes the fingerprint, so the four-loop baseline cannot apply.
+            with pytest.raises(ValueError, match="changed after its HF baseline was frozen"):
+                gsm8k.run(args)
+
+
+@pytest.mark.parametrize(
+    "backend,options,message",
+    [
+        ("native", dict(threshold=1.5), "\\[0, 1\\]"),
+        ("native", dict(threshold=0.5), "--min-loops"),
+        ("native", dict(threshold=0.5, min_loops=5), "--min-loops"),
+        # Loop and scheduling options would be silently ignored at fixed depth.
+        ("native", dict(min_loops=2), "below 1"),
+        ("native", dict(mode="ouro_delayed"), "below 1"),
+        ("native", dict(threshold=0.5, min_loops=2, async_scheduling=True), "ouro_delayed"),
+        ("transformers", dict(threshold=0.5, min_loops=2), "min-loops 1"),
+        ("transformers", dict(mode="ouro_delayed", threshold=0.5, min_loops=1), "min-loops 1"),
+    ],
+)
+def test_invalid_exit_settings_rejected(backend, options, message):
+    with pytest.raises(ValueError, match=message):
+        exit_settings(backend, 4, **options)
+
+
+def test_depth_summary_excludes_the_prefill_token():
+    rows = [{"exit_depths": [4, 2, 3]}, {"exit_depths": [4, 4]}, {"exit_depths": [4]}]
+    summary = depth_summary(rows)
+    assert summary["decode_tokens"] == 3
+    assert summary["mean_decode_depth"] == pytest.approx(3.0)
+    assert summary["decode_depth_histogram"] == {"2": 1, "3": 1, "4": 1}
+    assert summary["decode_loops_per_question_mean"] == pytest.approx(3.0)
+    assert depth_summary([{"token_ids": [1]}]) is None
+
+
+def test_compare_reports_exit_policies_between_native_runs(tmp_path):
+    args = comparison_fixture(tmp_path)
+    adaptive = exit_settings("native", 4, mode="ouro", threshold=0.5, min_loops=2)
+    depth = depth_summary([{"exit_depths": [4, 2]}])
+    for backend, extra in (
+        ("transformers", {"backend": "native"}),
+        ("native", {"exit": adaptive, "depth": depth}),
+    ):
+        path = tmp_path / backend / "summary.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), **extra}))
+    result = compare(args)
+    # A summary without exit settings predates them and used the fixed four-loop recipe.
+    assert result["reference"] == {"backend": "native", "exit": fixed_exit(4), "depth": None}
+    assert result["candidate"] == {"backend": "native", "exit": adaptive, "depth": depth}
+    assert (result["reference_correct"], result["candidate_correct"]) == (1, 1)
+    # Backend-named keys would mislabel a native-vs-native comparison, so they are omitted.
+    assert not any(key.startswith(("transformers_", "native_")) for key in result)
+    assert "reference_correct_native_wrong" not in result
+
+
+def test_compare_keeps_backend_named_keys_for_hf_vs_native(tmp_path):
+    result = compare(comparison_fixture(tmp_path, native_correct=False))
+    assert result["reference_correct_candidate_wrong"] == 1
+    assert result["transformers_correct"] == result["reference_correct"] == 1
+    assert result["native_correct"] == result["candidate_correct"] == 0
+    assert result["native_accuracy_pct"] == result["candidate_accuracy_pct"] == 0
+
+
+def rows(id_, tokens, depths=None):
+    row = {"id": id_, "token_ids": tokens}
+    if depths is not None:
+        row["exit_depths"] = depths
+    return row
+
+
+def test_sequence_differences_locate_first_divergence():
+    pairs = [
+        # identical
+        (rows(0, [1, 2, 3], [4, 2, 2]), rows(0, [1, 2, 3], [4, 2, 2])),
+        # same tokens, exit decision differs at 2 on identical context
+        (rows(1, [1, 2, 3], [4, 2, 2]), rows(1, [1, 2, 3], [4, 2, 3])),
+        # tokens diverge at 1; the later depth difference follows from it
+        (rows(2, [1, 5, 6], [4, 2, 2]), rows(2, [1, 2, 3], [4, 2, 3])),
+        # depth differs at 1 while tokens still agree there: identical context
+        (rows(3, [1, 2, 9], [4, 3, 2]), rows(3, [1, 2, 3], [4, 2, 2])),
+        # one output is a prefix of the other: a length difference, not an exit decision
+        (rows(4, [1, 2], [4, 2]), rows(4, [1, 2, 3], [4, 2, 2])),
+        # exit decision differs at 2 on identical context and changes token 2 itself
+        (rows(5, [1, 2, 3], [4, 2, 2]), rows(5, [1, 2, 9], [4, 2, 3])),
+    ]
+    result = sequence_differences(pairs)
+    tokens, depths = result["token_ids"], result["exit_depths"]
+    assert tokens["questions_compared"] == 6
+    assert tokens["questions_differing"] == 4
+    assert [q["first_divergence"] for q in tokens["questions"]] == [1, 2, 2, 2]
+    assert (tokens["earliest_first_divergence"], tokens["median_first_divergence"]) == (1, 2)
+    assert depths["questions_differing"] == 5
+    assert {q["id"]: q["identical_context"] for q in depths["questions"]} == {
+        1: True,
+        2: False,
+        3: True,
+        4: False,
+        5: True,
+    }
+    assert depths["questions_differing_on_identical_context"] == 3
+
+
+def test_sequence_differences_skip_unrecorded_depths():
+    # HF fixed-depth rows record no exit depths.
+    result = sequence_differences([(rows(0, [1, 2]), rows(0, [1, 3], [4, 2]))])
+    assert result["token_ids"]["questions_differing"] == 1
+    assert result["exit_depths"]["questions_compared"] == 0
+    assert result["exit_depths"]["earliest_first_divergence"] is None
+
+
+def test_compare_reports_sequences_without_changing_the_gate(tmp_path):
+    args = comparison_fixture(tmp_path, examples=2)
+    for backend, depths in (("transformers", [[4, 2], [4, 2]]), ("native", [[4, 2], [4, 3]])):
+        path = tmp_path / backend
+        samples = [json.loads(line) for line in (path / "samples.jsonl").read_text().splitlines()]
+        for sample, sample_depths in zip(samples, depths):
+            sample.update(token_ids=[7, 8], exit_depths=sample_depths)
+        (path / "samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in samples))
+        summary = json.loads((path / "summary.json").read_text())
+        summary.update(backend="native", samples_sha256=file_digest(path / "samples.jsonl"))
+        (path / "summary.json").write_text(json.dumps(summary))
+    result = compare(args)
+    differences = result["sequence_differences"]
+    assert differences["token_ids"]["questions_differing"] == 0
+    assert differences["exit_depths"]["questions_differing_on_identical_context"] == 1
+    assert result["answer_disagreements"] == []
+    assert result["passes_observed_accuracy_gate"]

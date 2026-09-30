@@ -30,8 +30,9 @@ Adopting the 87-question case required no new GPU inference.
 
 The reference calls `AutoModelForCausalLM.from_pretrained(...,
 trust_remote_code=True)` and the released model's `generate()`. It uses eager
-attention and the standard Transformers `DynamicCache` with 96 depth/layer slots,
-plus `exit_at_step=3` for fourth-loop logits. This cache setup accommodates the
+attention and the standard Transformers `DynamicCache` with one slot per layer and
+loop (96 here), plus `exit_at_step = total_ut_steps - 1` (3) for last-loop logits.
+This cache setup accommodates the
 pinned release's older cache interface; the model source is not patched.
 The candidate uses the existing native engine and Triton attention. Both use
 BF16 weights and activations, retaining each backend's existing FP32 reductions
@@ -110,6 +111,58 @@ Explicit `--limit 100 --seed 0` recreates the original 100-question selection;
 revision, split, seed and source row ID, independent of answers. In particular,
 `--limit 87` samples a different set from the fixed default case. Custom protocols
 do not reuse the stored 59/87 baseline: run HF and native, then use `compare`.
+
+## Adaptive-exit runs
+
+The default recipe runs the checkpoint's full depth for every token: `prepare` reads
+`total_ut_steps` from its `config.json` (4 for Ouro-1.4B) into the protocol's `loops`,
+and `run` takes the depth from there. `loops` is part of the baseline fingerprint, so the
+stored GSM8K-87 baseline applies only to a four-loop protocol. `run` also accepts an
+adaptive exit policy, so accuracy can be measured under the same protocol:
+
+```bash
+python -m benchmarks.gsm8k run --backend native \
+  --protocol /path/to/gsm8k-87-protocol.json --output /path/to/native-ouro-t05 \
+  --exit-mode ouro --exit-threshold 0.5 --min-loops 1
+```
+
+- `--exit-threshold` is the cumulative exit probability. `1` (the default) keeps
+  the fixed full-depth recipe, and the loop/mode options are rejected with it.
+- Below 1, `--min-loops` is required, between 1 and the protocol's depth.
+  `--exit-mode ouro_delayed` selects the delayed gate, and `--async-scheduling`
+  (native only) requires it.
+- The Transformers release accepts `--exit-mode ouro --min-loops 1` only: it has no
+  minimum loop count or delayed mode. It runs every loop and selects the exited
+  loop's hidden state, so its KV stays full-depth, while native execution skips the
+  remaining loops and uses the configured KV layout. The release would also apply the
+  threshold to the prefill forward; the harness forces that call to full depth, as
+  native prefill always is, so the first output token is chosen the same way.
+- The release computes the exit rule in BF16 and compares it with the threshold
+  rounded to BF16 (0.2 becomes 0.2002); native uses FP32 gate scores. Comparisons of
+  the two backends therefore include exit-arithmetic and kernel differences, not only
+  the KV layout.
+
+Metadata and summaries record the exit settings. Adaptive summaries add `depth`: decode
+token count, mean decode depth, a depth histogram and mean decode loops per
+question. For the Transformers release these are the selected exit loops, recorded
+with its own rule; it still computes every loop for every token. The first output
+token comes from full-depth prefill and is excluded from these statistics. The stored
+GSM8K-87 baseline describes fixed-depth generation, so adaptive native runs report no
+`baseline_comparison` and no gate.
+
+`compare --reference A --candidate B` (aliases of `--transformers`/`--native`)
+accepts any pair of backends from the same protocol and reports each side's backend,
+exit settings and depth summary alongside the paired accuracy result. Result keys use
+`reference_*`/`candidate_*`; the earlier `transformers_*`/`native_*` keys are also
+written only when the reference is the Transformers release and the candidate is native.
+
+Matching answers can hide different executions, for example between synchronous and
+asynchronous runs of one exit policy. `sequence_differences` therefore reports, for the
+generated token sequences and for the exit-depth sequences (where both runs record
+them), how many questions differ and where each first diverges. An exit-depth difference
+counts as `identical_context` when the two runs chose different depths for a position
+whose preceding tokens were still identical. These fields are diagnostic; the accuracy
+gate does not use them.
 
 Dataset: [GSM8K](https://huggingface.co/datasets/openai/gsm8k).
 The [Ouro evaluation settings](https://arxiv.org/html/2510.25741v5#A3.T16) do not

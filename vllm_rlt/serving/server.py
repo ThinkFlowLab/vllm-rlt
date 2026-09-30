@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+import math
 import time
 
 from aiohttp import web
 
-from vllm_rlt.models.config import OURO_MODEL_ID
+from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.serving.protocol import (
     CompletionRequest,
     ServingError,
@@ -29,7 +30,7 @@ def error_response(error):
 def create_app(
     factory,
     *,
-    model=OURO_MODEL_ID,
+    model,
     limits=ServingLimits(),
     allowed_hosts=("localhost",),
 ):
@@ -180,12 +181,57 @@ def create_app(
             if channel is not None:
                 worker.release(channel)
 
+    async def profile(request):
+        if "Origin" in request.headers:
+            return error_response(
+                ServingError("browser requests are not supported", 403, "forbidden")
+            )
+        action = request.match_info["action"]
+        if action not in ("start", "stop", "status", "wait"):
+            raise web.HTTPNotFound()
+        try:
+            if request.method == "GET" and action != "status":
+                raise web.HTTPMethodNotAllowed(request.method, ["POST"])
+            body = await request.json() if request.can_read_body else {}
+            if not isinstance(body, dict):
+                raise ValueError("profile request must be an object")
+            scheduled = body.pop("scheduled", False)
+            if type(scheduled) is not bool:
+                raise ValueError("scheduled must be boolean")
+            timeout = body.pop("timeout", 60)
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be a positive finite number")
+            if action == "start":
+                if not scheduled and set(body) & {"wait", "warmup", "active", "repeat"}:
+                    raise ValueError("schedule parameters require scheduled=true")
+                config = ProfileConfig(**body)
+            else:
+                if body or scheduled:
+                    raise ValueError("configuration is only accepted by profile/start")
+                config = None
+            result = await worker.profile_control(
+                action, config, scheduled=scheduled, timeout=timeout
+            )
+            return web.json_response(result)
+        except ServingError as exc:
+            return error_response(exc)
+        except (ValueError, TypeError) as exc:
+            return error_response(ServingError.invalid_request(str(exc)))
+        except TimeoutError as exc:
+            return error_response(ServingError(str(exc), 504, "timeout"))
+        except RuntimeError as exc:
+            return error_response(ServingError(str(exc), 409, "profile_conflict"))
+        except OSError as exc:
+            return error_response(ServingError(str(exc), 500, "profile_io_error"))
+
     async def start(app):
         worker.start()
 
     async def stop(app):
         await worker.close()
 
+    app.router.add_post("/profile/{action}", profile)
+    app.router.add_get("/profile/{action}", profile)
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_post("/v1/completions", complete)

@@ -37,11 +37,27 @@ def drive(engine):
     return outputs, steps, time.perf_counter() - start
 
 
+def _toy_ouro_config() -> OuroConfig:
+    return OuroConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=128,
+        total_ut_steps=4,
+        bos_token_id=0,
+        eos_token_id=0,
+    )
+
+
 def benchmark(device="cpu", layout="last_exited", trace=None, seed=123):
     torch.set_num_threads(1)
     torch.manual_seed(seed)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    model = OuroForCausalLM(OuroConfig.tiny()).to(device=device, dtype=dtype)
+    model = OuroForCausalLM(_toy_ouro_config()).to(device=device, dtype=dtype)
     prompts = {"A": [2, 3, 4, 5], "B": [6, 7], "C": [8, 9, 10]}
     parameters = {
         rid: SamplingParams(max_tokens=6, exit_threshold=q, ignore_eos=True)

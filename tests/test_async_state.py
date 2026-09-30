@@ -1,19 +1,18 @@
 """Resident state and mapped-host descriptor ownership under delayed execution."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Stage
 
 
 def engine(*, asynchronous=True, static=False, graph=False, shared=False):
     torch.manual_seed(19)
-    config = replace(OuroConfig.tiny(), head_dim=64)
+    config = tiny_ouro_config(head_dim=64)
     return LLMEngine(
         OuroForCausalLM(config).to(device="cuda", dtype=torch.bfloat16),
         cache_config=CacheConfig(128, 2, "shared" if shared else "last_exited"),

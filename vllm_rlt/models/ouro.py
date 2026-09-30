@@ -10,69 +10,143 @@ request or loop depth; the cache supplies the corresponding causal KV history.
 """
 
 import json
+import math
 from collections.abc import Sequence
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .config import OURO_MODEL_ID, OURO_REVISION, OuroConfig
+from vllm_rlt.layers import (
+    RMSNorm,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    rotate_half,
+)
 
 if TYPE_CHECKING:
     from vllm_rlt.core.kv_cache_manager import KVCacheManager, _PreparedKVBatch
 
 
-class OuroRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+@dataclass(frozen=True)
+class OuroConfig:
+    vocab_size: int = 49152
+    hidden_size: int = 2048
+    intermediate_size: int = 5632
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 16
+    head_dim: int = 128
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 65536
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1_000_000.0
+    total_ut_steps: int = 4
+    early_exit_threshold: float = 1.0
+    bos_token_id: int | None = 0
+    eos_token_id: int | None = 0
+    pad_token_id: int | None = None
+    tie_word_embeddings: bool = False
+    attention_dropout: float = 0.0
+    rope_scaling: dict[str, Any] | None = None
+    use_sliding_window: bool = False
+    sliding_window: int | None = None
+    layer_types: list[str] | None = None
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        value = hidden.float()
-        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.variance_epsilon)
-        return self.weight * value.to(hidden.dtype)
+    def __post_init__(self) -> None:
+        for name in (
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "max_position_embeddings",
+            "total_ut_steps",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.head_dim % 2:
+            raise ValueError("head_dim must be even for split-half RoPE")
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        for name in ("rope_theta", "rms_norm_eps", "initializer_range"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(self.early_exit_threshold) or not 0 <= self.early_exit_threshold <= 1:
+            raise ValueError("early_exit_threshold must be in [0, 1]")
+        if self.hidden_act != "silu":
+            raise ValueError("Only Ouro's silu activation is supported")
+        if self.rope_scaling is not None:
+            raise ValueError("RoPE scaling is not supported")
+        if self.use_sliding_window or self.sliding_window is not None:
+            raise ValueError("Sliding-window attention is not supported")
+        if self.layer_types is not None and (
+            len(self.layer_types) != self.num_hidden_layers
+            or any(layer != "full_attention" for layer in self.layer_types)
+        ):
+            raise ValueError("Every Ouro layer must use full_attention")
+        if self.tie_word_embeddings:
+            raise ValueError("Tied embeddings are not supported by the Ouro-1.4B loader")
+        if self.attention_dropout != 0:
+            raise ValueError("Inference requires attention_dropout=0")
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value < self.vocab_size
+            ):
+                raise ValueError(f"{name} must be a vocabulary index or None")
 
-
-class OuroRotaryEmbedding(nn.Module):
-    def __init__(self, config: OuroConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.register_buffer("inv_freq", self.frequencies(), persistent=False)
-
-    def frequencies(self, device: torch.device | str | None = None) -> torch.Tensor:
-        return 1.0 / (
-            self.config.rope_theta
-            ** (
-                torch.arange(0, self.config.head_dim, 2, dtype=torch.float32, device=device)
-                / self.config.head_dim
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "OuroConfig":
+        if values.get("model_type", "ouro") != "ouro":
+            raise ValueError("Only model_type='ouro' is supported")
+        if values.get("architectures", ["OuroForCausalLM"]) != ["OuroForCausalLM"]:
+            raise ValueError("Only the OuroForCausalLM architecture is supported")
+        names = {field.name for field in fields(cls)}
+        metadata = {
+            "architectures",
+            "auto_map",
+            "model_type",
+            "torch_dtype",
+            "dtype",
+            "transformers_version",
+            "max_window_layers",
+            "use_cache",
+            "_name_or_path",
+        }
+        unknown = values.keys() - names - metadata
+        if unknown:
+            raise ValueError(f"Unsupported Ouro configuration fields: {sorted(unknown)}")
+        config_values = {key: value for key, value in values.items() if key in names}
+        if "head_dim" not in config_values and "hidden_size" in config_values:
+            heads = config_values.get("num_attention_heads", cls.num_attention_heads)
+            if config_values["hidden_size"] % heads:
+                raise ValueError("hidden_size must be divisible by num_attention_heads")
+            config_values["head_dim"] = config_values["hidden_size"] // heads
+        if config_values.get("num_key_value_heads", 1) is None:
+            config_values["num_key_value_heads"] = config_values.get(
+                "num_attention_heads", cls.num_attention_heads
             )
-        )
+        return cls(**config_values)
 
-    def _apply(self, fn, recurse=True):
-        super()._apply(fn, recurse=recurse)
-        # Module.to(dtype) otherwise rounds these constants before forward's
-        # float32 cast, changing long-context rotary angles irreversibly.
-        self.inv_freq = self.frequencies(device=self.inv_freq.device)
-        return self
-
-    def forward(
-        self, hidden: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The reference forces fp32 here, including when the projections use bf16.
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
-            angles = positions.float().unsqueeze(-1) * self.inv_freq.float()
-            angles = torch.cat((angles, angles), dim=-1)
-        return angles.cos().to(hidden.dtype).unsqueeze(1), angles.sin().to(hidden.dtype).unsqueeze(
-            1
-        )
+    def to_dict(self) -> dict[str, Any]:
+        return {"model_type": "ouro", "architectures": ["OuroForCausalLM"], **asdict(self)}
 
 
-def _rotate_half(value: torch.Tensor) -> torch.Tensor:
-    first, second = value.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
+# Backward-compatible aliases for shared layers
+OuroRMSNorm = RMSNorm
+OuroRotaryEmbedding = RotaryEmbedding
+_rotate_half = rotate_half
 
 
 class OuroAttention(nn.Module):
@@ -105,8 +179,7 @@ class OuroAttention(nn.Module):
         k = self.k_proj(hidden).view(shape)
         v = self.v_proj(hidden).view(shape)
         cos, sin = position_embeddings
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
         cache._write_prepared(self.layer_idx, batch, k, v)
         output = cache._attend_prepared(self.layer_idx, batch, q)
         return self.o_proj(output.reshape(hidden.shape[0], -1))
@@ -128,10 +201,10 @@ class OuroDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = OuroAttention(config, layer_idx)
         self.mlp = OuroMLP(config)
-        self.input_layernorm = OuroRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.input_layernorm_2 = OuroRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = OuroRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm_2 = OuroRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -154,8 +227,8 @@ class OuroModel(nn.Module):
         self.layers = nn.ModuleList(
             OuroDecoderLayer(config, layer) for layer in range(config.num_hidden_layers)
         )
-        self.norm = OuroRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = OuroRotaryEmbedding(config)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(head_dim=config.head_dim, rope_theta=config.rope_theta)
         self.early_exit_gate = nn.Linear(config.hidden_size, 1, bias=True)
 
 
@@ -222,7 +295,7 @@ class OuroForCausalLM(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        path_or_repo: str | Path = OURO_MODEL_ID,
+        path_or_repo: str | Path,
         *,
         revision: str | None = None,
         device: torch.device | str = "cpu",
@@ -230,8 +303,7 @@ class OuroForCausalLM(nn.Module):
     ) -> "OuroForCausalLM":
         """Stream strictly checked safetensors into a meta model; never execute Hub code.
 
-        The official repository defaults to a frozen revision. Local directories
-        may contain a single model.safetensors or an indexed sharded checkpoint.
+        Local directories may contain a single model.safetensors or an indexed sharded checkpoint.
         """
         from safetensors import safe_open
 
@@ -239,16 +311,10 @@ class OuroForCausalLM(nn.Module):
             raise ValueError("dtype must be float32, float16, or bfloat16")
         folder = Path(path_or_repo).expanduser()
         if not folder.is_dir():
-            from huggingface_hub import snapshot_download
+            from vllm_rlt.models import resolve_model_config
 
-            repo = str(path_or_repo)
-            folder = Path(
-                snapshot_download(
-                    repo_id=repo,
-                    revision=revision or (OURO_REVISION if repo == OURO_MODEL_ID else None),
-                    allow_patterns=["config.json", "*.safetensors", "model.safetensors.index.json"],
-                )
-            )
+            source, revision, _ = resolve_model_config(path_or_repo, revision=revision)
+            folder = Path(source)
         config = OuroConfig.from_dict(json.loads((folder / "config.json").read_text()))
         index_path = folder / "model.safetensors.index.json"
         index = json.loads(index_path.read_text())["weight_map"] if index_path.is_file() else None

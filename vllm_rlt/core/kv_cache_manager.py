@@ -425,77 +425,138 @@ class KVCacheManager:
         packed_prefill: bool = False,
     ) -> _PreparedKVBatch:
         """Build layer-independent addresses once; do not initialize any KV slot."""
-        rows = tuple(self._validate_rows(request_ids, depths, positions))
-        addresses = [
-            (
-                allocation.block_tables[self._plane(depth)][position // self.block_size],
-                position % self.block_size,
+        return self._prepare_batches(
+            request_ids,
+            (depths,),
+            positions,
+            for_write=for_write,
+            packed_prefill=packed_prefill,
+        )[0]
+
+    def _prepare_batches(
+        self,
+        request_ids: Sequence[str],
+        depth_sets: Sequence[Sequence[int]],
+        positions: Sequence[int] | torch.Tensor,
+        *,
+        for_write: bool = True,
+        packed_prefill: bool = False,
+    ) -> tuple[_PreparedKVBatch, ...]:
+        """Prepare one batch per depth assignment of the same request/position rows.
+
+        Positions and write offsets do not depend on depth; they are built and
+        copied once and shared as read-only views, as are context lengths and
+        query boundaries when the per-depth grouping is identical. Block addresses
+        and page tables are built per depth assignment. No KV slot is initialized:
+        ownership and written-prefix checks still run when each batch executes.
+        """
+        if not depth_sets:
+            raise ValueError("at least one depth assignment is required")
+        if packed_prefill and (
+            self.layout != "last_exited" or getattr(self.attention, "generation", None) != 4
+        ):
+            raise ValueError("packed prefill requires LAST_EXITED and FlashAttention-4")
+        first = tuple(self._validate_rows(request_ids, depth_sets[0], positions))
+        row_sets = [first]
+        for depths in depth_sets[1:]:
+            if len(depths) != len(first):
+                raise ValueError("request_ids, depths, and positions must have equal lengths")
+            for depth in depths:
+                self._validate_depth(depth)
+            row_sets.append(
+                tuple(
+                    (allocation, int(depth), position)
+                    for (allocation, _, position), depth in zip(first, depths)
+                )
             )
-            for allocation, depth, position in rows
-        ]
-        if for_write and len(set(addresses)) != len(addresses):
-            raise ValueError(
-                "a write batch cannot contain duplicate request/depth/position addresses"
+        n = len(first)
+        position_list = [position for _, _, position in first]
+        offsets = [position % self.block_size for position in position_list]
+        width = max((position // self.block_size + 1 for position in position_list), default=0)
+        # Stage all metadata in two pinned host tensors and copy them without
+        # blocking: a pageable H2D copy would wait for all queued GPU work. The
+        # caching host allocator keeps each staging block alive until its copy ends.
+        wide = position_list + offsets
+        narrow = []
+        shared = {}
+        plans = []
+        for rows in row_sets:
+            blocks = [
+                allocation.block_tables[self._plane(depth)][position // self.block_size]
+                for allocation, depth, position in rows
+            ]
+            if for_write and len(set(zip(blocks, offsets))) != n:
+                raise ValueError(
+                    "a write batch cannot contain duplicate request/depth/position addresses"
+                )
+            table_rows, cumulative, max_query = (
+                self._group_packed_rows(rows) if packed_prefill else (rows, None, 1)
             )
-        width = max((position // self.block_size + 1 for _, _, position in rows), default=0)
-        table_rows = rows
-        cumulative = None
-        max_query = 1
-        if packed_prefill:
-            if self.layout != "last_exited" or getattr(self.attention, "generation", None) != 4:
-                raise ValueError("packed prefill requires LAST_EXITED and FlashAttention-4")
-            # Group only consecutive positions of one request/depth. The last
-            # position supplies the causal key length for the whole query chunk.
-            ends, cumulative, seen = [], [0], set()
-            for index, (allocation, depth, position) in enumerate(rows):
-                key = (id(allocation), depth)
-                if index and key == (id(rows[index - 1][0]), rows[index - 1][1]):
-                    if position != rows[index - 1][2] + 1:
-                        raise ValueError("packed prefill positions must be contiguous")
-                    ends[-1] = (allocation, depth, position)
-                    cumulative[-1] = index + 1
-                else:
-                    if key in seen:
-                        raise ValueError("packed prefill request/depth must form one sequence")
-                    seen.add(key)
-                    ends.append((allocation, depth, position))
-                    cumulative.append(index + 1)
-            table_rows = ends
-            max_query = max((b - a for a, b in zip(cumulative, cumulative[1:])), default=1)
-        tables = []
-        for allocation, depth, _ in table_rows:
-            table = allocation.block_tables[self._plane(depth)][:width]
-            tables.append(list(table) + [-1] * (width - len(table)))
-        allocations = dict(zip(request_ids, (allocation for allocation, _, _ in rows)))
-        return _PreparedKVBatch(
-            owner=self,
-            rows=rows,
-            allocations=tuple(allocations.items()),
-            position_ids=torch.tensor(
-                [position for _, _, position in rows], device=self.device, dtype=torch.long
-            ),
-            write_blocks=torch.tensor(
-                [block for block, _ in addresses], device=self.device, dtype=torch.long
-            ),
-            write_offsets=torch.tensor(
-                [offset for _, offset in addresses], device=self.device, dtype=torch.long
-            ),
-            block_tables=torch.tensor(tables, device=self.device, dtype=torch.int32).reshape(
-                len(table_rows), width
-            ),
-            context_lengths=torch.tensor(
-                [position + 1 for _, _, position in table_rows],
-                device=self.device,
-                dtype=torch.int32,
-            ),
-            writable=for_write,
-            cu_seqlens_q=(
-                torch.tensor(cumulative, device=self.device, dtype=torch.int32)
-                if cumulative is not None
-                else None
-            ),
-            max_seqlen_q=max_query,
-        )
+            block_start = len(wide)
+            wide += blocks
+            table_start = len(narrow)
+            for allocation, depth, _ in table_rows:
+                table = allocation.block_tables[self._plane(depth)][:width]
+                narrow += table
+                narrow += [-1] * (width - len(table))
+            lengths = [position + 1 for _, _, position in table_rows]
+            key = (tuple(lengths), None if cumulative is None else tuple(cumulative))
+            if key not in shared:
+                shared[key] = len(narrow)
+                narrow += lengths + (cumulative or [])
+            packed = cumulative is not None
+            plans.append(
+                (rows, block_start, table_start, len(table_rows), shared[key], packed, max_query)
+            )
+        wide = self._stage(wide, torch.long)
+        narrow = self._stage(narrow, torch.int32)
+        allocations = tuple(dict(zip(request_ids, (a for a, _, _ in first))).items())
+        batches = []
+        for rows, block_start, table_start, t, lengths_start, packed, max_query in plans:
+            batches.append(
+                _PreparedKVBatch(
+                    owner=self,
+                    rows=rows,
+                    allocations=allocations,
+                    position_ids=wide[:n],
+                    write_blocks=wide[block_start : block_start + n],
+                    write_offsets=wide[n : 2 * n],
+                    block_tables=narrow[table_start : table_start + t * width].reshape(t, width),
+                    context_lengths=narrow[lengths_start : lengths_start + t],
+                    writable=for_write,
+                    cu_seqlens_q=(
+                        narrow[lengths_start + t : lengths_start + 2 * t + 1] if packed else None
+                    ),
+                    max_seqlen_q=max_query,
+                )
+            )
+        return tuple(batches)
+
+    def _group_packed_rows(self, rows):
+        """Group consecutive positions of one request/depth into packed query chunks.
+
+        The last position supplies the causal key length for the whole chunk.
+        """
+        ends, cumulative, seen = [], [0], set()
+        for index, (allocation, depth, position) in enumerate(rows):
+            key = (id(allocation), depth)
+            if index and key == (id(rows[index - 1][0]), rows[index - 1][1]):
+                if position != rows[index - 1][2] + 1:
+                    raise ValueError("packed prefill positions must be contiguous")
+                ends[-1] = (allocation, depth, position)
+                cumulative[-1] = index + 1
+            else:
+                if key in seen:
+                    raise ValueError("packed prefill request/depth must form one sequence")
+                seen.add(key)
+                ends.append((allocation, depth, position))
+                cumulative.append(index + 1)
+        max_query = max((b - a for a, b in zip(cumulative, cumulative[1:])), default=1)
+        return ends, cumulative, max_query
+
+    def _stage(self, values, dtype):
+        host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
+        return host.to(self.device, non_blocking=True)
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
         if batch.owner is not self:

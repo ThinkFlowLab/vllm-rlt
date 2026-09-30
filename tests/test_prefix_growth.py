@@ -1,15 +1,16 @@
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 
 
 def model():
     torch.manual_seed(15)
-    return OuroForCausalLM(OuroConfig.tiny())
+    return OuroForCausalLM(tiny_ouro_config())
 
 
 def finish(engine):
@@ -96,13 +97,26 @@ def test_lossless_preemption_preserves_looped_history():
         while len(e.scheduler.requests["a"].generated_token_ids) < 3:
             e.step()
         if suspend:
+            request = e.scheduler.requests["a"]
+            generator = request.generator
+            assert generator is not None
+            state = generator.get_state().clone()
             e.add_request("b", [5], SamplingParams(max_tokens=1))
             e.scheduler.selected_request_ids.clear()
             assert e.preemption.preempt(e.scheduler.requests["b"])
             assert "a" in e.preemption.snapshots
+            # Suspension shares release() with termination, and the RNG survives
+            # only because the Request object is retained: it is not part of the
+            # KV/hidden snapshot.
+            assert request.generator is generator
+            assert torch.equal(generator.get_state(), state)
         results.append(finish(e)["a"])
         if suspend:
             assert e.preemption.resumptions == 1
+            # Sampling continued from the preserved state instead of reseeding,
+            # and termination then released the RNG slot.
+            assert not torch.equal(generator.get_state(), state)
+            assert request.generator is None
     assert results[0].token_ids == results[1].token_ids
     assert results[0].exit_depths == results[1].exit_depths
 
@@ -110,12 +124,10 @@ def test_lossless_preemption_preserves_looped_history():
 @pytest.mark.gpu
 @pytest.mark.parametrize("graph", [False, True])
 def test_fa4_prefill_uva_prefix_growth_and_bank_reuse(graph):
-    from dataclasses import replace
-
     from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(21)
-    cfg = replace(OuroConfig.tiny(), head_dim=64)
+    cfg = tiny_ouro_config(head_dim=64)
     m = OuroForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16)
     params = SamplingParams(max_tokens=8, min_loops=1, ignore_eos=True)
     engines = []
@@ -227,12 +239,10 @@ def test_prefill_uva_metadata_matches_reference_and_waits_for_consumer():
 
 @pytest.mark.gpu
 def test_async_pressure_preemption_with_resident_state():
-    from dataclasses import replace
-
     from vllm_rlt import ExecutionConfig, ExitConfig
 
     torch.manual_seed(71)
-    cfg = replace(OuroConfig.tiny(), head_dim=64)
+    cfg = tiny_ouro_config(head_dim=64)
     m = OuroForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16)
     options = dict(
         attention_backend="triton",

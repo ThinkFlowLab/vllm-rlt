@@ -8,11 +8,14 @@ import multiprocessing as mp
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
-from vllm_rlt.models import OuroConfig
+from vllm_rlt.models import OuroConfig, resolve_model_config
+from vllm_rlt.profiling import ProfileConfig
+from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
 
@@ -74,6 +77,8 @@ class PDEngine:
     ):
         if speculative_config is not None:
             raise ValueError("speculative decoding is not yet supported by PD")
+        if isinstance(model, (str, Path)):
+            model, revision, _ = resolve_model_config(model, revision=revision)
         self.config = pd_config or PDConfig()
         self.exit_config = exit_config or ExitConfig("ouro_delayed")
         execution = execution_config or ExecutionConfig(async_scheduling=True)
@@ -100,6 +105,11 @@ class PDEngine:
         self.outputs = deque()
         self.closed = False
         self.failure = None
+        self._profile_session = None
+        self._profile_replies = {}
+        self._profile_statuses = {}
+        self._profile_recording = False
+        self._profile_errors = []
         context = mp.get_context("spawn")
         epoch = uuid.uuid4().hex
         try:
@@ -180,6 +190,11 @@ class PDEngine:
 
     def _message(self, peer, m):
         kind = m["kind"]
+        if kind == "profile_reply":
+            pending = self._profile_replies.get(m.get("control_id"))
+            if pending is not None and m.get("session_id") == self._profile_session:
+                pending[peer.name] = m
+            return
         if kind == "fatal":
             raise RuntimeError(f"PD {peer.role} failed:\n{m['error']}")
         if kind == "ready":
@@ -423,7 +438,151 @@ class PDEngine:
             self._terminate()
             raise
 
+    def _profile_manifest(self):
+        result = dict(
+            session_id=self._profile_session,
+            recording=self._profile_recording,
+            errors=getattr(self, "_profile_errors", []),
+            ranks={
+                str(rank): dict(
+                    worker=name, **self._profile_statuses.get(name, {"state": "missing"})
+                )
+                for rank, name in enumerate(self.peers)
+            },
+        )
+        result["artifacts_complete"] = all(
+            rank.get("artifacts_complete", False) for rank in result["ranks"].values()
+        )
+        result["success"] = (
+            bool(result["ranks"])
+            and not result["errors"]
+            and all(rank.get("success", False) for rank in result["ranks"].values())
+        )
+        if self._profile_session:
+            result["capture_time"] = self._profile_timestamp
+            _write_json_atomic(
+                self._profile_root / f"manifest-{self._profile_timestamp}.json", result
+            )
+        return result
+
+    def _profile_control(self, action, *, timeout=None, **fields):
+        if self.closed:
+            raise RuntimeError("PD engine is closed")
+        control_id = uuid.uuid4().hex
+        replies = {}
+        self._profile_replies[control_id] = replies
+        deadline = time.monotonic() + (self.config.startup_timeout if timeout is None else timeout)
+        try:
+            for rank, name in enumerate(self.peers):
+                self._send(
+                    name,
+                    "profile_" + action,
+                    control_id=control_id,
+                    session_id=self._profile_session,
+                    rank=rank,
+                    **fields,
+                )
+            while len(replies) < len(self.peers):
+                self._poll()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("PD profile control timed out")
+                time.sleep(0.001)
+        finally:
+            self._profile_replies.pop(control_id, None)
+            for name in self.peers:
+                reply = replies.get(name)
+                self._profile_statuses[name] = (
+                    reply.get("result", {"state": "failed", "error": reply.get("error")})
+                    if reply
+                    else {"state": "missing", "error": "no profile acknowledgment"}
+                )
+            if len(replies) == len(self.peers) and not any("error" in r for r in replies.values()):
+                self._profile_recording = any(
+                    r.get("recording", False) for r in self._profile_statuses.values()
+                )
+            self._profile_manifest()
+        errors = {name: reply["error"] for name, reply in replies.items() if "error" in reply}
+        if errors:
+            raise RuntimeError(f"PD profiling failed: {errors}")
+        return self._profile_manifest()
+
+    def start_profile(self, config, *, scheduled=False):
+        if isinstance(config, dict):
+            config = ProfileConfig(**config)
+        if self._profile_session:
+            self.profile_status()
+        if self._profile_recording:
+            raise RuntimeError("a profiling session is already active")
+        if self._profile_session:
+            if any(
+                s.get("recording") or not s.get("artifacts_complete", True)
+                for s in self._profile_statuses.values()
+            ):
+                raise RuntimeError("previous profile session has not finished")
+        self._profile_session = uuid.uuid4().hex
+        self._profile_timestamp = profile_timestamp(config.output_dir)
+        self._profile_root = Path(config.output_dir).expanduser().resolve()
+        self._profile_root.mkdir(parents=True, exist_ok=True)
+        self._profile_statuses = {}
+        self._profile_errors = []
+        self._profile_recording = True
+        try:
+            return self._profile_control(
+                "start",
+                config=asdict(config),
+                scheduled=scheduled,
+                capture_time=self._profile_timestamp,
+            )
+        except BaseException as exc:
+            self._profile_errors.append(str(exc))
+            self._profile_recording = False
+            try:
+                self._profile_control("stop", timeout=self.config.shutdown_timeout)
+            except Exception:
+                pass  # Preserve the original failure; per-rank failures remain in manifest.
+            raise
+
+    def stop_profile(self):
+        if not self._profile_session:
+            return {"recording": False, "ranks": {}}
+        self._profile_control("stop")
+        self._profile_recording = False
+        return self._profile_manifest()
+
+    def profile_status(self):
+        if not self._profile_session:
+            return {"recording": False, "ranks": {}}
+        if self.closed:
+            return self._profile_manifest()
+        return self._profile_control("status")
+
+    def wait_for_profile_artifacts(self, timeout=None):
+        if self._profile_session:
+            self.profile_status()
+        if self._profile_recording:
+            raise RuntimeError("stop profiling before waiting for artifacts")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._profile_session:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            result = self._profile_control("status", timeout=remaining)
+            if all(s.get("artifacts_complete", False) for s in self._profile_statuses.values()):
+                return result
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("PD profile artifacts are still processing")
+            time.sleep(0.02)
+        return {"recording": False, "ranks": {}}
+
     def _terminate(self):
+        if self._profile_session:
+            self._profile_recording = False
+            for name in self.peers:
+                self._profile_statuses[name] = dict(
+                    state="incomplete", error=self.failure or "terminated"
+                )
+            try:
+                self._profile_manifest()
+            except OSError:
+                pass
         # Fail closed: stop all remote writers before destroying receive pools.
         for role in ("prefill", "decode"):
             selected = [p for p in self.peers.values() if p.role == role]
@@ -447,6 +606,9 @@ class PDEngine:
                 self.abort_request(rid)
             deadline = time.monotonic() + self.config.shutdown_timeout
             self._wait(lambda: not self.transfers, deadline)
+            if self._profile_session:
+                self.stop_profile()
+                self.wait_for_profile_artifacts(max(0, deadline - time.monotonic()))
             for peer in self.peers.values():
                 self._send(peer.name, "stop")
             self._wait(lambda: all(p.stopped for p in self.peers.values()), deadline)

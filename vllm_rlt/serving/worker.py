@@ -107,6 +107,34 @@ class EngineWorker:
     async def _call(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(self.executor, fn, *args)
 
+    async def profile_control(self, action, config=None, *, scheduled=False, timeout=60):
+        if not self.ready or self.stopping:
+            raise ServingError.not_ready()
+        if action == "start":
+            return await self._call(lambda: self.engine.start_profile(config, scheduled=scheduled))
+        if action == "stop":
+            return await self._call(self.engine.stop_profile)
+        if action == "status":
+            return await self._call(self.engine.profile_status)
+        if action != "wait":
+            raise ValueError("unknown profile action")
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            status = await self._call(self.engine.profile_status)
+            if status.get("recording"):
+                raise RuntimeError("stop profiling before waiting for artifacts")
+            ranks = status.get("ranks")
+            complete = (
+                all(r.get("artifacts_complete", False) for r in ranks.values())
+                if ranks is not None
+                else status.get("artifacts_complete", not status.get("jobs"))
+            )
+            if complete:
+                return status
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("profile artifacts are still processing")
+            await asyncio.sleep(0.05)
+
     def _load(self):
         self.engine, self.tokenizer = self.factory()
 

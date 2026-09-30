@@ -2,12 +2,14 @@
 
 import math
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +226,7 @@ def test_empty_adapters_preserve_layer_and_tensor_validation():
 
 def test_one_preparation_and_position_tensor_per_core_across_24_layers(monkeypatch):
     torch.manual_seed(43)
-    config = OuroConfig.tiny(num_hidden_layers=24)
+    config = tiny_ouro_config(num_hidden_layers=24)
     model = OuroForCausalLM(config)
     cache = make_cache(
         num_layers=24, num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim
@@ -273,10 +275,47 @@ def test_one_preparation_and_position_tensor_per_core_across_24_layers(monkeypat
     finally:
         for handle in handles:
             handle.remove()
-    assert metadata_counts == [5] * 4
+    # Two staged host tensors (int64 addresses, int32 tables/lengths) per core traversal.
+    assert metadata_counts == [2] * 4
     assert len(layer_ids) == 96
     for traversal in range(4):
         group = layer_ids[traversal * 24 : (traversal + 1) * 24]
         assert len(set(group)) == 1
         assert group[0][1] == rotary_ids[traversal]
     assert all(reference() is None for reference in preparations)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_depth_batches_share_depth_independent_metadata(packed):
+    cache = make_cache(num_blocks=64)
+    if packed:
+        cache.attention = SimpleNamespace(generation=4)
+    assert cache.allocate("a", 7) and cache.allocate("b", 5)
+    ids = ["a"] * 3 + ["b"] * 2
+    positions = [4, 5, 6, 2, 3]
+    depth_sets = [[depth] * len(ids) for depth in range(4)]
+    batches = cache._prepare_batches(ids, depth_sets, positions, packed_prefill=packed)
+    for depths, batch in zip(depth_sets, batches):
+        single = cache._prepare_batch(ids, depths, positions, packed_prefill=packed)
+        assert batch.rows == single.rows and batch.allocations == single.allocations
+        assert batch.max_seqlen_q == single.max_seqlen_q
+        for name in (
+            "position_ids",
+            "write_blocks",
+            "write_offsets",
+            "block_tables",
+            "context_lengths",
+            "cu_seqlens_q",
+        ):
+            ours, reference = getattr(batch, name), getattr(single, name)
+            assert (ours is None) == (reference is None)
+            if ours is not None:
+                assert torch.equal(ours, reference), name
+    # Each depth addresses its own plane; depth-independent metadata is one copy.
+    assert len({tuple(batch.write_blocks.tolist()) for batch in batches}) == 4
+    for name in ("position_ids", "write_offsets", "context_lengths"):
+        assert len({getattr(batch, name).data_ptr() for batch in batches}) == 1
+    with pytest.raises(ValueError, match="depth"):
+        cache._prepare_batches(ids, [[0] * 5, [4] * 5], positions)
+    with pytest.raises(ValueError, match="equal lengths"):
+        cache._prepare_batches(ids, [[0] * 5, [1] * 4], positions)

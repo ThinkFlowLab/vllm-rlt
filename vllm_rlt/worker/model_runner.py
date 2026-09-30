@@ -12,7 +12,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import RecurrentGraphs
-from vllm_rlt.worker.sampling import sample_logits
+from vllm_rlt.worker.sampler import Sampler
 
 
 @dataclass
@@ -79,6 +79,7 @@ class ModelRunner:
         self.cache_manager = cache_manager
         parameter = next(model.parameters())
         self.device = parameter.device
+        self.sampler = Sampler(self.device)
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
         scheduler = scheduler_config or SchedulerConfig()
@@ -597,8 +598,9 @@ class ModelRunner:
             if stream is not None:
                 stream.synchronize()
 
-    def _sample(self, logits: torch.Tensor, request: Request) -> int:
-        return int(self._sample_tensor(logits, request).item())
-
     def _sample_tensor(self, logits: torch.Tensor, request: Request):
-        return sample_logits(logits, request)
+        # Thin delegate kept for the async path and for tests that monkeypatch
+        # this method; the algorithm lives in Sampler.
+        token, generator = self.sampler.sample(logits, request.sampling_params, request.generator)
+        request.generator = generator
+        return token

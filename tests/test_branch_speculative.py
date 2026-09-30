@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
+from tests.reference import dense_reference
 from vllm_rlt import (
     LLM,
     CacheConfig,
@@ -13,8 +15,7 @@ from vllm_rlt import (
 )
 from vllm_rlt.core.scheduler import ScheduledItem, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
-from vllm_rlt.models.reference import dense_reference
+from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.branch_speculative import BranchSpeculativeRunner
 from vllm_rlt.worker.speculative import SpeculativeRunner
@@ -22,7 +23,7 @@ from vllm_rlt.worker.speculative import SpeculativeRunner
 
 def model(seed=123, dtype=torch.float32):
     torch.manual_seed(seed)
-    return OuroForCausalLM(OuroConfig.tiny()).to(dtype=dtype)
+    return OuroForCausalLM(tiny_ouro_config()).to(dtype=dtype)
 
 
 def branch_engine(m, k=3, margin=1.0, draft_loops=2, **kwargs):
@@ -103,7 +104,7 @@ def test_enabled_fallback_rejects_sampling_before_enqueue():
 @pytest.mark.parametrize("draft_loops", [1, 2])
 def test_enabled_fallback_matches_native_and_plain(draft_loops):
     torch.manual_seed(0)
-    m = OuroForCausalLM(OuroConfig.tiny(vocab_size=8))
+    m = OuroForCausalLM(tiny_ouro_config(vocab_size=8))
     prompts = [[2], [3, 4, 5, 6, 7], [7, 3]]
     params = [SamplingParams(max_tokens=n, ignore_eos=True) for n in [2, 32, 24]]
     common = dict(
@@ -528,7 +529,7 @@ def assert_fork_chains(
 def test_branch_paths_match_serial_oracle(monkeypatch, dtype, device, backend, draft_loops, fork):
     if backend == "flash_attn_4":
         torch.manual_seed(123)
-        m = OuroForCausalLM(OuroConfig.tiny(hidden_size=256, head_dim=64)).to(
+        m = OuroForCausalLM(tiny_ouro_config(hidden_size=256, head_dim=64)).to(
             device=device, dtype=dtype
         )
     else:

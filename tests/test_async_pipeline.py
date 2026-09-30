@@ -3,9 +3,10 @@
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Stage
 from vllm_rlt.worker.model_runner import Submission
 
@@ -14,7 +15,7 @@ def make_engine(
     *, asynchronous=True, device="cpu", multi_stream=False, static=False, seqs=3, **kwargs
 ):
     torch.manual_seed(123)
-    base = OuroForCausalLM(OuroConfig.tiny()).to(device)
+    base = OuroForCausalLM(tiny_ouro_config()).to(device)
     return LLMEngine(
         base,
         cache_config=CacheConfig(128, 2),

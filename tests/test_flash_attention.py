@@ -1,15 +1,14 @@
 """Official paged attention: ragged prefixes, physical strides and async exits."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.kernels.flash_attention import FlashPagedAttention, select_version
 from vllm_rlt.kernels.paged_attention import torch_paged_attention
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import OuroForCausalLM
 
 
 @pytest.mark.parametrize(
@@ -75,7 +74,7 @@ def test_ragged_strided_paged_attention(dtype, heads):
 @pytest.mark.parametrize("static", [False, True])
 def test_flash_sync_async_mixed_depths(layout, static):
     torch.manual_seed(123)
-    config = replace(OuroConfig.tiny(), head_dim=64)
+    config = tiny_ouro_config(head_dim=64)
     model = OuroForCausalLM(config).to(device="cuda", dtype=torch.bfloat16)
     traces = {str(i): [4, 2 + i % 3, 4, 2, 3, 4] for i in range(3)}
     outputs = []

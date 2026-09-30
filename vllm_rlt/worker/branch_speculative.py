@@ -112,8 +112,8 @@ class _Plan:
 class BranchSpeculativeRunner(SpeculativeRunner):
     """One bounded top-2 fallback per request and round, greedily verified."""
 
-    def __init__(self, model, cache, config):
-        super().__init__(model, cache, config)
+    def __init__(self, model, cache, config, execution):
+        super().__init__(model, cache, config, execution)
         self.margin = config.fallback_margin
         self.stats = BranchSpeculativeStats()
 

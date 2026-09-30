@@ -11,7 +11,8 @@ from dataclasses import asdict, dataclass, field, replace
 import torch
 
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import AutoModelForCausalLM, OuroConfig, OuroForCausalLM
+from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.request import Stage
 
 from .transport import NixlConnector, kv_segments, partition_segments
@@ -23,6 +24,7 @@ class Work:
     request: object
     slot: int
     peer: str
+    trace_id: str | None = None
     target_tables: tuple = ()
     target_slot: int = 0
     cached_tokens: int = 0
@@ -51,8 +53,11 @@ class PDWorker:
         self.model = (
             OuroForCausalLM(model_source).to(device=f"cuda:{device}", dtype=dtype)
             if isinstance(model_source, OuroConfig)
-            else OuroForCausalLM.from_pretrained(
-                model_source, revision=options["revision"], device=f"cuda:{device}", dtype=dtype
+            else AutoModelForCausalLM.from_pretrained(
+                model_source,
+                revision=options["revision"],
+                device=f"cuda:{device}",
+                dtype=dtype,
             )
         )
         self.engine = LLMEngine(self.model, **options["engine"])
@@ -138,7 +143,9 @@ class PDWorker:
             self.send("rejected", tid=tid, role=self.role)
             return
         self.cache.pin_transfer(tid, tid)
-        w = Work(tid, request, self.free_slots.pop(), command["peer"])
+        w = Work(
+            tid, request, self.free_slots.pop(), command["peer"], trace_id=command.get("trace_id")
+        )
         w.cached_tokens = hit
         self.work[tid] = w
         if self.role == "decode":
@@ -163,6 +170,43 @@ class PDWorker:
 
     def command(self, command):
         kind = command["kind"]
+        if kind.startswith("profile_"):
+            try:
+                action = kind.removeprefix("profile_")
+                if action == "start":
+                    result = self.engine.start_profile(
+                        ProfileConfig(**command["config"]),
+                        scheduled=command["scheduled"],
+                        session_id=command["session_id"],
+                        capture_time=command["capture_time"],
+                        rank=command["rank"],
+                        role=self.role,
+                        managed_manifest=False,
+                    )
+                else:
+                    current = self.engine.profile_status().get("session_id")
+                    if current is not None and current != command["session_id"]:
+                        raise ValueError("profile session ID mismatch")
+                    if action == "stop":
+                        result = self.engine.stop_profile()
+                    elif action == "status":
+                        result = self.engine.profile_status()
+                    else:
+                        raise ValueError("unknown profile action")
+                self.send(
+                    "profile_reply",
+                    control_id=command["control_id"],
+                    session_id=command["session_id"],
+                    result=result,
+                )
+            except Exception as exc:
+                self.send(
+                    "profile_reply",
+                    control_id=command["control_id"],
+                    session_id=command["session_id"],
+                    error=str(exc),
+                )
+            return
         if kind == "connect":
             for peer in command["peers"]:
                 self.connector.connect(peer)
@@ -275,6 +319,7 @@ class PDWorker:
                     self.engine.scheduler.enqueue(request, Stage.PREFILL)
         # submit keeps its events; the prefill ticket has no readback slot.
         del ticket
+        return True
 
     def progress(self):
         self.cache.poll_prefixes()
@@ -350,7 +395,9 @@ class PDWorker:
                 self.command(self.channel.recv())
             self.progress()
             if self.role == "prefill":
-                self.prefill_step()
+                submitted = self.prefill_step()
+                if submitted:
+                    self.engine.profiling.step()
             elif any(w.active for w in self.work.values()):
                 for output in self.engine.step():
                     self.send("output", tid=output.request_id, output=output)
@@ -361,6 +408,7 @@ class PDWorker:
             if not self.work and not self.channel.poll():
                 time.sleep(0.001)
         self.engine.model_runner.synchronize()
+        self.engine.close()
         self.connector.close()
         self.send(
             "stopped",

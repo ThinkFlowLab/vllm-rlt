@@ -10,7 +10,6 @@ import subprocess
 import time
 from pathlib import Path
 
-MODEL_REVISION = "574fa66cb8bf5abdc979642d01cf2b79b16bfab1"
 DATA_REVISION = "740312add88f781978c0658806c59bc2815b9866"
 PACKAGES = ("torch", "transformers", "lm-eval", "datasets", "tokenizers", "triton")
 DEFAULT_CASE = Path(__file__).parent / "fixtures/gsm8k-87.json"
@@ -72,6 +71,29 @@ def select_doc_ids(population, *, limit, seed, split):
         ).digest(),
     )
     return sorted(ranked[:limit])
+
+
+def checkpoint_loops(config):
+    """Full recurrent depth of an Ouro checkpoint, from its config.json."""
+    loops = config.get("total_ut_steps")
+    if config.get("model_type") != "ouro" or type(loops) is not int or loops < 1:
+        raise ValueError("This evaluation requires an Ouro checkpoint with total_ut_steps >= 1")
+    return loops
+
+
+def fixed_exit(loops):
+    """The original recipe: every output token runs the checkpoint's full depth."""
+    return {
+        "mode": "ouro",
+        "threshold": 1.0,
+        "min_loops": loops,
+        "max_loops": loops,
+        "async_scheduling": False,
+    }
+
+
+def is_fixed(exit_policy):
+    return exit_policy["threshold"] == 1
 
 
 def baseline_fingerprint(protocol):
@@ -150,9 +172,7 @@ def prepare(args):
         raise ValueError("--limit must be positive")
     if not 0 < args.max_new_tokens < args.max_length or args.max_regression_pp < 0:
         raise ValueError("Invalid context/output budget or regression threshold")
-    config = json.loads((model / "config.json").read_text())
-    if config.get("model_type") != "ouro" or config.get("total_ut_steps") != 4:
-        raise ValueError("This evaluation requires the four-loop Ouro checkpoint")
+    loops = checkpoint_loops(json.loads((model / "config.json").read_text()))
     task = make_task(split=args.split)
     case = None
     if args.limit is None and not args.all:
@@ -182,9 +202,9 @@ def prepare(args):
     for path in sorted(files):
         metadata = get_hf_file_metadata(
             hf_hub_url(
-                "ByteDance/Ouro-1.4B",
+                args.model_repo,
                 path.name,
-                revision=MODEL_REVISION,
+                revision=args.model_revision,
             )
         )
         hashes[path.name] = file_digest(path)
@@ -193,12 +213,12 @@ def prepare(args):
         else:
             data = path.read_bytes()
             observed = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
-        if observed != metadata.etag or metadata.commit_hash != MODEL_REVISION:
+        if observed != metadata.etag or metadata.commit_hash != args.model_revision:
             raise ValueError(f"File does not match the pinned HF release: {path.name}")
     protocol = {
         "format_version": 1,
         "model": str(model),
-        "model_revision": MODEL_REVISION,
+        "model_revision": args.model_revision,
         "model_files": hashes,
         "task_config": task.dump_config(),
         "records": records,
@@ -206,7 +226,8 @@ def prepare(args):
         "max_new_tokens": args.max_new_tokens,
         "max_length": args.max_length,
         "dtype": "bfloat16",
-        "loops": 4,
+        # Fingerprinted: the stored four-loop baseline applies only when this is 4.
+        "loops": loops,
         "batch_size": 1,
         "add_special_tokens": False,
         "apply_chat_template": False,
@@ -236,6 +257,112 @@ def prepare(args):
             }
         )
     )
+
+
+def exit_settings(
+    backend, loops, mode="ouro", threshold=1.0, min_loops=None, async_scheduling=False
+):
+    """Validate one run's exit policy against the checkpoint's full depth ``loops``.
+
+    The default reproduces the fixed-depth recipe.
+    """
+    if not 0 <= threshold <= 1:
+        raise ValueError("--exit-threshold must be in [0, 1]")
+    if threshold == 1:
+        if (mode, min_loops, async_scheduling) != ("ouro", None, False):
+            raise ValueError("Exit options require --exit-threshold below 1")
+        return fixed_exit(loops)
+    if min_loops is None or not 1 <= min_loops <= loops:
+        raise ValueError(f"Adaptive exit requires an explicit --min-loops between 1 and {loops}")
+    if async_scheduling and mode != "ouro_delayed":
+        raise ValueError("--async-scheduling requires --exit-mode ouro_delayed")
+    if backend == "transformers" and (mode, min_loops) != ("ouro", 1):
+        # The release applies its threshold from the first loop and has no delayed mode.
+        raise ValueError("Transformers adaptive exit supports only --exit-mode ouro --min-loops 1")
+    return {
+        "mode": mode,
+        "threshold": threshold,
+        "min_loops": min_loops,
+        "max_loops": loops,
+        "async_scheduling": async_scheduling,
+    }
+
+
+def depth_summary(rows):
+    """Summarize native exit depths; the first output token is produced by prefill."""
+    if any("exit_depths" not in row for row in rows):
+        return None
+    decode = [row["exit_depths"][1:] for row in rows]
+    tokens = sum(len(depths) for depths in decode)
+    loops = [sum(depths) for depths in decode]
+    histogram = {}
+    for depths in decode:
+        for depth in depths:
+            histogram[str(depth)] = histogram.get(str(depth), 0) + 1
+    return {
+        "decode_tokens": tokens,
+        "mean_decode_depth": sum(loops) / tokens if tokens else None,
+        "decode_depth_histogram": dict(sorted(histogram.items())),
+        "decode_loops_per_question_mean": statistics.mean(loops),
+    }
+
+
+def first_difference(a, b):
+    """First index where two sequences differ; the shorter length if one is a prefix."""
+    return next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+
+
+def sequence_differences(pairs):
+    """Diagnostic token and exit-depth sequence differences per question (not gated).
+
+    Matching answers and accuracy can hide different executions, e.g. synchronous and
+    asynchronous runs of one exit policy. Each sequence is compared only where both runs
+    recorded it. Exit depth k is chosen with the prompt plus tokens[:k] as context, so a
+    depth difference at k <= the first token difference, with both runs having a depth at k,
+    means the two runs made different exit decisions on identical context
+    ("identical_context").
+    """
+    tokens, depths = [], []
+    token_compared = depth_compared = 0
+    for x, y in pairs:
+        tx, ty = x.get("token_ids"), y.get("token_ids")
+        token_first = None
+        if tx is not None and ty is not None:
+            token_compared += 1
+            if tx != ty:
+                token_first = first_difference(tx, ty)
+                tokens.append({"id": x["id"], "first_divergence": token_first})
+        dx, dy = x.get("exit_depths"), y.get("exit_depths")
+        if dx is not None and dy is not None:
+            depth_compared += 1
+            if dx != dy:
+                first = first_difference(dx, dy)
+                shared = token_first if token_first is not None else min(len(dx), len(dy))
+                # A difference only in length (one run stopped earlier) is not a decision.
+                decided = first < min(len(dx), len(dy))
+                depths.append(
+                    {
+                        "id": x["id"],
+                        "first_divergence": first,
+                        "identical_context": decided and first <= shared,
+                    }
+                )
+
+    def block(differing, compared):
+        firsts = [d["first_divergence"] for d in differing]
+        return {
+            "questions_compared": compared,
+            "questions_differing": len(differing),
+            "earliest_first_divergence": min(firsts, default=None),
+            "median_first_divergence": statistics.median(firsts) if firsts else None,
+            "questions": differing,
+        }
+
+    depth_block = block(depths, depth_compared)
+    depth_block["questions_differing_on_identical_context"] = sum(
+        d["identical_context"] for d in depths
+    )
+    return {"token_ids": block(tokens, token_compared), "exit_depths": depth_block}
 
 
 def score(task, row, text):
@@ -289,12 +416,23 @@ def run(args):
         and baseline_fingerprint(protocol) != protocol["baseline"]["protocol_fingerprint"]
     ):
         raise ValueError("Default case protocol changed after its HF baseline was frozen")
+    loops = protocol["loops"]
+    exit_policy = exit_settings(
+        args.backend,
+        loops,
+        args.exit_mode,
+        args.exit_threshold,
+        args.min_loops,
+        args.async_scheduling,
+    )
     if protocol["source"]["packages"] != source()["packages"]:
         raise ValueError("Evaluation package versions changed after preparation")
     model = Path(protocol["model"])
     for name, expected in protocol["model_files"].items():
         if file_digest(model / name) != expected:
             raise ValueError(f"Model file changed: {name}")
+    if checkpoint_loops(json.loads((model / "config.json").read_text())) != loops:
+        raise ValueError("Checkpoint depth differs from the protocol")
     if not os.environ.get("CUDA_VISIBLE_DEVICES") or torch.cuda.device_count() != 1:
         raise RuntimeError("Run with one scheduler-assigned GPU")
     output = Path(args.output)
@@ -311,12 +449,14 @@ def run(args):
         "expected_examples": len(protocol["records"]),
         "max_regression_pp": protocol["max_regression_pp"],
         "min_reference_accuracy_pct": protocol["min_reference_accuracy_pct"],
+        "loops": loops,
+        "exit": exit_policy,
     }
     write_json(output / "metadata.json", metadata)
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
     task = make_task(protocol["task_config"])
     start = time.monotonic()
-    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"])
+    generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
     load_seconds = time.monotonic() - start
     rows = []
     with (output / "samples.jsonl").open("x", buffering=1) as stream:
@@ -345,11 +485,14 @@ def run(args):
         "correct": sum(r["correct"] for r in rows),
         "unparseable": sum(r["unparseable"] for r in rows),
         "length_limited": sum(r["finish_reason"] == "length" for r in rows),
+        "generated_tokens_per_question_mean": statistics.mean(len(r["token_ids"]) for r in rows),
+        "depth": depth_summary(rows),
         "load_seconds": load_seconds,
         "generation_and_scoring_seconds": sum(r["seconds"] for r in rows),
         "samples_sha256": file_digest(output / "samples.jsonl"),
     }
-    if args.backend == "native" and "baseline" in protocol:
+    # The stored baseline describes fixed-depth generation only; its fingerprint fixes loops.
+    if args.backend == "native" and "baseline" in protocol and is_fixed(exit_policy):
         summary["baseline_comparison"] = baseline_result(protocol, rows)
     write_json(output / "summary.json", summary)
     print(json.dumps(summary, indent=2))
@@ -360,8 +503,8 @@ def compare(args):
     paths = [Path(args.transformers), Path(args.native)]
     summaries = [json.loads((p / "summary.json").read_text()) for p in paths]
     a, b = summaries
-    if (a["backend"], b["backend"]) != ("transformers", "native"):
-        raise ValueError("Expected Transformers reference and native candidate")
+    if {a["backend"], b["backend"]} - {"transformers", "native"}:
+        raise ValueError("Unknown backend")
     for key in (
         "protocol_sha256",
         "expected_examples",
@@ -393,17 +536,31 @@ def compare(args):
     result = {
         "examples": a["examples"],
         "split": a["split"],
-        "transformers_accuracy_pct": 100 * a["accuracy"],
-        "native_accuracy_pct": 100 * b["accuracy"],
-        "transformers_correct": a["correct"],
-        "native_correct": b["correct"],
+        # Summaries written before exit options existed used the fixed recipe, and the
+        # harness then accepted only four-loop checkpoints.
+        "reference": {
+            "backend": a["backend"],
+            "exit": a.get("exit", fixed_exit(4)),
+            "depth": a.get("depth"),
+        },
+        "candidate": {
+            "backend": b["backend"],
+            "exit": b.get("exit", fixed_exit(4)),
+            "depth": b.get("depth"),
+        },
+        "reference_accuracy_pct": 100 * a["accuracy"],
+        "candidate_accuracy_pct": 100 * b["accuracy"],
+        "reference_correct": a["correct"],
+        "candidate_correct": b["correct"],
         "delta_pp": delta,
         "paired_delta_stderr_pp": 100 * statistics.stdev(differences) / len(pairs) ** 0.5
         if len(pairs) > 1
         else None,
-        "reference_correct_native_wrong": sum(d == -1 for d in differences),
-        "reference_wrong_native_correct": sum(d == 1 for d in differences),
+        "reference_correct_candidate_wrong": sum(d == -1 for d in differences),
+        "reference_wrong_candidate_correct": sum(d == 1 for d in differences),
         "answer_disagreements": [x["id"] for x, y in pairs if x["answer"] != y["answer"]],
+        # Diagnostic only; the accuracy gate below does not use it.
+        "sequence_differences": sequence_differences(pairs),
         "max_regression_pp": a["max_regression_pp"],
         "passes_observed_accuracy_gate": (
             delta >= -a["max_regression_pp"]
@@ -414,6 +571,16 @@ def compare(args):
         ),
         "min_reference_accuracy_pct": a["min_reference_accuracy_pct"],
     }
+    if (a["backend"], b["backend"]) == ("transformers", "native"):
+        # Earlier key names, kept only for the original pairing where they are accurate.
+        result.update(
+            transformers_accuracy_pct=result["reference_accuracy_pct"],
+            native_accuracy_pct=result["candidate_accuracy_pct"],
+            transformers_correct=result["reference_correct"],
+            native_correct=result["candidate_correct"],
+            reference_correct_native_wrong=result["reference_correct_candidate_wrong"],
+            reference_wrong_native_correct=result["reference_wrong_candidate_correct"],
+        )
     write_json(args.output, result)
     print(json.dumps(result, indent=2))
     return result
@@ -427,6 +594,10 @@ def main():
         "--model",
         required=True,
         help="Local pinned Ouro checkpoint including official Python files",
+    )
+    p.add_argument("--model-repo", required=True, help="HF repository used to verify local files")
+    p.add_argument(
+        "--model-revision", required=True, help="Exact HF commit used to verify local files"
     )
     p.add_argument("--output", required=True)
     p.add_argument("--split", choices=["train", "test"], default="test")
@@ -448,9 +619,18 @@ def main():
     p.add_argument("--backend", choices=["transformers", "native"], required=True)
     p.add_argument("--protocol", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--exit-mode", choices=["ouro", "ouro_delayed"], default="ouro")
+    p.add_argument(
+        "--exit-threshold",
+        type=float,
+        default=1.0,
+        help="Cumulative exit probability; 1 keeps the fixed full-depth recipe",
+    )
+    p.add_argument("--min-loops", type=int, help="Required when --exit-threshold is below 1")
+    p.add_argument("--async-scheduling", action="store_true", help="Native ouro_delayed only")
     p = commands.add_parser("compare")
-    p.add_argument("--transformers", required=True)
-    p.add_argument("--native", required=True)
+    p.add_argument("--transformers", "--reference", dest="transformers", required=True)
+    p.add_argument("--native", "--candidate", dest="native", required=True)
     p.add_argument("--output", required=True)
     args = parser.parse_args()
     result = {"prepare": prepare, "run": run, "compare": compare}[args.command](args)

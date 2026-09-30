@@ -13,9 +13,10 @@ pytest.importorskip("aiohttp")
 from aiohttp import ClientPayloadError
 from aiohttp.test_utils import TestClient, TestServer
 
+from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroConfig, OuroForCausalLM
+from vllm_rlt.models import AutoModelForCausalLM, OuroForCausalLM
 from vllm_rlt.request import Stage
 from vllm_rlt.serving.protocol import (
     CompletionRequest,
@@ -66,7 +67,7 @@ class PauseAt:
 def factory(*, seqs=8, blocks=256, hook=None):
     torch.manual_seed(123)
     engine = LLMEngine(
-        OuroForCausalLM(OuroConfig.tiny()),
+        OuroForCausalLM(tiny_ouro_config()),
         cache_config=CacheConfig(num_blocks=blocks, block_size=2),
         scheduler_config=SchedulerConfig(max_num_seqs=seqs, max_num_batched_tokens=3),
     )
@@ -85,7 +86,7 @@ async def until(predicate):
 
 @asynccontextmanager
 async def client_for(load=factory, **kwargs):
-    app = create_app(load, limits=ServingLimits(**kwargs))
+    app = create_app(load, model="test-model", limits=ServingLimits(**kwargs))
     client = TestClient(TestServer(app, handler_cancellation=True))
     await client.start_server()
     try:
@@ -96,7 +97,7 @@ async def client_for(load=factory, **kwargs):
 
 def body(**kwargs):
     return {
-        "model": "ByteDance/Ouro-1.4B",
+        "model": "test-model",
         "prompt": "abc",
         "max_tokens": 4,
         "ignore_eos": True,
@@ -131,7 +132,7 @@ def body(**kwargs):
 )
 def test_validation(extra):
     with pytest.raises((ValueError, TypeError)):
-        CompletionRequest.parse(body(**extra), "ByteDance/Ouro-1.4B")
+        CompletionRequest.parse(body(**extra), "test-model")
 
 
 def test_neutral_client_fields_and_extensions():
@@ -147,7 +148,7 @@ def test_neutral_client_fields_and_extensions():
             top_k=9,
             top_p=0.8,
         ),
-        "ByteDance/Ouro-1.4B",
+        "test-model",
     )
     assert spec.include_usage and spec.params.max_loops == 3 and spec.params.top_k == 9
 
@@ -190,7 +191,7 @@ def test_byte_decoder_unicode_special_tokens_and_final_flush(monkeypatch):
 
 
 @pytest.mark.parametrize("byte_level", [False, True])
-def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level):
+def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level, tmp_path):
     tokenizers = pytest.importorskip("tokenizers")
     transformers = pytest.importorskip("transformers")
     from vllm_rlt.entrypoints.serve import load_engine
@@ -202,11 +203,12 @@ def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level
 
     def load_model(*args, **kwargs):
         loaded.append(True)
-        return OuroForCausalLM(OuroConfig.tiny())
+        return OuroForCausalLM(tiny_ouro_config())
 
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_model)
     monkeypatch.setattr(OuroForCausalLM, "from_pretrained", load_model)
     args = SimpleNamespace(
-        model="local-model",
+        model=str(tmp_path),
         tokenizer=None,
         revision=None,
         tokenizer_revision=None,
@@ -219,6 +221,7 @@ def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level
         mode="refill",
         attention_backend="torch",
     )
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "ouro"}))
     if byte_level:
         engine, actual = load_engine(args)
         assert actual is tokenizer and loaded
@@ -227,6 +230,42 @@ def test_load_engine_checks_decoder_before_loading_model(monkeypatch, byte_level
         with pytest.raises(ValueError, match="byte-level tokenizer"):
             load_engine(args)
         assert not loaded
+
+
+def test_load_engine_allows_non_byte_level_tokenizer_for_nanbeige(monkeypatch, tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    from tests.helpers import tiny_nanbeige_config
+    from vllm_rlt.entrypoints.serve import load_engine
+    from vllm_rlt.models import NanbeigeForCausalLM
+
+    decoder = tokenizers.decoders.WordPiece()
+    tokenizer = SimpleNamespace(backend_tokenizer=SimpleNamespace(decoder=decoder))
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer)
+    loaded = []
+
+    def load_model(*args, **kwargs):
+        loaded.append(True)
+        return NanbeigeForCausalLM(tiny_nanbeige_config())
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_model)
+    args = SimpleNamespace(
+        model=str(tmp_path),
+        tokenizer=None,
+        revision=None,
+        tokenizer_revision=None,
+        device="cpu",
+        dtype="float32",
+        num_blocks=16,
+        block_size=2,
+        max_num_seqs=1,
+        max_num_batched_tokens=3,
+        mode="refill",
+        attention_backend="torch",
+    )
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "nanbeige"}))
+    engine, actual = load_engine(args)
+    assert actual is tokenizer and loaded
 
 
 def test_startup_readiness_failure_and_shutdown_during_load():
@@ -317,6 +356,7 @@ def test_shutdown_cleans_http_and_engine_state(caplog, expired):
         pause, cleaned = PauseAt(Stage.PREFILL), asyncio.Event()
         app = create_app(
             lambda: factory(hook=pause),
+            model="test-model",
             limits=ServingLimits(shutdown_timeout=0.01 if expired else 5),
         )
 
@@ -659,7 +699,7 @@ def test_write_deadline_aborts_socket_without_blocking_other_clients(monkeypatch
 @pytest.mark.parametrize("value", [None, "", 1, [], True])
 def test_invalid_trace_id(value):
     with pytest.raises(ValueError, match="trace_id"):
-        CompletionRequest.parse(body(trace_id=value), "ByteDance/Ouro-1.4B")
+        CompletionRequest.parse(body(trace_id=value), "test-model")
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -671,7 +711,7 @@ def test_http_trace_selection_and_concurrent_reuse(asynchronous):
 
         def load():
             engine = LLMEngine(
-                OuroForCausalLM(OuroConfig.tiny()),
+                OuroForCausalLM(tiny_ouro_config()),
                 cache_config=CacheConfig(num_blocks=256, block_size=2),
                 exit_config=ExitConfig("trace", depths_by_request={"A": [4, 2, 3, 2]}),
                 execution_config=ExecutionConfig(async_scheduling=asynchronous),
@@ -716,7 +756,7 @@ def test_speculative_http_and_stream_deliver_entire_committed_suffix():
 
     def load():
         torch.manual_seed(123)
-        m = OuroForCausalLM(OuroConfig.tiny())
+        m = OuroForCausalLM(tiny_ouro_config())
 
         # Force full acceptance of a printable token so this test exercises
         # multi-token chunks regardless of random tiny-model draft quality.
