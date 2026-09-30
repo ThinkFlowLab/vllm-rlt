@@ -355,6 +355,10 @@ def test_pd_nanbeige_1p1d_matches_single_engine():
     config = tiny_nanbeige_config(head_dim=16)
     params = SamplingParams(max_tokens=4, temperature=0.0)  # greedy
     
+    # Nanbeige fixed 2-loop: prefill uses depth=2, decode also uses depth=2
+    # Trace needs: [prefill_depth, decode_token1, decode_token2, ...]
+    trace_depths = [2] * (1 + params.max_tokens)  # 1 prefill + max_tokens decode
+    
     # Create PD engine with Nanbeige
     pd_engine = PDEngine(
         config,
@@ -372,7 +376,7 @@ def test_pd_nanbeige_1p1d_matches_single_engine():
             max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=8
         ),
         decode_scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=2),
-        exit_config=ExitConfig("fixed", max_depth=2),
+        exit_config=ExitConfig("trace", depths_by_request={"pd_0": trace_depths, "pd_1": trace_depths}),
         execution_config=ExecutionConfig(async_scheduling=True),
         attention_backend="triton",
         seed=42,
@@ -385,7 +389,7 @@ def test_pd_nanbeige_1p1d_matches_single_engine():
         model,
         cache_config=CacheConfig(64, 4, "last_exited"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
-        exit_config=ExitConfig("fixed", max_depth=2),
+        exit_config=ExitConfig("trace", depths_by_request={"ref_0": trace_depths, "ref_1": trace_depths}),
         attention_backend="triton",
     )
     
@@ -393,8 +397,8 @@ def test_pd_nanbeige_1p1d_matches_single_engine():
     
     try:
         for i, prompt in enumerate(prompts):
-            pd_engine.add_request(f"pd_{i}", prompt, params)
-            reference_engine.add_request(f"ref_{i}", prompt, params)
+            pd_engine.add_request(f"pd_{i}", prompt, params, trace_id=f"pd_{i}")
+            reference_engine.add_request(f"ref_{i}", prompt, params, trace_id=f"ref_{i}")
         
         pd_outputs = drain(pd_engine)
         ref_outputs = drain(reference_engine)
@@ -415,5 +419,5 @@ def test_pd_nanbeige_1p1d_matches_single_engine():
         pd_engine.close()
     
     assert all(not p.process.is_alive() for p in pd_engine.peers.values())
-    assert all(m["used_blocks"] == 0 for m in pd_engine.worker_metrics.values())
-    assert all(x["used_blocks"] == 0 for x in stats)
+    stats = pd_engine.worker_metrics.values()
+    assert all(m["used_blocks"] == 0 for m in stats)
