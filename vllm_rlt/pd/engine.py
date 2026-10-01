@@ -1,16 +1,19 @@
 """CPU coordinator for independent prefill/decode GPU pools.
 
 D reservations precede P computation. Control channels carry only metadata and
-outputs; NIXL moves KV directly between registered worker allocations.
+outputs and CPU-staged full-weight chunks; NIXL moves KV between GPU pools.
 """
 
 import multiprocessing as mp
 import time
 import uuid
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
+
+import torch
 
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.models import OuroConfig, resolve_model_config
@@ -55,6 +58,7 @@ class Pending:
     d_released: bool = False
     finished: bool = False
     timings: dict = field(default_factory=dict)
+    latest_output: RequestOutput | None = None
 
 
 class PDEngine:
@@ -74,6 +78,7 @@ class PDEngine:
         revision=None,
         seed=0,
         speculative_config=None,
+        terminate_workers_on_failure: bool = True,
     ):
         if speculative_config is not None:
             raise ValueError("speculative decoding is not yet supported by PD")
@@ -105,6 +110,12 @@ class PDEngine:
         self.outputs = deque()
         self.closed = False
         self.failure = None
+        self.terminate_workers_on_failure = terminate_workers_on_failure
+        self._weight_version = 0
+        self._update_version: int | None = None
+        self._update_failed = False
+        self._paused = False
+        self._weight_replies = {}
         self._profile_session = None
         self._profile_replies = {}
         self._profile_statuses = {}
@@ -190,6 +201,11 @@ class PDEngine:
 
     def _message(self, peer, m):
         kind = m["kind"]
+        if kind == "weight_reply":
+            replies = self._weight_replies.get(m["control_id"])
+            if replies is not None:
+                replies[peer.name] = m
+            return
         if kind == "profile_reply":
             pending = self._profile_replies.get(m.get("control_id"))
             if pending is not None and m.get("session_id") == self._profile_session:
@@ -249,6 +265,9 @@ class PDEngine:
         elif kind == "output":
             if not w.cancelled:
                 output = replace(m["output"], request_id=w.request.request_id)
+                if output.weight_version != w.request.weight_version:
+                    raise RuntimeError("PD workers returned a different policy version")
+                w.latest_output = output
                 w.request.generated_token_ids = list(output.token_ids)
                 w.request.exit_depths = list(output.exit_depths)
                 w.timings.setdefault("first_token", now)
@@ -296,6 +315,8 @@ class PDEngine:
     def add_request(self, request_id, prompt_token_ids, sampling_params=None, *, trace_id=None):
         if self.closed or self.failure:
             raise RuntimeError("PD engine is unavailable")
+        if self._paused or self._update_version is not None or self._update_failed:
+            raise RuntimeError("Generation admission is paused")
         if not isinstance(request_id, str) or not request_id or request_id in self.requests:
             raise ValueError("request ID must be nonempty and unique among active requests")
         if len(self.transfers) >= self.config.max_pending_requests:
@@ -306,9 +327,12 @@ class PDEngine:
             type(t) is not int or not 0 <= t < cfg.vocab_size for t in prompt_token_ids
         ):
             raise ValueError("prompt must contain valid model token IDs")
+        if any(t >= cfg.vocab_size for t in params.stop_token_ids):
+            raise ValueError("stop token IDs must be within the model vocabulary")
         maximum = params.max_loops or cfg.total_ut_steps
         if maximum > cfg.total_ut_steps or params.min_loops > maximum:
             raise ValueError("requested loop bounds exceed model depth")
+        params = replace(params, max_loops=maximum, top_k=min(params.top_k, cfg.vocab_size))
         if len(prompt_token_ids) + params.max_tokens - 1 > cfg.max_position_embeddings:
             raise ValueError("prompt plus decode exceeds context capacity")
         if trace_id is not None and (not isinstance(trace_id, str) or not trace_id):
@@ -335,7 +359,9 @@ class PDEngine:
                 if p.role == role
             ):
                 raise ValueError(f"request exceeds {role} KV pool capacity")
-        request = Request(request_id, list(prompt_token_ids), params)
+        request = Request(
+            request_id, list(prompt_token_ids), params, weight_version=self._weight_version
+        )
         w = Pending(request, uuid.uuid4().hex, trace_id)
         self.requests[request_id] = request
         self.transfers[w.tid] = w
@@ -412,7 +438,79 @@ class PDEngine:
                 self._send(w.p, "cancel", tid=w.tid)
         request.stage = Stage.FINISHED
         request.finish_reason = FinishReason.ABORT
+        if w.latest_output is not None:
+            return replace(w.latest_output, finished=True, finish_reason=FinishReason.ABORT.value)
         return RequestOutput.from_request(request)
+
+    def get_weight_version(self) -> int:
+        return self._weight_version
+
+    def pause_generation(self):
+        self._paused = True
+
+    def resume_generation(self):
+        if self._update_version is not None or self._update_failed:
+            raise RuntimeError("Complete the weight update before resuming generation")
+        self._paused = False
+
+    def _weight_control(self, action, **arguments):
+        control_id = uuid.uuid4().hex
+        replies = self._weight_replies[control_id] = {}
+        try:
+            for name in self.peers:
+                self._send(
+                    name,
+                    "weight_control",
+                    control_id=control_id,
+                    action=action,
+                    arguments=arguments,
+                )
+            self._wait(
+                lambda: len(replies) == len(self.peers),
+                time.monotonic() + self.config.request_timeout,
+            )
+            errors = [reply["error"] for reply in replies.values() if "error" in reply]
+            if errors:
+                raise RuntimeError("PD weight control failed: " + "; ".join(errors))
+            return [reply["version"] for reply in replies.values()]
+        except Exception:
+            # Some peers may already have copied or committed the new policy.
+            # Keep admission blocked until every peer completes a newer full update.
+            self._update_failed = True
+            raise
+        finally:
+            del self._weight_replies[control_id]
+
+    def reset_prefix_cache(self):
+        if self.has_unfinished_requests():
+            raise RuntimeError("Finish active PD transfers before resetting cached KV")
+        self._weight_control("reset_prefix_cache")
+
+    def start_weight_update(self, version: int | None = None):
+        if self.closed or self.failure or self.has_unfinished_requests():
+            raise RuntimeError("Weight updates require an available, idle PD engine")
+        latest = max(self._weight_version, self._update_version or 0)
+        version = latest + 1 if version is None else version
+        if type(version) is not int or version <= latest:
+            raise ValueError("PD weight version must exceed all previous update attempts")
+        self._update_version, self._update_failed = version, False
+        self._weight_control("start_weight_update", version=version)
+
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("Start a full PD weight update first")
+        # CPU staging avoids CUDA tensor ownership across spawned worker processes.
+        weights = [(name, tensor.detach().cpu()) for name, tensor in weights]
+        self._weight_control("update_weights", weights=weights)
+
+    def finish_weight_update(self):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("No successful PD weight update to finish")
+        versions = self._weight_control("finish_weight_update")
+        if any(version != self._update_version for version in versions):
+            self._update_failed = True
+            raise RuntimeError("PD workers committed different policy versions")
+        self._weight_version, self._update_version = self._update_version, None
 
     def has_unfinished_requests(self):
         return bool(self.transfers)
@@ -420,6 +518,8 @@ class PDEngine:
     def step(self):
         if self.closed:
             raise RuntimeError("PD engine is closed")
+        if self._update_version is not None or self._update_failed:
+            raise RuntimeError("Generation is unavailable during a PD weight update")
         try:
             self._poll()
             if any(
@@ -573,6 +673,9 @@ class PDEngine:
         return {"recording": False, "ranks": {}}
 
     def _terminate(self):
+        if not self.terminate_workers_on_failure:
+            self.closed = True
+            return
         if self._profile_session:
             self._profile_recording = False
             for name in self.peers:

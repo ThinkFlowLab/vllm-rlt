@@ -4,7 +4,7 @@ Temporary tensors belong to one execute call. Requests expose only committed
 outputs; the engine applies returned tokens and owns KV commit/truncation.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -14,6 +14,7 @@ from vllm_rlt.worker.sampling import (
     generator_for,
     probabilities,
     rejection_sample,
+    selected_logprob,
 )
 
 
@@ -22,6 +23,7 @@ class SpeculativeResult:
     token_ids: list[int]
     accepted_count: int
     draft_count: int
+    log_probs: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -163,6 +165,11 @@ class SpeculativeRunner:
                 )
                 start += item.token_count
                 results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+                if request.sampling_params.logprobs is not None:
+                    results[-1].log_probs.extend(
+                        selected_logprob(row, token, request.sampling_params)
+                        for row, token in zip(rows, tokens)
+                    )
                 continue
             start += item.token_count
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
@@ -183,6 +190,11 @@ class SpeculativeRunner:
                 )
                 tokens.append(int(token.item()))
             results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+            if request.sampling_params.logprobs is not None:
+                results[-1].log_probs.extend(
+                    selected_logprob(row, token, request.sampling_params)
+                    for row, token in zip(rows, tokens)
+                )
         self.stats.rounds += len(items)
         self.stats.drafted_tokens += sum(len(c) for c in candidates)
         self.stats.verified_rows += len(ids)

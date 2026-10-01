@@ -13,6 +13,7 @@ from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import RecurrentGraphs
 from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampling import selected_logprob
 
 
 @dataclass
@@ -603,4 +604,6 @@ class ModelRunner:
         # this method; the algorithm lives in Sampler.
         token, generator = self.sampler.sample(logits, request.sampling_params, request.generator)
         request.generator = generator
+        if request.sampling_params.logprobs is not None:
+            request.log_probs.append(selected_logprob(logits, token, request.sampling_params))
         return token

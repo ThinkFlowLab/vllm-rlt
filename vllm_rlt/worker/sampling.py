@@ -21,8 +21,19 @@ def probabilities(logits, params):
 
 def generator_for(request, device):
     if request.generator is None:
-        request.generator = torch.Generator(device=device).manual_seed(request.sampling_params.seed)
+        request.generator = torch.Generator(device=device)
+        if request.sampling_params.seed is None:
+            request.generator.seed()
+        else:
+            request.generator.manual_seed(request.sampling_params.seed)
     return request.generator
+
+
+def selected_logprob(logits, token, params):
+    if params.logprobs_mode == "processed" and params.temperature > 0:
+        return probabilities(logits, params)[token].log()
+    # Integer speculative tokens otherwise retain a view of the vocabulary row.
+    return logits.float().log_softmax(-1)[token].clone()
 
 
 def draw(probs, generator):

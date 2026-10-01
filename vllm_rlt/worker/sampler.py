@@ -41,5 +41,9 @@ class Sampler:
             remove[0] = False
             logits = logits.scatter(0, indices, sorted_logits.masked_fill(remove, -torch.inf))
         if generator is None:
-            generator = torch.Generator(device=self.device).manual_seed(params.seed)
+            generator = torch.Generator(device=self.device)
+            if params.seed is None:
+                generator.seed()
+            else:
+                generator.manual_seed(params.seed)
         return torch.multinomial(logits.softmax(-1), 1, generator=generator).squeeze(0), generator
