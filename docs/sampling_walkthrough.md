@@ -19,11 +19,19 @@ written during `M7 1/3`; sections that describe later increments say so explicit
 
 ## 1. Baseline and boundary
 
-Pinned baseline: `upstream/main @ 3314c1b`, the merge of PR #44. PR #44 added
-`worker/sampling.py` and routed `ModelRunner._sample_tensor` through
-`sampling.sample_logits()`; this increment replaces that one-line delegate with `Sampler`
-and leaves the speculative decoding path on `sampling.py`. Both modules therefore coexist
-until `M7 2/3` (section 6).
+Pinned baseline: `upstream/main @ 3314c1b`, the merge of PR #44; this increment was merged
+as PR #45 (`ea680f7`). PR #44 added `worker/sampling.py` and routed
+`ModelRunner._sample_tensor` through `sampling.sample_logits()`; this increment replaces
+that one-line delegate with `Sampler` and leaves the speculative decoding path on
+`sampling.py`. Both modules therefore coexist until `M7 2/3` (section 6).
+
+`3314c1b` is the PR base, so it predates this increment. The file and line references in
+sections 4 and 5 describe the merged snapshot instead (`ea680f7`, whose tree contains
+`worker/sampler.py` and the `Sampler` described there). Re-checking out `3314c1b` will not
+show that code: at the base the arithmetic is still inline in `_sample_tensor` and
+`worker/sampler.py` does not exist. `main` has moved past the merged snapshot too, so
+cross-module call sites are also named by symbol here; prefer the symbol when a number no
+longer matches.
 
 ### Call chain
 
@@ -105,9 +113,9 @@ speculative path. `rejection_sample()` is speculative-only and has no counterpar
 | First random sample (CODA) | Lazily creates `torch.Generator(device=...)` seeded from `params.seed` | `sampler.py:43-44` |
 | First random sample (speculative) | Lazily creates the same kind of generator on the `Request` | `sampling.py:22-25` |
 | Greedy sample | `argmax`, no generator created or advanced | `sampler.py:31-32` |
-| Request finishes | `scheduler.finish` sets `request.generator = None` | `scheduler.py:95` |
-| Request preempted | Not reset; the `Request` object and its generator are retained | `preemption.py:3`, `preemption.py:102` |
-| Request resumed | Not rebuilt; sampling continues on the same generator | `preemption.py:114-144` |
+| Request finishes | Sets `request.generator = None` | `Scheduler.finish` |
+| Request preempted | Not reset; the `Request` object and its generator are retained | `engine/preemption.py:3`, `PreemptionManager.preempt` |
+| Request resumed | Not rebuilt; sampling continues on the same generator | `PreemptionManager.resume` |
 
 Both modules write the same `Request.generator` slot, so the two creation sites must stay
 consistent until `M7 2/3` moves the RNG behind the runner (section 6). Speculative
@@ -220,14 +228,21 @@ but ownership is implicit: any change that treats `release()` as "termination re
 everything" can silently reset the RNG.
 
 **Preemption and termination share `model_runner.release()` (the key design
-constraint).** `preemption.py:102` calls `release()` when suspending a victim;
-`llm_engine.py:191` (abort) and `llm_engine.py:332` (finish) call the same method, and
-`pd/worker.py:107` (removal) and `pd/worker.py:305` (prefill compute release) do as
-well. Moving the RNG into the runner and deleting it inside `release()` would reset it
+constraint).** `PreemptionManager.preempt` calls `release()` when suspending a victim;
+`LLMEngine.abort_request` and `LLMEngine._finish` call the same method, and
+`PDWorker.remove` and the prefill compute release in `PDWorker.progress` do as well.
+Moving the RNG into the runner and deleting it inside `release()` would reset it
 on preemption, changing the token sequence after restoration. That would violate the
-`preemption.py:3` contract and the RFC acceptance criterion for fixed-seed sampling
-across preemption/restoration. RNG migration must therefore distinguish "termination
-release" from "preemption suspend" (see section 6).
+`engine/preemption.py` module contract and the RFC acceptance criterion for fixed-seed
+sampling across preemption/restoration. RNG migration must therefore distinguish
+"termination release" from "preemption suspend" (see section 6).
+
+The prefill-side compute release needs no separate path for RNG purposes: the prefill
+role owns only prompt KV and never samples (`pd/worker.py`: "P owns only prompt KV and
+never samples. D owns all sampling/RNG."), and only the decode role reaches `Stage.CODA`.
+`release()` there therefore cannot drop a generator that is still in use. The
+RNG-bearing termination sites are the decode worker's `remove()` and the engine's
+abort/finish.
 
 **Sampling had almost no unit coverage (test gap).** Before this increment the
 only coverage was batch invariance (`tests/test_engine.py:147`), a monkeypatched
@@ -262,15 +277,24 @@ RNG ownership is unchanged: `request.generator` is still read and written by the
 
 `M7 2/3` will, in order:
 
-1. Collapse `worker/sampling.py` into `Sampler`: move `probabilities()`, `draw()` and
-   `generator_for()` onto the class, retarget the `speculative.py` call sites, and delete
-   `sample_logits()`.
-2. Add a runner-side RNG registry (`dict[str, torch.Generator]`) and have both sampling
-   paths read and write it instead of `request.generator`.
-3. Split the release path: `suspend(request_id)` synchronizes the event and frees the
+1. Collapse `worker/sampling.py` into `Sampler` and retarget both call sites: move
+   `probabilities()` and `draw()` onto the class as helpers, move the speculative-only
+   `rejection_sample()` to `worker/speculative.py` (its only consumer), delete the unused
+   `sample_logits()`, and leave `worker/sampling.py` empty. `generator_for()` becomes the
+   registry lookup of step 3. The callers to retarget are `worker/speculative.py` and the
+   `tests/test_speculative.py` import of `probabilities`/`rejection_sample`.
+2. Delete the now-empty `worker/sampling.py` as its own commit, so the removal is
+   reviewed separately from the migration that emptied it.
+3. Add an RNG registry (`dict[str, torch.Generator]`) and have both sampling paths read
+   and write it instead of `request.generator`. The registry must be reachable from both
+   runners: `LLMEngine.__init__` builds `SpeculativeRunner` before `ModelRunner` and
+   passes neither to the other, so the registry belongs to the engine and is injected
+   into both rather than living privately on `ModelRunner`.
+4. Split the release path: `suspend(request_id)` synchronizes the event and frees the
    state slot but keeps the RNG (called by preemption); `release(request_id)` does the
-   same and additionally drops the RNG (called by abort, finish and PD removal).
-4. Remove `Request.generator` and the `scheduler.finish` assignment, then delete the
+   same and additionally drops the RNG (called by abort, finish and PD removal). The PD
+   prefill compute release stays on `release()` because that role never samples.
+5. Remove `Request.generator` and the `Scheduler.finish` assignment, then delete the
    temporary adapters.
 
 The unification must keep each path's RNG call order: the CODA path draws one
@@ -295,11 +319,13 @@ The target RNG contract:
 
 `ModelRunner._sample_tensor` exists so that `tests/test_async_pipeline.py:138` keeps
 working. It can be removed once that test patches `Sampler` instead, which is planned
-for `M7 2/3` when the runner-side registry lands and both sampling paths read it.
+for `M7 2/3` when the engine-owned registry lands and both sampling paths read it.
 
 ## 7. Validation
 
-`M7 1/3` CPU evidence (macOS, Python 3.12, PyTorch 2.14.0):
+`M7 1/3` CPU evidence (macOS, Python 3.12, PyTorch 2.14.0). These numbers are the PR #45
+review baseline at `3314c1b`; `main` has moved since and its current CPU result is not
+part of this increment's evidence.
 
 | Suite | Result |
 | --- | --- |
