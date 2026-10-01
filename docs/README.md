@@ -6,6 +6,7 @@ an environment to receiving the first generated response. The
 
 | Guide | Topics |
 | --- | --- |
+| [Developer Must-Read](developer-guide.md) | Requirement understanding, correctness, performance analysis, refactoring rules, and completion criteria |
 | [First-run user guide](launching.md) | Environment setup, model download, server startup, first request, CLI, Python API, and troubleshooting |
 | [Engine design](design.md) | Model stages, scheduling, and KV ownership |
 | [Scheduler walkthrough](scheduler_walkthrough.md) | Responsibilities, admission cases, control flow, and refactoring checklist |
