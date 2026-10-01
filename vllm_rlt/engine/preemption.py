@@ -22,19 +22,19 @@ class PreemptionManager:
         """Discard saved CPU state when a request will not be resumed."""
         self.snapshots.pop(request_id, None)
 
-    def _is_preemption_candidate(self, request, requester, *, priority_only):
+    def _is_preemption_candidate(self, request, requester, *, priority_only, excluded):
         """Check safety before considering a victim's priority.
 
-        Pending outputs, transfer leases and this batch's selected requests must
-        remain alive. priority_only additionally forbids evicting equal/higher
-        priority work to admit a new arrival.
+        Pending outputs, transfer leases and the current batch's selected
+        requests must remain alive. priority_only additionally forbids evicting
+        equal/higher priority work to admit a new arrival.
         """
         e = self.engine
         if (
             request is requester
             or request.stage in (Stage.WAITING, Stage.RECEIVING)
             or request.num_output_placeholders
-            or request.request_id in e.scheduler.selected_request_ids
+            or request.request_id in excluded
         ):
             return False
         if e.cache_manager._get_allocation(request.request_id).transfer_leases:
@@ -43,7 +43,7 @@ class PreemptionManager:
             request.sampling_params.priority > requester.sampling_params.priority
         )
 
-    def _select_preemption_victim(self, requester, *, priority_only):
+    def _select_preemption_victim(self, requester, *, priority_only, excluded):
         """Prefer lower priority, then a larger current-position KV footprint.
 
         Priority 10 loses to priority 0. The footprint tie-breaker uses
@@ -54,7 +54,9 @@ class PreemptionManager:
         candidates = (
             request
             for request in self.engine.scheduler.requests.values()
-            if self._is_preemption_candidate(request, requester, priority_only=priority_only)
+            if self._is_preemption_candidate(
+                request, requester, priority_only=priority_only, excluded=excluded
+            )
         )
         return max(
             candidates,
@@ -65,14 +67,20 @@ class PreemptionManager:
             default=None,
         )
 
-    def preempt(self, requester, *, priority_only=False):
+    def preempt(self, requester, *, priority_only=False, excluded=frozenset()):
         """Suspend one other request, preserving its recurrent execution state.
 
         Returns False if no safe victim exists. True means the victim's device
         resources have been released and it has been moved to WAITING; the
         requester must still retry its own allocation.
+
+        excluded names requests this call must not suspend. The Scheduler passes
+        the batch it is currently assembling explicitly, rather than exposing
+        that selection for the manager to read.
         """
-        victim = self._select_preemption_victim(requester, priority_only=priority_only)
+        victim = self._select_preemption_victim(
+            requester, priority_only=priority_only, excluded=excluded
+        )
         if victim is None:
             return False
         e = self.engine

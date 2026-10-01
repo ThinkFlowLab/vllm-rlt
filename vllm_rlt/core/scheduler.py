@@ -63,7 +63,6 @@ class Scheduler:
         self.speculative_config = speculative_config
         self.requests: dict[str, Request] = {}
         self.queues: dict[Stage, deque[str]] = {s: deque() for s in Stage}
-        self.selected_request_ids: set[str] = set()
         # Bound by Engine when preemption is enabled. These callbacks can copy
         # device state and mutate queues; they are operations, not predicates.
         self.preempt_callback = None
@@ -124,13 +123,15 @@ class Scheduler:
         A full engine may make room for a higher-priority arrival. The callback
         suspends another request and moves it to WAITING; it does not admit the
         requester. This operation can synchronize the runner and copy KV to CPU.
+        Admission runs before any batch is selected, so no request is excluded
+        from preemption here.
         """
         if active_count < self.config.max_num_seqs:
             return active_count
         if (
             self.config.policy == "priority"
             and self.preempt_callback is not None
-            and self.preempt_callback(requester, priority_only=True)
+            and self.preempt_callback(requester, priority_only=True, excluded=frozenset())
         ):
             return active_count - 1
         return None
@@ -306,17 +307,23 @@ class Scheduler:
             return ScheduledItem(request, request.position, count)
         return ScheduledItem(request)
 
-    def _ensure_execution_capacity(self, request: Request, frontier: int) -> bool:
+    def _ensure_execution_capacity(
+        self, request: Request, frontier: int, *, selected: set[str]
+    ) -> bool:
         """Grow KV for this step; if needed, preempt one other request and retry.
 
         frontier is an exclusive token count, not a loop count. Another loop at
-        the same token position normally uses existing capacity. The callback
-        excludes requests already selected into this batch.
+        the same token position normally uses existing capacity. selected holds
+        the requests already chosen for this batch; preemption must not suspend
+        them, so it is handed a frozen snapshot of that batch-local selection
+        instead of reading shared Scheduler state.
         """
         cache = self.cache_manager
         if cache.ensure_capacity(request.request_id, frontier):
             return True
-        if self.preempt_callback is None or not self.preempt_callback(request):
+        if self.preempt_callback is None or not self.preempt_callback(
+            request, excluded=frozenset(selected)
+        ):
             return False
         return cache.ensure_capacity(request.request_id, frontier)
 
@@ -327,9 +334,15 @@ class Scheduler:
         queue length so a blocked request cannot cycle forever in this call.
         Successful items leave the queue; the engine later updates progress and
         enqueues their next stage after handling execution results.
+
+        The selection set is local to this one batch construction. Direct
+        callers such as the PD prefill worker, and later scheduling calls, can
+        therefore neither inherit nor accumulate protection from an earlier
+        batch.
         """
         token_budget = self.config.max_num_batched_tokens
         items = []
+        selected: set[str] = set()
         queue = self.queues[stage]
         remaining = len(queue)
         while queue and token_budget and len(items) < self.config.max_num_seqs and remaining:
@@ -342,11 +355,11 @@ class Scheduler:
                     if stage in (Stage.PREFILL, Stage.SPECULATIVE)
                     else request.position + 1
                 )
-                if not self._ensure_execution_capacity(request, frontier):
+                if not self._ensure_execution_capacity(request, frontier, selected=selected):
                     queue.append(request.request_id)
                     continue
             # Selecting A must prevent B's later capacity check from evicting A.
-            self.selected_request_ids.add(request.request_id)
+            selected.add(request.request_id)
             items.append(item)
             token_budget -= item.token_count
         if not items:
@@ -362,7 +375,6 @@ class Scheduler:
         filling available slots. The stage policy decides when to call _admit;
         merely checking whether requests exist must not allocate or preempt.
         """
-        self.selected_request_ids.clear()
         if not self.requests:
             return None
         return self.policy.schedule(self, prefer_recurrent=prefer_recurrent)

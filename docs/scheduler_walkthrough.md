@@ -144,7 +144,7 @@ When C is considered again, `_admit()` calls `_try_resume()`. The existing callb
 | Prefill fairness counter | `SchedulingPolicy` owns the counter and records only nonempty scheduled batches |
 | Termination reason | `Request` uses `FinishReason`; `RequestOutput` converts it to a plain string |
 | Cancellation cleanup | `abort()` delegates to `finish()`, removing duplicate queue cleanup |
-| Selected-request protection | `protected` becomes `selected_request_ids`, identifying requests excluded from subsequent preemption |
+| Selected-request protection | The batch under construction passes its selection to preemption as a frozen `excluded` set; the Scheduler holds no selection state |
 | Batch return contract | `_take()` explicitly returns `SchedulerOutput` or `None` |
 
 The intentional accounting fix is that an empty batch neither increments the prefill counter nor resets it for recurrent execution. Accounting occurs when a nonempty batch is scheduled, without waiting for GPU completion.
@@ -158,7 +158,7 @@ Admission budgets, priority rules, callback contracts, and stage ordering are pr
 | Configuration | `max_prefill_batches_before_decode` | Prefill fairness threshold |
 | Policy state | `prefill_batches_since_recurrent` | Nonempty prefill batches scheduled since the last nonempty recurrent batch |
 | No-refill state | `phase` | FILL, CORE, or CODA |
-| Current selection state | `selected_request_ids` | Requests already selected and excluded from subsequent capacity-driven preemption |
+| Current selection state | local `selected` set inside `_take()` | Requests already chosen for the batch under construction, handed to preemption as a frozen exclusion set |
 
 FILL prepares the next group of recurrent work; it is distinct from request stage `Stage.PREFILL`. CORE drains recurrent work, CODA processes tokens leaving recurrence, and the policy then returns to FILL.
 
@@ -174,8 +174,7 @@ A scheduling call need not attempt admission. Successful admission does not impl
 
 ```mermaid
 flowchart TD
-    A["Scheduler.schedule"] --> B["Clear selected_request_ids"]
-    B --> C{"No requests?"}
+    A["Scheduler.schedule"] --> C{"No requests?"}
     C -- Yes --> N["Return None"]
     C -- No --> D["Invoke policy.schedule"]
     D --> E["Inspect queues and policy state"]
@@ -297,7 +296,7 @@ required_blocks + reserved_growth_blocks + admission_headroom_blocks + cached_cl
 
 `capacity_tokens` equals prompt length plus `max_tokens - 1`: the final sampled token is not fed back into the model. `initial_tokens` defines the extent covered by the initial allocation, usually through the next prefill chunk under incremental allocation.
 
-`resume_callback` returns `None` for no snapshot, `True` for completed restoration and enqueueing, or `False` for blocked restoration. `preempt_callback` receives the request needing resources and selects a different request as the victim.
+`resume_callback` returns `None` for no snapshot, `True` for completed restoration and enqueueing, or `False` for blocked restoration. `preempt_callback` receives the request needing resources and the batch-local exclusion set, and selects a different request as the victim.
 
 ## 7. Batch construction flow
 
@@ -336,7 +335,9 @@ Capacity checks apply to PREFILL, PRELUDE, and RECURRENT. CODA does not request 
 
 Suppose A is selected before B, and B's failed growth attempt triggers preemption. Preempting A at that point would invalidate resources referenced by the batch under construction. Selected requests must therefore be excluded from subsequent victim selection.
 
-`schedule()` clears `selected_request_ids` at entry; `_take()` adds each selected request. The set is not a GPU-completion indicator and does not replace Runner events or synchronization. The preemption manager currently reads it directly; a future interface may pass explicit excluded request IDs instead.
+That exclusion is an argument of one batch construction, not Scheduler state. `_take()` owns a local `selected` set, grows it as items are chosen, and passes a frozen copy to the preemption callback through `excluded`. `_ensure_active_slot()` passes an empty set, because admission runs before any request is selected for the batch. The selection is not a GPU-completion indicator and does not replace Runner events or synchronization.
+
+Because no exclusion is stored on the Scheduler, it cannot leak into a later batch, into a direct `_take()` caller such as the PD prefill worker, or into a reused request ID. `preempt()` defaults `excluded` to an empty set, so a direct caller selects among every safe victim.
 
 ## 9. Termination reasons and cleanup
 

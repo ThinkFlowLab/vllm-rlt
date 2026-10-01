@@ -102,7 +102,6 @@ def test_lossless_preemption_preserves_looped_history():
             assert generator is not None
             state = generator.get_state().clone()
             e.add_request("b", [5], SamplingParams(max_tokens=1))
-            e.scheduler.selected_request_ids.clear()
             assert e.preemption.preempt(e.scheduler.requests["b"])
             assert "a" in e.preemption.snapshots
             # Suspension shares release() with termination, and the RNG survives
