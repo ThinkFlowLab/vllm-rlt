@@ -92,7 +92,6 @@ class Scheduler:
         request.hidden_state = None
         request.input_token_tensor = None
         request.num_output_placeholders = 0
-        request.generator = None
         self.requests.pop(request.request_id)
 
     def abort(self, request_id: str) -> Request:

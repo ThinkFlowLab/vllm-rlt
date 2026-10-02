@@ -20,8 +20,8 @@ from vllm_rlt.core.scheduler import ScheduledItem, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request, Stage
-from vllm_rlt.worker.sampling import probabilities, rejection_sample
-from vllm_rlt.worker.speculative import greedy_accept
+from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.speculative import greedy_accept, rejection_sample
 
 
 def model(seed=123, dtype=torch.float32):
@@ -282,6 +282,48 @@ def test_sampling_seeded_replay_and_request_isolation(top_k, top_p):
     assert [run([p])[0].token_ids for p in prompts] == [o.token_ids for o in batched]
 
 
+def test_both_runners_share_the_engine_rng_registry():
+    # The registry belongs to the engine because LLMEngine builds SpeculativeRunner
+    # before ModelRunner and passes neither to the other. If the two runners held
+    # separate registries, preemption and termination would stop covering the
+    # speculative path's RNG.
+    e = engine(model())
+    assert e.model_runner.rng is e.rng
+    assert e.speculative_runner.rng is e.rng
+
+    plain = LLMEngine(model())
+    assert plain.model_runner.rng is plain.rng
+    assert plain.speculative_runner is None
+
+
+def test_speculative_path_advances_the_registry_generator():
+    # Sharing the registry is not enough: the speculative path must actually draw
+    # from the stored generator. Rebuilding or reseeding one per call would keep
+    # the slot frozen and silently change every sampled token after the first.
+    e = engine(model())
+    params = SamplingParams(
+        max_tokens=24, temperature=0.8, top_k=7, top_p=0.8, seed=42, ignore_eos=True
+    )
+    e.add_request("r", [2, 3, 4], params)
+
+    def step_until_speculative():
+        for _ in range(10):
+            e.step()
+            if e.last_schedule.stage == Stage.SPECULATIVE:
+                return True
+        return False
+
+    assert step_until_speculative()
+    generator = e.rng.peek("r")
+    assert generator is not None
+    state = generator.get_state().clone()
+
+    assert step_until_speculative()
+    assert e.has_unfinished_requests()
+    assert e.rng.peek("r") is generator
+    assert not torch.equal(generator.get_state(), state)
+
+
 @pytest.mark.parametrize(
     "p,q",
     [
@@ -303,11 +345,11 @@ def test_rejection_sampling_recovers_target_distribution(p, q):
 
 def test_probability_filters_match_expected_and_keep_boundary_ties():
     logits = torch.tensor([0.50, 0.25, 0.15, 0.10]).log()
-    p = probabilities(logits, SamplingParams(temperature=1, top_p=0.8))
+    p = Sampler.probabilities(logits, SamplingParams(temperature=1, top_p=0.8))
     torch.testing.assert_close(p, torch.tensor([0.50, 0.25, 0.15, 0]) / 0.9)
-    p = probabilities(logits, SamplingParams(temperature=0.5, top_k=2))
+    p = Sampler.probabilities(logits, SamplingParams(temperature=0.5, top_k=2))
     torch.testing.assert_close(p, torch.tensor([0.8, 0.2, 0, 0]))
-    p = probabilities(torch.zeros(4), SamplingParams(temperature=1, top_k=1))
+    p = Sampler.probabilities(torch.zeros(4), SamplingParams(temperature=1, top_k=1))
     torch.testing.assert_close(p, torch.full((4,), 0.25))
 
 

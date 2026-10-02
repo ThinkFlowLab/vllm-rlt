@@ -9,12 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.sampling import (
-    draw,
-    generator_for,
-    probabilities,
-    rejection_sample,
-)
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
 @dataclass(frozen=True)
@@ -48,10 +43,32 @@ def greedy_accept(candidates, targets):
     return list(targets[: accepted + 1]), accepted
 
 
+def rejection_sample(candidate, target, proposal, generator):
+    """Return (token, accepted) for normalized, actually sampled p and q.
+
+    Comparing u*q to p avoids division by tiny q. A zero residual after a real
+    rejection is a numerical error, never a reason to silently sample from p.
+    """
+    mass = proposal[candidate]
+    if not bool(mass > 0):
+        raise ValueError("candidate has zero proposal probability")
+    uniform = torch.rand((), device=target.device, generator=generator)
+    if bool(uniform * mass < target[candidate]):
+        return candidate, True
+    residual = (target - proposal).clamp_min(0)
+    total = residual.sum()
+    if not bool(torch.isfinite(total) & (total > 0)):
+        raise RuntimeError("invalid speculative residual probability mass")
+    return int(Sampler.draw(residual / total, generator).item()), False
+
+
 class SpeculativeRunner:
-    def __init__(self, model, cache, config, execution):
+    def __init__(self, model, cache, config, execution, rng=None):
         self.model, self.cache, self.config = model, cache, config
         self.device = next(model.parameters()).device
+        # The engine injects one registry per engine so both sampling paths share
+        # each request's RNG slot.
+        self.rng = rng if rng is not None else RngRegistry()
         self.stats = SpeculativeStats()
         self.graphs = (
             RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
@@ -83,6 +100,14 @@ class SpeculativeRunner:
         else:
             hidden, _ = self.model.recurrent_prepared(hidden, batch, self.cache, compute_gate=False)
         return hidden
+
+    def _generator_for(self, request, logits):
+        """Resolve this request's generator from the shared engine registry.
+
+        The generator has to live on the distribution's device, so it follows the
+        logits row rather than the device the model was loaded on.
+        """
+        return self.rng.acquire(request.request_id, request.sampling_params, logits.device)
 
     def _coda(self, hidden):
         return (
@@ -122,10 +147,10 @@ class SpeculativeRunner:
             for row, (_, i) in enumerate(drafting):
                 request = items[i].request
                 if request.sampling_params.temperature != 0:
-                    q = probabilities(logits[row], request.sampling_params)
+                    q = Sampler.probabilities(logits[row], request.sampling_params)
                     proposals[i].append(q)
                     # Per-request RNG consumption order is unchanged; only the read moves.
-                    inputs[row] = draw(q, generator_for(request, self.device))
+                    inputs[row] = Sampler.draw(q, self._generator_for(request, logits[row]))
             drafted.append(([i for _, i in drafting], inputs))
         # Group contiguous positions per request for causal ragged attention.
         ids, positions = [], []
@@ -168,18 +193,18 @@ class SpeculativeRunner:
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
             tokens, accepted = [], 0
             for offset, candidate in enumerate(candidates[i]):
-                p = probabilities(rows[offset], request.sampling_params)
+                p = Sampler.probabilities(rows[offset], request.sampling_params)
                 token, accept = rejection_sample(
-                    candidate, p, proposals[i][offset], generator_for(request, self.device)
+                    candidate, p, proposals[i][offset], self._generator_for(request, rows[offset])
                 )
                 tokens.append(token)
                 if not accept:
                     break
                 accepted += 1
             else:
-                token = draw(
-                    probabilities(rows[-1], request.sampling_params),
-                    generator_for(request, self.device),
+                token = Sampler.draw(
+                    Sampler.probabilities(rows[-1], request.sampling_params),
+                    self._generator_for(request, rows[-1]),
                 )
                 tokens.append(int(token.item()))
             results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))

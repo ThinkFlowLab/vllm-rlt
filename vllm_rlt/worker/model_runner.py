@@ -12,7 +12,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import RecurrentGraphs
-from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
 @dataclass
@@ -74,12 +74,16 @@ class ModelRunner:
         exit_config=None,
         execution_config=None,
         scheduler_config=None,
+        rng=None,
     ):
         self.model = model.eval()
         self.cache_manager = cache_manager
         parameter = next(model.parameters())
         self.device = parameter.device
-        self.sampler = Sampler(self.device)
+        self.sampler = Sampler()
+        # Sampling RNG state lives with the engine, which shares this registry
+        # between the CODA runner and the speculative runner.
+        self.rng = rng if rng is not None else RngRegistry()
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
         scheduler = scheduler_config or SchedulerConfig()
@@ -580,7 +584,7 @@ class ModelRunner:
                 event.record(stream)
                 self.events[request.request_id] = event
 
-    def release(self, request_id):
+    def _free_runner_slot(self, request_id):
         # The latest submission or KV-finalization event follows earlier work
         # through stream dependencies. Wait before recycling this request's slot.
         event = self.events.pop(request_id, None)
@@ -593,6 +597,23 @@ class ModelRunner:
         if slot is not None:
             self.free_state_slots.append(slot)
 
+    def suspend(self, request_id):
+        """Free the request's runner resources but keep its sampling RNG.
+
+        Preemption suspends a request without terminating it, so its generator
+        must survive for the resumed token sequence to match an uninterrupted run.
+        """
+        self._free_runner_slot(request_id)
+
+    def release(self, request_id):
+        """Terminate the request: free its runner resources and drop its RNG.
+
+        A new request reusing the same ID must start from a fresh generator, so
+        termination drops the RNG slot while suspension keeps it.
+        """
+        self._free_runner_slot(request_id)
+        self.rng.drop(request_id)
+
     def synchronize(self):
         for stream in (self.core_stream, self.boundary_stream, self.copy_stream):
             if stream is not None:
@@ -601,6 +622,9 @@ class ModelRunner:
     def _sample_tensor(self, logits: torch.Tensor, request: Request):
         # Thin delegate kept for the async path and for tests that monkeypatch
         # this method; the algorithm lives in Sampler.
-        token, generator = self.sampler.sample(logits, request.sampling_params, request.generator)
-        request.generator = generator
+        request_id = request.request_id
+        token, generator = self.sampler.sample(
+            logits, request.sampling_params, self.rng.peek(request_id)
+        )
+        self.rng.store(request_id, generator)
         return token
