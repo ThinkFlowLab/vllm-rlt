@@ -289,7 +289,11 @@ class ModelRunner:
                 if bank
                 else torch.tensor(tokens, device=self.device, dtype=torch.long)
             )
-            hidden = self.model.prelude(tensor)
+            if getattr(self.model, "requires_boundary_kv", False):
+                boundary = cache._prepare_batch(ids, [0] * len(ids), positions, packed_prefill=True)
+                hidden = self.model.prelude_prepared(tensor, boundary, cache)
+            else:
+                hidden = self.model.prelude(tensor)
             for depth in range(self.model.config.total_ut_steps):
                 metadata = (
                     bank.metadata(depth)
@@ -301,6 +305,8 @@ class ModelRunner:
                 hidden, _ = self.model.recurrent_prepared(
                     hidden, metadata, cache, compute_gate=False
                 )
+            if getattr(self.model, "requires_boundary_kv", False):
+                self.model.coda_prepared(hidden, boundary, cache)
             if bank:
                 bank.release()
             return hidden
@@ -311,7 +317,12 @@ class ModelRunner:
             if workspace
             else torch.tensor(tokens, device=self.device, dtype=torch.long)
         )
-        hidden = self.model.prelude(tensor)
+        boundary = None
+        if getattr(self.model, "requires_boundary_kv", False):
+            boundary = cache._prepare_batch(ids, [0] * len(ids), positions)
+            hidden = self.model.prelude_prepared(tensor[: len(ids)], boundary, cache)
+        else:
+            hidden = self.model.prelude(tensor)
         for depth in range(self.model.config.total_ut_steps):
             # Same workspace metadata can be refilled only once previous DMA is done.
             if workspace:
@@ -319,6 +330,8 @@ class ModelRunner:
             hidden, _ = self._core(hidden, ids, [depth] * len(ids), positions, workspace, size)
             if workspace:
                 workspace.release()
+        if boundary is not None:
+            self.model.coda_prepared(hidden, boundary, cache)
         return hidden
 
     def prepare(self, batch):
@@ -381,7 +394,17 @@ class ModelRunner:
                     if workspace
                     else torch.tensor(ids, device=self.device, dtype=torch.long)
                 )
-            hidden = self.model.prelude(tokens)
+            if getattr(self.model, "requires_boundary_kv", False):
+                boundary = self.cache_manager._prepare_batch(
+                    [r.request_id for r in requests],
+                    [0] * len(requests),
+                    [r.position for r in requests],
+                )
+                hidden = self.model.prelude_prepared(
+                    tokens[: len(requests)], boundary, self.cache_manager
+                )
+            else:
+                hidden = self.model.prelude(tokens)
             self._save_batch(requests, hidden, routing)
             result = None
         else:
@@ -420,7 +443,17 @@ class ModelRunner:
                     logits = self.lookahead_head(hidden).squeeze(-1)
                 result = logits[: len(requests)].float().sigmoid() if logits is not None else None
             elif batch.stage == Stage.CODA:
-                logits = self.model.coda(hidden)
+                if getattr(self.model, "requires_boundary_kv", False):
+                    boundary = self.cache_manager._prepare_batch(
+                        [r.request_id for r in requests],
+                        [0] * len(requests),
+                        [r.position for r in requests],
+                    )
+                    logits = self.model.coda_prepared(
+                        hidden[: len(requests)], boundary, self.cache_manager
+                    )
+                else:
+                    logits = self.model.coda(hidden)
                 result = torch.stack(
                     [self._sample_tensor(row, r) for row, r in zip(logits, requests)]
                 )

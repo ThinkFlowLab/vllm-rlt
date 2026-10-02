@@ -33,8 +33,18 @@ class LLMEngine:
         scheduler_config = scheduler_config or SchedulerConfig()
         parameter = next(model.parameters())
         config = model.config
+        if getattr(model, "requires_boundary_kv", False):
+            if cache_config.layout != "last_exited":
+                raise ValueError("Huginn requires last_exited KV")
+            if cache_config.enable_prefix_caching:
+                raise ValueError("Huginn prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        if getattr(model, "requires_boundary_kv", False):
+            if self.execution_config.async_scheduling or self.execution_config.prefill_uva:
+                raise ValueError("Huginn requires synchronous scheduling without prefill UVA")
+            if speculative_config is not None:
+                raise ValueError("Huginn speculative decoding is not yet supported")
         self.speculative_config = speculative_config
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
@@ -89,6 +99,7 @@ class LLMEngine:
             enable_prefix_caching=cache_config.enable_prefix_caching,
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
+            recurrent_layers=getattr(model, "recurrent_kv_layers", None),
         )
         if self.execution_config.prefill_uva and (
             parameter.device.type != "cuda"

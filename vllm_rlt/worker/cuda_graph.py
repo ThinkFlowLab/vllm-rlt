@@ -96,7 +96,7 @@ class RecurrentGraphs:
             row_key = (id(allocation), depth)
             previous = frontier.get(row_key)
             if previous is None:
-                for layer in range(cache.num_layers):
+                for layer in cache.recurrent_layers:
                     cache._require_prefix(allocation, layer, depth, pos)
             elif pos != previous + 1:
                 self.fallbacks += 1
@@ -156,7 +156,7 @@ class RecurrentGraphs:
         self.last_event = torch.cuda.Event()
         self.last_event.record(stream)
         for allocation, depth, pos in batch.rows:
-            for layer in range(cache.num_layers):
+            for layer in cache.recurrent_layers:
                 allocation.written[cache._plane(depth)][layer].add(pos)
         self.replays += 1
         return output
