@@ -99,7 +99,9 @@ class PreemptionManager:
             if victim.input_token_tensor is None
             else victim.input_token_tensor.cpu().clone(),
         )
-        e.model_runner.release(victim.request_id)
+        # Suspend rather than release: the victim is not terminating, so its
+        # sampling RNG must survive for the resumed sequence to be lossless.
+        e.model_runner.suspend(victim.request_id)
         cache.poll_prefixes()
         cache.free(victim.request_id)
         for q in e.scheduler.queues.values():

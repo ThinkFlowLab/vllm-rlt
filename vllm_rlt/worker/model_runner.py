@@ -580,7 +580,7 @@ class ModelRunner:
                 event.record(stream)
                 self.events[request.request_id] = event
 
-    def release(self, request_id):
+    def _free_runner_slot(self, request_id):
         # The latest submission or KV-finalization event follows earlier work
         # through stream dependencies. Wait before recycling this request's slot.
         event = self.events.pop(request_id, None)
@@ -592,6 +592,25 @@ class ModelRunner:
         slot = self.state_slots.pop(request_id, None)
         if slot is not None:
             self.free_state_slots.append(slot)
+
+    def suspend(self, request_id):
+        """Free the request's runner resources but keep its sampling RNG.
+
+        Preemption suspends a request without terminating it, so its generator
+        must survive for the resumed token sequence to match an uninterrupted
+        run. The RNG slot itself moves to the engine registry in the next
+        commit; this method is the hook that will keep it.
+        """
+        self._free_runner_slot(request_id)
+
+    def release(self, request_id):
+        """Terminate the request: free its runner resources and drop its RNG.
+
+        A new request reusing the same ID must start from a fresh generator, so
+        termination drops the RNG while suspension keeps it. Dropping the slot
+        belongs here once the registry holds it (next commit).
+        """
+        self._free_runner_slot(request_id)
 
     def synchronize(self):
         for stream in (self.core_stream, self.boundary_stream, self.copy_stream):
