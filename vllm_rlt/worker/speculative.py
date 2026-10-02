@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
 @dataclass(frozen=True)
@@ -43,17 +43,6 @@ def greedy_accept(candidates, targets):
     return list(targets[: accepted + 1]), accepted
 
 
-def generator_for(request, device):
-    """Temporary RNG accessor for the speculative path.
-
-    A later M7 2/3 commit replaces this with the engine-owned RNG registry, so
-    the speculative path stops writing ``Request.generator`` directly.
-    """
-    if request.generator is None:
-        request.generator = torch.Generator(device=device).manual_seed(request.sampling_params.seed)
-    return request.generator
-
-
 def rejection_sample(candidate, target, proposal, generator):
     """Return (token, accepted) for normalized, actually sampled p and q.
 
@@ -74,9 +63,12 @@ def rejection_sample(candidate, target, proposal, generator):
 
 
 class SpeculativeRunner:
-    def __init__(self, model, cache, config, execution):
+    def __init__(self, model, cache, config, execution, rng=None):
         self.model, self.cache, self.config = model, cache, config
         self.device = next(model.parameters()).device
+        # The engine injects one registry per engine so both sampling paths share
+        # each request's RNG slot.
+        self.rng = rng if rng is not None else RngRegistry()
         self.stats = SpeculativeStats()
         self.graphs = (
             RecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
@@ -108,6 +100,14 @@ class SpeculativeRunner:
         else:
             hidden, _ = self.model.recurrent_prepared(hidden, batch, self.cache, compute_gate=False)
         return hidden
+
+    def _generator_for(self, request, logits):
+        """Resolve this request's generator from the shared engine registry.
+
+        The generator has to live on the distribution's device, so it follows the
+        logits row rather than the device the model was loaded on.
+        """
+        return self.rng.acquire(request.request_id, request.sampling_params, logits.device)
 
     def _coda(self, hidden):
         return (
@@ -150,7 +150,7 @@ class SpeculativeRunner:
                     q = Sampler.probabilities(logits[row], request.sampling_params)
                     proposals[i].append(q)
                     # Per-request RNG consumption order is unchanged; only the read moves.
-                    inputs[row] = Sampler.draw(q, generator_for(request, self.device))
+                    inputs[row] = Sampler.draw(q, self._generator_for(request, logits[row]))
             drafted.append(([i for _, i in drafting], inputs))
         # Group contiguous positions per request for causal ragged attention.
         ids, positions = [], []
@@ -195,7 +195,7 @@ class SpeculativeRunner:
             for offset, candidate in enumerate(candidates[i]):
                 p = Sampler.probabilities(rows[offset], request.sampling_params)
                 token, accept = rejection_sample(
-                    candidate, p, proposals[i][offset], generator_for(request, self.device)
+                    candidate, p, proposals[i][offset], self._generator_for(request, rows[offset])
                 )
                 tokens.append(token)
                 if not accept:
@@ -204,7 +204,7 @@ class SpeculativeRunner:
             else:
                 token = Sampler.draw(
                     Sampler.probabilities(rows[-1], request.sampling_params),
-                    generator_for(request, self.device),
+                    self._generator_for(request, rows[-1]),
                 )
                 tokens.append(int(token.item()))
             results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))

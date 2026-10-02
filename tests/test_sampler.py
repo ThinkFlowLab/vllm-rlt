@@ -8,6 +8,7 @@ should do in the future.
 import pytest
 import torch
 
+import vllm_rlt.worker.sampler as sampler_module
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.sampler import Sampler
 
@@ -22,7 +23,7 @@ def draw(sampler, logits, params, generator=None, count=1):
 
 
 def test_greedy_returns_argmax_and_never_creates_a_generator():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     logits = torch.tensor([0.1, 2.0, 1.0, -1.0])
     # top_k/top_p are deliberately set: the temperature == 0 short circuit runs
     # first, so greedy ignores them and stays RNG-free.
@@ -44,7 +45,7 @@ GREEDY_CASES = [
 
 @pytest.mark.parametrize("logits", GREEDY_CASES)
 def test_top_k_one_is_equivalent_to_greedy(logits):
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     greedy_tokens, _ = draw(sampler, logits, SamplingParams(temperature=0.0))
     # top_k=1 makes the threshold the maximum, so masked_fill leaves exactly one
     # candidate and the result cannot depend on the RNG stream. Checking several
@@ -57,7 +58,7 @@ def test_top_k_one_is_equivalent_to_greedy(logits):
 
 
 def test_top_k_keeps_every_token_tied_at_the_threshold():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     # top_k=2 selects a threshold of 3.0, which three tokens share. The mask is
     # ``logits < threshold``, so the candidate set is larger than k.
     logits = torch.tensor([3.0, 3.0, 3.0, 0.0])
@@ -69,7 +70,7 @@ def test_top_k_keeps_every_token_tied_at_the_threshold():
 
 
 def test_top_p_keeps_at_least_one_token():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     # A top_p far below the head probability would empty the candidate set; the
     # mask shift keeps the single most likely token instead.
     logits = torch.linspace(1.0, 0.0, 100)
@@ -79,7 +80,7 @@ def test_top_p_keeps_at_least_one_token():
 
 
 def test_top_p_one_does_not_truncate_the_support():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     logits = torch.tensor([1.0, 0.9, 0.8, 0.7])
     truncated = SamplingParams(temperature=1.0, top_p=0.5, seed=13)
     untruncated = SamplingParams(temperature=1.0, top_p=1.0, seed=13)
@@ -99,14 +100,14 @@ def sequence(sampler, logits, params, count=32):
 
 
 def test_same_seed_reproduces_the_same_sequence():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     logits = torch.linspace(1.0, -1.0, 64)
     params = SamplingParams(temperature=0.7, top_k=8, top_p=0.9, seed=42)
     assert sequence(sampler, logits, params) == sequence(sampler, logits, params)
 
 
 def test_different_seeds_produce_different_sequences():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     logits = torch.linspace(1.0, -1.0, 64)
     base = dict(temperature=0.7, top_k=8, top_p=0.9)
     assert sequence(sampler, logits, SamplingParams(seed=1, **base)) != sequence(
@@ -115,7 +116,7 @@ def test_different_seeds_produce_different_sequences():
 
 
 def test_generator_is_reused_and_advanced_across_calls():
-    sampler = Sampler(torch.device("cpu"))
+    sampler = Sampler()
     logits = torch.linspace(1.0, -1.0, 64)
     params = SamplingParams(temperature=0.7, top_k=8, seed=42)
     _, generator = draw(sampler, logits, params)
@@ -126,3 +127,28 @@ def test_generator_is_reused_and_advanced_across_calls():
     _, same_generator = draw(sampler, logits, params, generator=generator)
     assert same_generator is generator
     assert not torch.equal(generator.get_state(), state)
+
+
+def test_generator_is_created_on_the_logits_device(monkeypatch):
+    # multinomial runs on the distribution's device, so creating the generator on
+    # the model's device instead would raise a device mismatch whenever the two
+    # differ. Pin where the device comes from without needing a second device.
+    calls = []
+
+    def spy(device, params):
+        calls.append(device)
+        return torch.Generator(device=device).manual_seed(params.seed)
+
+    monkeypatch.setattr(sampler_module, "new_generator", spy)
+    logits = torch.zeros(8)
+    _, generator = Sampler().sample(logits, SamplingParams(temperature=1.0, seed=5), None)
+    assert calls == [logits.device]
+    assert generator.device == logits.device
+
+
+def test_greedy_never_needs_a_generator_device():
+    # The greedy short circuit must not reach generator creation at all.
+    logits = torch.tensor([0.1, 3.0, -1.0])
+    token, generator = Sampler().sample(logits, SamplingParams(temperature=0.0), None)
+    assert token.item() == 1
+    assert generator is None
