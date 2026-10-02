@@ -9,12 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.sampling import (
-    draw,
-    generator_for,
-    probabilities,
-    rejection_sample,
-)
+from vllm_rlt.worker.sampler import Sampler
 
 
 @dataclass(frozen=True)
@@ -46,6 +41,36 @@ def greedy_accept(candidates, targets):
             break
         accepted += 1
     return list(targets[: accepted + 1]), accepted
+
+
+def generator_for(request, device):
+    """Temporary RNG accessor for the speculative path.
+
+    A later M7 2/3 commit replaces this with the engine-owned RNG registry, so
+    the speculative path stops writing ``Request.generator`` directly.
+    """
+    if request.generator is None:
+        request.generator = torch.Generator(device=device).manual_seed(request.sampling_params.seed)
+    return request.generator
+
+
+def rejection_sample(candidate, target, proposal, generator):
+    """Return (token, accepted) for normalized, actually sampled p and q.
+
+    Comparing u*q to p avoids division by tiny q. A zero residual after a real
+    rejection is a numerical error, never a reason to silently sample from p.
+    """
+    mass = proposal[candidate]
+    if not bool(mass > 0):
+        raise ValueError("candidate has zero proposal probability")
+    uniform = torch.rand((), device=target.device, generator=generator)
+    if bool(uniform * mass < target[candidate]):
+        return candidate, True
+    residual = (target - proposal).clamp_min(0)
+    total = residual.sum()
+    if not bool(torch.isfinite(total) & (total > 0)):
+        raise RuntimeError("invalid speculative residual probability mass")
+    return int(Sampler.draw(residual / total, generator).item()), False
 
 
 class SpeculativeRunner:
@@ -122,10 +147,10 @@ class SpeculativeRunner:
             for row, (_, i) in enumerate(drafting):
                 request = items[i].request
                 if request.sampling_params.temperature != 0:
-                    q = probabilities(logits[row], request.sampling_params)
+                    q = Sampler.probabilities(logits[row], request.sampling_params)
                     proposals[i].append(q)
                     # Per-request RNG consumption order is unchanged; only the read moves.
-                    inputs[row] = draw(q, generator_for(request, self.device))
+                    inputs[row] = Sampler.draw(q, generator_for(request, self.device))
             drafted.append(([i for _, i in drafting], inputs))
         # Group contiguous positions per request for causal ragged attention.
         ids, positions = [], []
@@ -168,7 +193,7 @@ class SpeculativeRunner:
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
             tokens, accepted = [], 0
             for offset, candidate in enumerate(candidates[i]):
-                p = probabilities(rows[offset], request.sampling_params)
+                p = Sampler.probabilities(rows[offset], request.sampling_params)
                 token, accept = rejection_sample(
                     candidate, p, proposals[i][offset], generator_for(request, self.device)
                 )
@@ -177,8 +202,8 @@ class SpeculativeRunner:
                     break
                 accepted += 1
             else:
-                token = draw(
-                    probabilities(rows[-1], request.sampling_params),
+                token = Sampler.draw(
+                    Sampler.probabilities(rows[-1], request.sampling_params),
                     generator_for(request, self.device),
                 )
                 tokens.append(int(token.item()))

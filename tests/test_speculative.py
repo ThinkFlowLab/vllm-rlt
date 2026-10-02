@@ -20,8 +20,8 @@ from vllm_rlt.core.scheduler import ScheduledItem, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.request import Request, Stage
-from vllm_rlt.worker.sampling import probabilities, rejection_sample
-from vllm_rlt.worker.speculative import greedy_accept
+from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.speculative import greedy_accept, rejection_sample
 
 
 def model(seed=123, dtype=torch.float32):
@@ -303,11 +303,11 @@ def test_rejection_sampling_recovers_target_distribution(p, q):
 
 def test_probability_filters_match_expected_and_keep_boundary_ties():
     logits = torch.tensor([0.50, 0.25, 0.15, 0.10]).log()
-    p = probabilities(logits, SamplingParams(temperature=1, top_p=0.8))
+    p = Sampler.probabilities(logits, SamplingParams(temperature=1, top_p=0.8))
     torch.testing.assert_close(p, torch.tensor([0.50, 0.25, 0.15, 0]) / 0.9)
-    p = probabilities(logits, SamplingParams(temperature=0.5, top_k=2))
+    p = Sampler.probabilities(logits, SamplingParams(temperature=0.5, top_k=2))
     torch.testing.assert_close(p, torch.tensor([0.8, 0.2, 0, 0]))
-    p = probabilities(torch.zeros(4), SamplingParams(temperature=1, top_k=1))
+    p = Sampler.probabilities(torch.zeros(4), SamplingParams(temperature=1, top_k=1))
     torch.testing.assert_close(p, torch.full((4,), 0.25))
 
 
