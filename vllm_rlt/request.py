@@ -41,7 +41,6 @@ class Request:
     admission_bypasses: int = 0
     remaining_probability: float = 1.0
     hidden_state: torch.Tensor | None = field(default=None, repr=False)
-    generator: torch.Generator | None = field(default=None, repr=False)
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
 

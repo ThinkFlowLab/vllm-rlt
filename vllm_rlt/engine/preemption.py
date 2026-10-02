@@ -1,8 +1,10 @@
 """Lossless pressure preemption for recurrent-depth KV.
 
-CPU snapshots retain exact KV planes, hidden state and request RNG ownership.
-Full-depth replay of generated tokens is deliberately avoided: it changes RLT
-semantics. Snapshots are bounded by the admitted request population.
+CPU snapshots retain exact KV planes and hidden state. The sampling RNG is not
+part of the snapshot: ModelRunner.suspend keeps the request's registry slot, so
+resuming continues the same random stream. Full-depth replay of generated tokens
+is deliberately avoided: it changes RLT semantics. Snapshots are bounded by the
+admitted request population.
 """
 
 from copy import deepcopy
