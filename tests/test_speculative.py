@@ -282,6 +282,48 @@ def test_sampling_seeded_replay_and_request_isolation(top_k, top_p):
     assert [run([p])[0].token_ids for p in prompts] == [o.token_ids for o in batched]
 
 
+def test_both_runners_share_the_engine_rng_registry():
+    # The registry belongs to the engine because LLMEngine builds SpeculativeRunner
+    # before ModelRunner and passes neither to the other. If the two runners held
+    # separate registries, preemption and termination would stop covering the
+    # speculative path's RNG.
+    e = engine(model())
+    assert e.model_runner.rng is e.rng
+    assert e.speculative_runner.rng is e.rng
+
+    plain = LLMEngine(model())
+    assert plain.model_runner.rng is plain.rng
+    assert plain.speculative_runner is None
+
+
+def test_speculative_path_advances_the_registry_generator():
+    # Sharing the registry is not enough: the speculative path must actually draw
+    # from the stored generator. Rebuilding or reseeding one per call would keep
+    # the slot frozen and silently change every sampled token after the first.
+    e = engine(model())
+    params = SamplingParams(
+        max_tokens=24, temperature=0.8, top_k=7, top_p=0.8, seed=42, ignore_eos=True
+    )
+    e.add_request("r", [2, 3, 4], params)
+
+    def step_until_speculative():
+        for _ in range(10):
+            e.step()
+            if e.last_schedule.stage == Stage.SPECULATIVE:
+                return True
+        return False
+
+    assert step_until_speculative()
+    generator = e.rng.peek("r")
+    assert generator is not None
+    state = generator.get_state().clone()
+
+    assert step_until_speculative()
+    assert e.has_unfinished_requests()
+    assert e.rng.peek("r") is generator
+    assert not torch.equal(generator.get_state(), state)
+
+
 @pytest.mark.parametrize(
     "p,q",
     [

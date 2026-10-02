@@ -10,7 +10,7 @@ import torch
 
 import vllm_rlt.worker.sampler as sampler_module
 from vllm_rlt.sampling_params import SamplingParams
-from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
 def draw(sampler, logits, params, generator=None, count=1):
@@ -152,3 +152,41 @@ def test_greedy_never_needs_a_generator_device():
     token, generator = Sampler().sample(logits, SamplingParams(temperature=0.0), None)
     assert token.item() == 1
     assert generator is None
+
+
+def test_rng_registry_creates_lazily_and_reuses_the_slot():
+    registry = RngRegistry()
+    params = SamplingParams(temperature=1.0, seed=42)
+    assert registry.peek("r") is None
+
+    first = registry.acquire("r", params, torch.device("cpu"))
+    assert registry.peek("r") is first
+    # A later draw for the same request must advance the same generator.
+    assert registry.acquire("r", params, torch.device("cpu")) is first
+
+
+def test_rng_registry_store_keeps_greedy_requests_slotless():
+    registry = RngRegistry()
+    # store() receives whatever Sampler.sample returned: None means greedy and
+    # must not create a slot.
+    registry.store("g", None)
+    assert registry.peek("g") is None
+
+    generator = torch.Generator().manual_seed(7)
+    registry.store("r", generator)
+    assert registry.peek("r") is generator
+
+
+def test_rng_registry_drop_removes_only_that_requests_slot():
+    registry = RngRegistry()
+    params = SamplingParams(temperature=1.0, seed=5)
+    dropped = registry.acquire("dropped", params, torch.device("cpu"))
+    kept = registry.acquire("kept", params, torch.device("cpu"))
+
+    registry.drop("dropped")
+    assert registry.peek("dropped") is None
+    assert registry.peek("kept") is kept
+    # Termination can run twice for the same request; the second drop is a no-op.
+    registry.drop("dropped")
+    assert registry.peek("kept") is kept
+    assert dropped is not kept
