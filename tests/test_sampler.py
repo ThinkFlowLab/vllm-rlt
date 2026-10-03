@@ -1,15 +1,21 @@
-"""Contract tests for the extracted Sampler: greedy, top-k and top-p.
+"""Contract tests for sampling: the extracted Sampler, per-token logprobs and seeds.
 
-These pin the current arithmetic exactly as it behaved inside
-``ModelRunner._sample_tensor``; they are not a specification of what sampling
-should do in the future.
+The Sampler tests (greedy, top-k, top-p, seeded generators) pin the arithmetic
+exactly as it behaved inside ``ModelRunner._sample_tensor``; they are not a
+specification of what sampling should do in the future. The rest cover
+``token_logprob`` in raw and processed modes, ``generator_for``, and the
+rejection of unresolved ``seed=None`` params before any sampling.
 """
+
+import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.sampler import Sampler
+from vllm_rlt.worker.sampling import generator_for, probabilities, token_logprob
 
 
 def draw(sampler, logits, params, generator=None, count=1):
@@ -126,3 +132,72 @@ def test_generator_is_reused_and_advanced_across_calls():
     _, same_generator = draw(sampler, logits, params, generator=generator)
     assert same_generator is generator
     assert not torch.equal(generator.get_state(), state)
+
+
+def test_unresolved_seed_is_rejected_before_any_sampling():
+    params = SamplingParams(seed=None, temperature=1.0)
+    for sampled in (params, SamplingParams(seed=None)):
+        with pytest.raises(ValueError, match="seed=None"):
+            Sampler(torch.device("cpu")).sample(torch.zeros(4), sampled, None)
+    with pytest.raises(ValueError, match="seed=None"):
+        generator_for(SimpleNamespace(generator=None, sampling_params=params), "cpu")
+
+
+LOGPROB_LOGITS = torch.tensor([1.5, 0.2, -0.7, 2.1, 0.0, -3.0])
+
+
+@pytest.mark.parametrize("token", range(len(LOGPROB_LOGITS)), ids=lambda t: f"token={t}")
+def test_raw_token_logprob_is_the_model_log_softmax_for_any_token(token):
+    for dtype in (torch.float32, torch.bfloat16):
+        logits = LOGPROB_LOGITS.to(dtype)
+        params = SamplingParams(temperature=0.6, top_k=2, top_p=0.5, seed=1)
+        value = token_logprob(logits, params, torch.tensor(token), "raw_logprobs")
+        assert value.dim() == 0 and value.dtype == torch.float32
+        expected = torch.log_softmax(logits.float(), -1)[token]
+        assert torch.equal(value, expected)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        SamplingParams(temperature=0.6, seed=1),
+        SamplingParams(temperature=1.3, top_k=3, seed=1),
+        SamplingParams(temperature=0.9, top_p=0.7, seed=1),
+        SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=1),
+    ],
+    ids=["temperature", "temperature-top_k", "temperature-top_p", "temperature-top_k-top_p"],
+)
+def test_processed_token_logprob_scores_the_sampling_distribution(params):
+    probs = probabilities(LOGPROB_LOGITS, params)
+    for token in range(len(LOGPROB_LOGITS)):
+        value = token_logprob(LOGPROB_LOGITS, params, torch.tensor(token), "processed_logprobs")
+        if probs[token] == 0:
+            assert value.item() == -math.inf  # Filtered tokens cannot be sampled.
+        else:
+            assert value.item() == pytest.approx(probs[token].log().item(), abs=1e-6)
+
+
+def test_processed_token_logprob_edge_cases():
+    argmax = torch.tensor(int(LOGPROB_LOGITS.argmax()))
+    greedy = SamplingParams(temperature=0.0, top_k=1)
+    # Greedy requests report the unscaled model distribution, as vLLM does.
+    assert torch.equal(
+        token_logprob(LOGPROB_LOGITS, greedy, argmax, "processed_logprobs"),
+        token_logprob(LOGPROB_LOGITS, greedy, argmax, "raw_logprobs"),
+    )
+    # One token survives top_k=1, or top_p=0.6 after top_k=2: top-p sees the renormalized
+    # top-2 mass (argmax 0.65), not the full distribution (0.53, which would keep two).
+    for single in (dict(temperature=0.7, top_k=1), dict(temperature=1.0, top_k=2, top_p=0.6)):
+        params = SamplingParams(seed=1, **single)
+        assert token_logprob(LOGPROB_LOGITS, params, argmax, "processed_logprobs").item() == 0.0
+
+
+def test_token_logprob_consumes_no_rng():
+    sampler = Sampler(torch.device("cpu"))
+    params = SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=42)
+    token, generator = sampler.sample(LOGPROB_LOGITS, params, None)
+    state, global_state = generator.get_state().clone(), torch.get_rng_state()
+    for logprobs_mode in ("raw_logprobs", "processed_logprobs"):
+        token_logprob(LOGPROB_LOGITS, params, token, logprobs_mode)
+    assert torch.equal(generator.get_state(), state)
+    assert torch.equal(torch.get_rng_state(), global_state)

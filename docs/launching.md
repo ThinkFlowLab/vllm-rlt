@@ -226,7 +226,10 @@ Results preserve input order. Prompt prefill runs at full depth; the exit
 threshold controls subsequent decode. Set `exit_threshold=1.0` for fixed-depth
 execution. The first generated token comes from full-depth prefill, reflected
 in `exit_depths`. For dynamic arrivals, stepwise output, and cancellation, see
-the [engine design](design.md).
+the [engine design](design.md). For RL rollouts, `SamplingParams(logprobs=0)`
+adds `output.logprobs`, aligned with `token_ids` and `exit_depths`; see the
+[sampling walkthrough](sampling_walkthrough.md#8-rollout-outputs) for its
+definition, `seed=None` and `stop_token_ids`.
 
 ## Troubleshooting
 

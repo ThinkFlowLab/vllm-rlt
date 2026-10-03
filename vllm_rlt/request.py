@@ -31,6 +31,8 @@ class Request:
     stage: Stage = Stage.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
     exit_depths: list[int] = field(default_factory=list)
+    # Aligned with generated_token_ids when sampling_params.logprobs is set, else None.
+    logprobs: list[float] | None = None
     # Scheduling advances before coda's CPU output delivery.
     num_output_placeholders: int = 0
     input_token_tensor: torch.Tensor | None = field(default=None, repr=False)
@@ -44,6 +46,10 @@ class Request:
     generator: torch.Generator | None = field(default=None, repr=False)
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
+
+    def __post_init__(self):
+        if self.logprobs is None and self.sampling_params.logprobs is not None:
+            self.logprobs = []
 
     @property
     def num_scheduled_outputs(self) -> int:
@@ -67,6 +73,10 @@ class RequestOutput:
     finished: bool
     finish_reason: str | None = None
     text: str = ""
+    # Log-probability of each token_ids entry, conditional on its exit_depths entry.
+    logprobs: list[float] | None = None
+    # Effective parameters, including the engine-chosen seed for seed=None.
+    sampling_params: SamplingParams | None = None
 
     @classmethod
     def from_request(cls, request: Request):
@@ -79,4 +89,6 @@ class RequestOutput:
             finish_reason=request.finish_reason.value
             if request.finish_reason is not None
             else None,
+            logprobs=list(request.logprobs) if request.logprobs is not None else None,
+            sampling_params=request.sampling_params,
         )

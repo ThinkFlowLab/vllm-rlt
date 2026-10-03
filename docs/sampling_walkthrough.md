@@ -81,7 +81,8 @@ plus the Ouro extensions `min_loops`, `max_loops`, `exit_threshold`, `ignore_eos
 `priority`. `__post_init__` already validates everything sampling depends on:
 `temperature` is finite and nonnegative, `top_p ∈ (0, 1]`, `top_k` is `-1` or a
 positive integer, and `seed ∈ [0, 2**63)`. `Sampler` therefore assumes validated
-input and does not re-check it.
+input and does not re-check it. The rollout fields `logprobs`, `stop_token_ids` and
+`seed=None` were added later; see [section 8](#8-rollout-outputs).
 
 ### `Sampler`
 
@@ -92,7 +93,10 @@ one, so "where the RNG lives" stays visible at the call site. This is what lets
 
 ### `worker/sampling.py` (unchanged by this increment)
 
-The same arithmetic also exists as module-level helpers, introduced by PR #44:
+Since the rollout-outputs change, the temperature/top-k/top-p statements live once in
+`processed_logits()`, shared by `Sampler.sample`, `probabilities()` and processed
+logprobs (section 8). Before that, the same arithmetic also existed as module-level
+helpers, introduced by PR #44:
 `probabilities()` builds the temperature/top-k/top-p distribution, `draw()` performs one
 multinomial draw, and `generator_for()` performs the lazy generator creation for the
 speculative path. `rejection_sample()` is speculative-only and has no counterpart in
@@ -342,3 +346,121 @@ python -m pytest -q tests/ -m gpu --run-gpu
 
 Until then, both increments state "GPU validation pending in M7 3/3" in their pull
 request descriptions.
+
+## 8. Rollout outputs
+
+RL trainers (verl, vime) consume, for each generated token, its ID, the loop depth
+that produced it and its log-probability under the policy that sampled it. This
+section is the engine contract from RFC
+[#70](https://github.com/ThinkFlowLab/vllm-rlt/issues/70), PR 1. Names follow vLLM.
+
+### Parameters
+
+| Option | Default | Contract |
+| --- | --- | --- |
+| `SamplingParams.logprobs` | `None` | `0` returns the log-probability of each sampled token, as vLLM's `logprobs=0`. Positive values (top-k alternatives) raise `ValueError` for now. |
+| `SamplingParams.seed` | `0` | `None` asks the engine for a fresh 63-bit seed from OS entropy (`secrets`), consuming neither the torch nor the Python global RNG. |
+| `SamplingParams.stop_token_ids` | `()` | A list or tuple of IDs, normalized to a tuple. Emitting one finishes the request with `stop`, even with `ignore_eos=True` (vLLM semantics). IDs outside the vocabulary are rejected by `add_request`. |
+| `LLMEngine` / `LLM` / `PDEngine` `logprobs_mode` | `"raw_logprobs"` | Engine-level, as in vLLM. `"processed_logprobs"` is the other accepted value; `raw_logits`, `processed_logits` and anything else raise `ValueError`. No CLI flag yet. |
+
+`LLMEngine.add_request` and `PDEngine.add_request` resolve `seed=None` (`resolve_seed`)
+before creating the `Request`, so P and D workers receive identical parameters and
+`RequestOutput.sampling_params.seed` reports the seed actually used. Replaying with it
+reproduces tokens and logprobs bitwise only with the same batch composition, scheduling,
+engine configuration, dtype and hardware, as with vLLM seeds. In a different batch, the
+GEMM and attention reductions can change the logits in the last bits. Logprobs then
+agree only numerically, and near a sampling or exit-threshold boundary the tokens and
+exit depths can diverge. `Sampler.sample` and `generator_for` raise if they ever see an
+unresolved seed.
+
+### Output contract
+
+`RequestOutput` appends `logprobs: list[float] | None` and `sampling_params` (the
+effective parameters). When a request sets `logprobs=0`, every output it emits,
+including streamed, `stop`, `length` and `abort` outputs, satisfies
+`len(logprobs) == len(token_ids) == len(exit_depths)`; otherwise `logprobs` is `None`.
+A stop token (EOS or a `stop_token_ids` entry) stays in `token_ids` with its depth and
+logprob. `LLMEngine._append_output` is the single place that appends a token, its depth
+and its logprob and decides `stop` (stop IDs, then EOS unless `ignore_eos`) before
+`length`; synchronous CODA, asynchronous delivery and speculative rounds all use it.
+`LLM.generate` omits the text of a matched `stop_token_ids` entry, as vLLM does; the
+token stays in `token_ids`, `exit_depths` and `logprobs`. EOS text handling is unchanged.
+The HTTP API does not accept `logprobs`, `stop_token_ids` or `seed: null` until the
+token-in/token-out API of #70.
+
+### Definitions
+
+Values are FP32, computed on the device from the CODA logits row of the emitted token.
+
+| Mode | Value |
+| --- | --- |
+| `raw_logprobs` | `log_softmax(coda_logits.float())[token]`: the model distribution at the depth where the token exited. |
+| `processed_logprobs` | `log_softmax(processed_logits(logits, params))[token]`: the distribution actually sampled from (temperature, then top-k, then top-p, excluded tokens `-inf`). Greedy requests report `log_softmax(logits.float())[token]` without temperature, as vLLM does. |
+
+`processed_logits` is the one function `Sampler.sample` and `probabilities()` use, so
+sampling arithmetic, op order and RNG consumption are unchanged. Logprobs are computed
+from `(logits row, params, token, mode)` after sampling and never consume RNG, so
+requesting them does not change sampled tokens.
+
+### Looped-model probability convention
+
+- `logprobs[i]` is conditional on `exit_depths[i]`: the token's policy is the model
+  truncated at that loop depth, not the full-depth model.
+- `token_ids[0]` always comes from full-depth prefill (`exit_depths[0]` is the model
+  depth). Per-request `min_loops`, `max_loops` and `exit_threshold` affect decode only.
+- Under `last_exited` KV, a trainer that recomputes logprobs with an ordinary full-depth
+  forward matches only rollouts whose `exit_depths` all equal the model depth:
+  `exit_threshold=1` and `max_loops` equal to the model depth, in a non-`trace` exit
+  mode. `trace` takes its depths from `depths_by_request`.
+- Under `shared` KV, prompt and decode positions read earlier tokens' final retained KV
+  at every loop depth (see [KV layout examples](kv_layout_computation.md)). No ordinary
+  forward reproduces these logprobs, even at full depth. The recompute must implement
+  shared-layout attention.
+- Per input position, a teacher-forced recompute runs prompt positions at the model
+  depth and the input `token_ids[i]` (at position `len(prompt) + i`) for
+  `exit_depths[i + 1]` loops: `[depth] * len(prompt) + exit_depths[1:]`. The last
+  generated token is never an input.
+- With early exit, the recompute must replay `exit_depths`. Under `last_exited` KV, a
+  token that exited at depth `d` has its depth-`d` KV copied into the deeper loop
+  planes, and later tokens attend to those copies; the recompute must reproduce that.
+
+### Data flow and cost
+
+| Path | Behavior |
+| --- | --- |
+| Synchronous | `ModelRunner._execute` returns `(token_ids, logprobs)` device tensors; `execute()` reads both back and `_update` appends them. |
+| Asynchronous | Token IDs stay on the device for the next prelude and `routing.scatter`, as before. Logprobs get a non-blocking FP32 copy into a pinned slot recorded on the same CUDA event; `_deliver_coda` appends them on delivery. |
+| PD | D samples and computes logprobs. The coordinator mirrors each output's `logprobs` into its `Request`, so `abort_request` stays aligned. P never samples. |
+| Speculative | `SpeculativeResult.logprobs` is appended per emitted token and sliced with the tokens on EOS, stop IDs and length. The runner does not compute it yet, so `add_request` rejects `logprobs` with `speculative_config`. |
+| Preemption, prefix caching | Snapshots retain the `Request`, so `request.logprobs` is neither reset nor duplicated; a prefix hit or a resumption matches the cold logprobs numerically (the tests use `abs=1e-6`), not bitwise on GPU, because the prefill chunking changes. |
+
+When no request in a CODA batch asks for logprobs there are no extra kernels, syncs,
+readbacks or allocations. Otherwise raw mode adds one batched
+`log_softmax(dtype=float32)` and `gather` over the batch (an FP32 `[rows, vocab]`
+temporary), and processed mode recomputes `processed_logits` for each requesting row,
+which repeats the top-k/top-p work of sampling. The synchronous path adds one small
+device-to-host copy. These costs have not been measured on GPU yet.
+
+### Readback slot sizing
+
+Asynchronous CUDA execution leases pinned host slots from preallocated pools. FP32
+exit-score slots are held by recurrent tickets until their scores are collected: at most
+one ticket per request through `_pending_exit_signals`, plus the in-flight submissions
+bounded by `submission_events`. A request whose output is still pending can already run
+its next token's recurrent loops, so it can hold an exit-score lease and a logprob lease
+at once. Logprobs therefore use a dedicated pool of `max_num_seqs + 4` FP32 slots with
+`max_num_seqs` rows each. A CODA ticket keeps its lease until `_deliver_coda` collects
+it. Each request has at most one undelivered output, so live CODA tickets never exceed
+`max_num_seqs`; tickets of aborted requests have completed events (`release()`
+synchronizes) and are collected at the next step before any new submission. The
+exit-score pool keeps its previous sizing argument unchanged.
+
+### Limitations
+
+- `logprobs > 0` (top-k alternatives) is not supported.
+- The HTTP API is unchanged: `logprobs` stays null-only, and `stop_token_ids` and
+  `seed: null` are rejected until the token-in/token-out API (RFC #70, PR 3).
+- Speculative decoding logprobs are pending in the speculative runner.
+- `finish_reason` is `stop` for both EOS and stop IDs; the matching ID is not reported.
+- GPU paths (CUDA readback, CUDA Graphs, PD) are covered by `@pytest.mark.gpu` tests
+  in `tests/test_rollout_outputs.py` that have not yet run in this change.

@@ -22,6 +22,8 @@ class SpeculativeResult:
     token_ids: list[int]
     accepted_count: int
     draft_count: int
+    # Aligned with token_ids when the request asked for logprobs; else None.
+    logprobs: list[float] | None = None
 
 
 @dataclass
