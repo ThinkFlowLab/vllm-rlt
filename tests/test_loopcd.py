@@ -175,14 +175,13 @@ def test_stale_reference_rejected(field):
         replace(ref, **{field: value}).check(request, 1, 0, 1)
 
 
-@pytest.mark.parametrize("case", ["unreserved", "reference", "early_exit", "prefix", "preemption"])
+@pytest.mark.parametrize("case", ["unreserved", "reference", "early_exit", "prefix"])
 def test_unsupported_admission_rejected_before_request_allocation(case):
     engine = LLMEngine(
         model_for(),
         cache_config=CacheConfig(
             num_blocks=256, block_size=2, enable_prefix_caching=case == "prefix"
         ),
-        scheduler_config=SchedulerConfig(enable_preemption=case == "preemption"),
         execution_config=ExecutionConfig(loopcd=case != "unreserved"),
     )
     params = params_for()

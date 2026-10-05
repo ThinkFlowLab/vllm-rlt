@@ -52,6 +52,13 @@ class RefillPolicy(SchedulingPolicy):
         scheduler._admit()
         if q[Stage.PREFILL]:
             return scheduler._take(Stage.PREFILL)
+        # Admission can restore a snapshot directly to a boundary stage.
+        if q[Stage.PRELUDE]:
+            return scheduler._take(Stage.PRELUDE)
+        if q[Stage.CODA] and (
+            len(q[Stage.CODA]) >= self.config.min_coda_batch_size or not q[Stage.RECURRENT]
+        ):
+            return scheduler._take(Stage.CODA)
         if q[Stage.RECURRENT]:
             return scheduler._take(Stage.RECURRENT)
         return None

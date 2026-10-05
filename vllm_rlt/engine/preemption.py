@@ -6,10 +6,12 @@ semantics. Snapshots are bounded by the admitted request population.
 """
 
 from copy import deepcopy
+from dataclasses import replace
 
 import torch
 
 from vllm_rlt.request import Stage
+from vllm_rlt.worker.loopcd import preemption_reference
 
 
 class PreemptionManager:
@@ -78,6 +80,9 @@ class PreemptionManager:
         e = self.engine
         e.model_runner.synchronize()
         cache = e.cache_manager
+        reference = preemption_reference(
+            victim, victim.stage, e.model_runner.loopcd_references.get(victim.request_id)
+        )
         allocation = cache._get_allocation(victim.request_id)
         blocks = [b for table in allocation.block_tables for b in table]
         # Copy views one page at a time: a pressure recovery must not allocate
@@ -89,6 +94,9 @@ class PreemptionManager:
             values[row].copy_(cache.value_cache[block])
         snapshot = dict(
             stage=victim.stage,
+            loopcd_reference=None
+            if reference is None
+            else replace(reference, hidden=reference.hidden.cpu().clone()),
             maximum=allocation.max_tokens,
             pages=len(allocation.block_tables[0]),
             written=deepcopy(allocation.written),
@@ -122,6 +130,7 @@ class PreemptionManager:
         if state is None:
             return None
         e, cache = self.engine, self.engine.cache_manager
+        reference = preemption_reference(request, state["stage"], state["loopcd_reference"])
         frontier = min(state["maximum"], state["pages"] * cache.block_size)
         if not cache.allocate(request.request_id, state["maximum"], initial_tokens=frontier):
             return False
@@ -135,6 +144,10 @@ class PreemptionManager:
         request.input_token_tensor = (
             None if state["token"] is None else state["token"].to(cache.device)
         )
+        if reference is not None:
+            e.model_runner.loopcd_references[request.request_id] = replace(
+                reference, hidden=reference.hidden.to(cache.device)
+            )
         # Restored buffers become visible to every runner stream before resumption.
         if cache.device.type == "cuda":
             torch.cuda.current_stream(cache.device).synchronize()
