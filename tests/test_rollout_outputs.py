@@ -23,8 +23,9 @@ from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine, Peer
 from vllm_rlt.request import RequestOutput, Stage
 from vllm_rlt.serving.protocol import CompletionRequest
+from vllm_rlt.worker import sampler, sampling
 from vllm_rlt.worker.model_runner import ReadbackSlot, Submission
-from vllm_rlt.worker.sampling import probabilities
+from vllm_rlt.worker.sampling import probabilities, processed_logits, token_logprob
 from vllm_rlt.worker.speculative import SpeculativeResult
 
 TRACES = {"a": [4, 1, 3, 2, 4, 1, 2, 3], "b": [4, 2, 1, 4, 3, 2, 1, 4]}  # Keyed by request ID.
@@ -204,22 +205,27 @@ def test_logprobs_are_defined_and_aligned_through_each_finish(
     rows = defaultdict(list)  # CODA logits rows in token order; the baseline runs first.
     common = dict(min_loops=1, exit_threshold=threshold)
     options = dict(asynchronous=asynchronous, exit_config=exit_config, logprobs_mode=logprobs_mode)
-    # The unrequested row exercises mixed batches (NaN or ignored values). Admitted first, it
-    # puts "a" behind row 0 in shared batches, so each row must read its own logprob.
+    # The unrequested row exercises mixed batches (ignored values). Admitted first, it puts
+    # "a" behind row 0 in shared batches, so each row must read its own logprob.
     unrequested = rollout(max_tokens=6, temperature=0.9, seed=5, logprobs=None, **common)
 
     def run(params, *, eos=0, abort=False):
         engine = make_engine(model(eos_token_id=eos), **options)
-        runner, sample = engine.model_runner, engine.model_runner._sample_tensor
+        runner = engine.model_runner
         if params.logprobs is None:  # No logprob work when no request asks.
             unexpected = AssertionError("logprobs computed without a request")
-            monkeypatch.setattr(runner, "_logprobs", Mock(side_effect=unexpected))
+            monkeypatch.setattr(runner, "_sample_with_logprobs", Mock(side_effect=unexpected))
 
-        def record(row, request):
-            rows[request.request_id].append(row.detach().clone())
-            return sample(row, request)
+        def recording(sample):
+            def record(row, request):
+                rows[request.request_id].append(row.detach().clone())
+                return sample(row, request)
 
-        runner._sample_tensor = record
+            return record
+
+        # Processed top-k/top-p rows that request logprobs draw through _sample_with_logprob.
+        for name in ("_sample_tensor", "_sample_with_logprob"):
+            setattr(runner, name, recording(getattr(runner, name)))
         engine.add_request("b", [4], unrequested)
         engine.add_request("a", [2, 3], replace(params, **common))
         if not abort:
@@ -273,6 +279,68 @@ def test_logprobs_are_defined_and_aligned_through_each_finish(
         k = len(output.token_ids)
         assert output.token_ids == tokens[:k] and output.exit_depths == baseline.exit_depths[:k]
         assert output.logprobs == baseline.logprobs[:k]
+
+
+# Request ID -> overrides covering each processed-logprob path: one batched raw log_softmax
+# (greedy, even with top-k, and T == 1), one per other temperature (0.7 twice, 1.3), the
+# sampler's top-k/top-p logits, and a row that asks for no logprobs.
+MIXED_ROWS = {
+    "greedy": dict(temperature=0.0, top_k=3),
+    "t1": dict(temperature=1.0),
+    "t07": dict(temperature=0.7),
+    "t07b": dict(temperature=0.7),
+    "t13": dict(temperature=1.3),
+    "top_k": dict(temperature=0.9, top_k=8),
+    "top_p": dict(temperature=1.0, top_p=0.8),
+    "top_k_top_p": dict(temperature=0.7, top_k=16, top_p=0.9),
+    "quiet": dict(temperature=0.8, logprobs=None),
+}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_grouped_processed_logprobs_equal_the_per_row_reference(monkeypatch, asynchronous):
+    mode, built = "processed_logprobs", []  # built: one entry per processed_logits call.
+
+    def counted(logits, params):
+        built.append(params)
+        return processed_logits(logits, params)
+
+    for module in (sampler, sampling):
+        monkeypatch.setattr(module, "processed_logits", counted)
+    batch_sizes = []
+
+    def run(logprobs):
+        scheduler = SchedulerConfig(max_num_seqs=9, max_num_batched_tokens=16)
+        options = dict(logprobs_mode=mode, scheduler_config=scheduler)
+        engine = make_engine(model(), asynchronous=asynchronous, **options)
+        runner = engine.model_runner
+        batched = runner._sample_with_logprobs
+
+        def checked(logits, requests):
+            before = len(built)
+            token_ids, values = batched(logits, requests)
+            # Sampling builds each sampled row's processed logits once; logprobs reuse them.
+            assert len(built) - before == sum(r.sampling_params.temperature > 0 for r in requests)
+            for row, request in enumerate(requests):  # 57d2308 ran token_logprob per row.
+                params = request.sampling_params
+                if params.logprobs is not None:
+                    reference = token_logprob(logits[row], params, token_ids[row], mode)
+                    assert torch.equal(values[row], reference)
+            batch_sizes.append(len(requests))
+            return token_ids, values
+
+        monkeypatch.setattr(runner, "_sample_with_logprobs", checked)
+        for i, (rid, overrides) in enumerate(MIXED_ROWS.items()):
+            params = rollout(max_tokens=6, seed=20 + i, exit_threshold=1.0, **overrides)
+            engine.add_request(rid, [1 + i], params if logprobs else replace(params, logprobs=None))
+        return final(stream(engine))
+
+    grouped, quiet = run(logprobs=True), run(logprobs=False)
+    assert max(batch_sizes) == len(MIXED_ROWS)  # Every path shared one CODA batch.
+    for rid, output in quiet.items():  # Logprobs change no token, depth or RNG draw.
+        assert grouped[rid].token_ids == output.token_ids
+        assert grouped[rid].exit_depths == output.exit_depths
+        assert (grouped[rid].logprobs is None) == (rid == "quiet")
 
 
 @pytest.mark.parametrize("layout", ["last_exited", "shared"])

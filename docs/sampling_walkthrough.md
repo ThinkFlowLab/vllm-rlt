@@ -398,9 +398,10 @@ Values are FP32, computed on the device from the CODA logits row of the emitted 
 | `processed_logprobs` | `log_softmax(processed_logits(logits, params))[token]`: the distribution actually sampled from (temperature, then top-k, then top-p, excluded tokens `-inf`). Greedy requests report `log_softmax(logits.float())[token]` without temperature, as vLLM does. |
 
 `processed_logits` is the one function `Sampler.sample` and `probabilities()` use, so
-sampling arithmetic, op order and RNG consumption are unchanged. Logprobs are computed
-from `(logits row, params, token, mode)` after sampling and never consume RNG, so
-requesting them does not change sampled tokens.
+sampling arithmetic, op order and RNG consumption are unchanged. Logprobs never consume
+RNG, so requesting them does not change sampled tokens: a top-k/top-p row is scored from
+the processed logits it was drawn from, the other rows after sampling (see "Data flow and
+cost").
 
 ### Looped-model probability convention
 
@@ -437,9 +438,36 @@ requesting them does not change sampled tokens.
 When no request in a CODA batch asks for logprobs there are no extra kernels, syncs,
 readbacks or allocations. Otherwise raw mode adds one batched
 `log_softmax(dtype=float32)` and `gather` over the batch (an FP32 `[rows, vocab]`
-temporary), and processed mode recomputes `processed_logits` for each requesting row,
-which repeats the top-k/top-p work of sampling. The synchronous path adds one small
-device-to-host copy. These costs have not been measured on GPU yet.
+temporary). Processed mode (`ModelRunner._sample_with_logprobs`,
+`sampling.processed_logprobs`) groups the requesting rows so that no row rebuilds its
+processed logits:
+
+| Requesting row | Logprob source | Added work per CODA step |
+| --- | --- | --- |
+| Greedy (any top-k/top-p), or `T == 1` without top-k/top-p | Raw `log_softmax`: `logits.float() / 1.0` is exact, so the value is the raw one | One `log_softmax` + `gather` over the group's rows, shared by the group |
+| `T != 1` without top-k/top-p | `log_softmax(logits.float() / T)`, dividing by the Python scalar `T` as `processed_logits` does | One division, `log_softmax` + `gather` per distinct `T` over that group's rows |
+| `T > 0` with `top_k > 0` or `top_p < 1` | `Sampler.sample_with_logprob`: `log_softmax` of the processed logits the token was just drawn from | One row `log_softmax` + `gather` per row |
+
+Every other row samples through `_sample_tensor` as before. A group's pass covers its row
+span, first to last row, when that span is at most twice its rows, and each of its rows on
+its own otherwise; so however many temperatures a batch mixes, the scored rows never
+exceed twice the requesting rows (57d2308 scored each requesting row once). When no row
+is top-k/top-p and the only group holds at least half the rows, one pass over the whole
+batch is returned as is; otherwise one `torch.stack` of 0-dim views assembles the result.
+Rows that did not ask hold arbitrary values, which the engine ignores. Grouping happens
+on the host from `SamplingParams` and spans are host-integer slices: no host sync, no
+per-row device writes and no host-to-device copy of per-row metadata, synchronous or
+asynchronous. With all rows at `T == 1`, processed mode costs what raw mode does; with all
+rows at one other temperature it adds one division; top-k/top-p rows keep a per-row
+`log_softmax` + `gather` but no longer repeat the sort, top-k and masking of sampling. The
+values equal those of 57d2308, which called `token_logprob` per requesting row, bitwise
+on CPU in FP32 and BF16 (tests compare against `token_logprob` per row). The synchronous
+path adds one small device-to-host copy.
+
+57d2308 measured on an RTX PRO 6000 (Ouro-1.4B BF16, CUDA graphs) a throughput overhead
+of +0.76% sync and -0.11% async (noise) for raw versus `logprobs=None`, of +5.27% sync
+and +0.03% async for processed at `T = 1`, and of +14.9% sync and +15.4% async for
+processed versus raw at `T = 0.7, top_p = 0.9`; re-measured after this change in the PR.
 
 ### Readback slot sizing
 
