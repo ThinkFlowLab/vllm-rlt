@@ -13,7 +13,6 @@ from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
 from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.transport import kv_segments, partition_segments
-from vllm_rlt.profiling import Profiler
 
 
 def test_transfer_lease_defers_free_until_last_reader():
@@ -230,46 +229,33 @@ def test_pd_cancel_during_execution_and_close_with_live_request(phase):
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
-    from types import SimpleNamespace
+def test_engine_yields_while_waiting_for_remote_kv(async_scheduling, monkeypatch):
     from unittest.mock import Mock
 
-    from vllm_rlt.core.scheduler import Scheduler
-    from vllm_rlt.engine.preemption import PreemptionManager
     from vllm_rlt.request import Request, Stage
 
-    engine = object.__new__(LLMEngine)
-    engine.profiling = Profiler("cpu")
-    engine.preemption = PreemptionManager(engine)
-    engine.execution_config = ExecutionConfig(async_scheduling=async_scheduling)
-    engine.scheduler = Scheduler(SchedulerConfig(), Mock())
-    engine.cache_manager = engine.scheduler.cache_manager
+    torch.manual_seed(123)
+    engine = LLMEngine(
+        OuroForCausalLM(tiny_ouro_config()),
+        execution_config=ExecutionConfig(async_scheduling=async_scheduling),
+        exit_config=ExitConfig("ouro_delayed") if async_scheduling else None,
+    )
+    synchronize = Mock(wraps=engine.model_runner.synchronize)
+    monkeypatch.setattr(engine.model_runner, "synchronize", synchronize)
     receiving = Request("remote", [1], SamplingParams(max_tokens=1), stage=Stage.RECEIVING)
     engine.scheduler.requests[receiving.request_id] = receiving
-    engine._inflight = []
-    engine._pending_coda = []
-    engine._overlap_boundary = False
-    engine._pending_exit_signals = {}
-    engine.model_runner = Mock()
     assert engine.step() == []
     assert engine.has_unfinished_requests()
-    engine.model_runner.synchronize.assert_not_called()
+    synchronize.assert_not_called()
     if async_scheduling:
         # Reap the last local output while another request still awaits KV.
-        active = Request("local", [1], SamplingParams(max_tokens=1), stage=Stage.CODA)
-        engine.scheduler.requests[active.request_id] = active
-        active.num_output_placeholders = 1
-        engine.model = SimpleNamespace(config=SimpleNamespace(eos_token_id=2))
-        ticket = Mock()
-        ticket.batch.items = [SimpleNamespace(request=active)]
-        ticket.ready.return_value = True
-        ticket.collect.return_value = [3]
-        ticket.output_indices = [0]
-        ticket.depths = [4]
-        engine._pending_coda = [ticket]
+        engine.add_request("local", [1], SamplingParams(max_tokens=1, ignore_eos=True))
+        assert engine.step() == []  # PREFILL
+        assert engine.step() == []  # CODA submission
+        assert len(engine._pending_coda) == 1
         outputs = engine.step()
         assert len(outputs) == 1 and outputs[0].finished
-        assert outputs[0].token_ids == [3]
+        assert len(outputs[0].token_ids) == 1
         assert list(engine.scheduler.requests) == ["remote"]
     # A lost runnable request must still trigger the original invariant.
     receiving.stage = Stage.RECURRENT
@@ -280,6 +266,9 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 @pytest.mark.gpu
 @pytest.mark.parametrize("p_cache,d_cache", [(True, True), (True, False), (False, True)])
 def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cache):
+    pytest.importorskip("nixl")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 visible GPUs")
     from vllm_rlt.pd.engine import PDEngine
 
     cfg = tiny_ouro_config(head_dim=64)
