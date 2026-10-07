@@ -41,11 +41,10 @@ def test_sync_adapters_preserve_row_identity_and_host_values():
     assert coda.sampled_token_ids == (5,)
     speculative = adapt_speculative_execute(
         batch(Stage.SPECULATIVE),
-        [SimpleNamespace(token_ids=[6, 7], accepted_count=1, draft_count=2)],
+        [SimpleNamespace(token_ids=[6, 7], accepted_count=1)],
     )
     assert speculative.speculative[0].token_ids == (6, 7)
     assert speculative.speculative[0].accepted_count == 1
-    assert speculative.speculative[0].draft_count == 2
 
 
 def test_async_adapters_separate_submission_from_delivery():

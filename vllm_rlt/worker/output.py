@@ -26,7 +26,6 @@ class ExitSignal:
 class SpeculativeTokens:
     token_ids: tuple[int, ...]
     accepted_count: int
-    draft_count: int
 
 
 @dataclass(slots=True)

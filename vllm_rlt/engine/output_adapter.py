@@ -1,4 +1,4 @@
-"""Temporary wrappers around the existing runner calls and readbacks."""
+"""Adapt runner calls to Scheduler results."""
 
 from dataclasses import dataclass
 
@@ -13,7 +13,6 @@ class SignalHandle:
     generation: int
     position: int
     signal_depth: int
-    source_seq: int
 
 
 def adapt_sync_execute(batch, values) -> ModelRunnerOutput:
@@ -43,9 +42,7 @@ def adapt_speculative_execute(batch, results) -> ModelRunnerOutput:
         batch.seq,
         batch.stage,
         Progress.COMPLETED,
-        speculative=tuple(
-            SpeculativeTokens(tuple(r.token_ids), r.accepted_count, r.draft_count) for r in results
-        ),
+        speculative=tuple(SpeculativeTokens(tuple(r.token_ids), r.accepted_count) for r in results),
     )
 
 

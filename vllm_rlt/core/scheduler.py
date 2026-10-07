@@ -376,12 +376,10 @@ class Scheduler:
         return cache.ensure_capacity(request.request_id, frontier)
 
     def _take(self, stage: Stage) -> SchedulerOutput | None:
-        """Build a stage batch: describe work -> ensure capacity -> select.
+        """Select work whose KV capacity is available.
 
-        Requests that cannot grow return to the tail. Scan at most the initial
-        queue length so a blocked request cannot cycle forever in this call.
-        Successful items leave the queue; the engine later updates progress and
-        enqueues their next stage after handling execution results.
+        Scan only the initial queue; blocked requests return to its tail.
+        Selected work advances through update_from_output.
         """
         token_budget = self.config.max_num_batched_tokens
         items = []
@@ -590,6 +588,7 @@ class Scheduler:
                 if reason is not None:
                     update.finished.append((item.request_id, item.generation, reason))
                 else:
+                    # The final emitted token has not been forwarded yet.
                     self.cache_manager.truncate_suffix(item.request_id, item.token_start + emitted)
                     request.loops_done = 0
                     self.enqueue(request, Stage.SPECULATIVE)

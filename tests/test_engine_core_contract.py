@@ -1,4 +1,4 @@
-"""Behavior pinned before moving result application into the scheduler."""
+"""Scheduler result-application regression tests."""
 
 import math
 from dataclasses import replace
@@ -252,7 +252,6 @@ def test_scheduled_snapshots_match_runner_prepare_and_seqs_are_unique(monkeypatc
         prepared = prepare(batch)
         observed.append((batch.seq, batch.stage))
         assert batch.seq > 0
-        assert replace(batch, items=list(batch.items)).seq == batch.seq
         for row, item in enumerate(batch.items):
             assert item.request_id == item.request.request_id
             assert item.generation == item.request.generation

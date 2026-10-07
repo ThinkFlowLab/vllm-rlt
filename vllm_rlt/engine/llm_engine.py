@@ -129,8 +129,7 @@ class LLMEngine:
         self._exit_traces = {
             key: tuple(values) for key, values in (self.exit_config.depths_by_request or {}).items()
         }
-        # Unconsumed exit scores: request ID -> device-owned readback handle.
-        # Delayed policies consume the preceding loop's score after submitting the next.
+        # Delayed scores are read after the next core submission.
         self._pending_exit_signals = {}
         self._pending_coda = []
         self._inflight = []
@@ -309,7 +308,7 @@ class LLMEngine:
             for row in update.next_prelude:
                 item = batch.items[row]
                 if self._is_live(item):
-                    # R1 shim: the runner still takes its device token from Request.
+                    # Prelude uses the device token before CPU delivery.
                     item.request.input_token_tensor = ticket.device_values[row]
             for row, rid, generation, position, signal_depth in update.retain_signal:
                 item = batch.items[row]
@@ -320,7 +319,6 @@ class LLMEngine:
                         generation=generation,
                         position=position,
                         signal_depth=signal_depth,
-                        source_seq=batch.seq,
                     )
         return [RequestOutput.from_request(item.request) for item in update.output_rows]
 
@@ -386,8 +384,7 @@ class LLMEngine:
                 and runner.boundary_stream is not runner.core_stream
             )
         elif batch.stage == Stage.RECURRENT:
-            # The next core is submitted before collecting the previous score.
-            # Retained handles are exactly those Scheduler expects to consume.
+            # Submit the next core before reading retained scores.
             for item in batch.items:
                 previous = self._pending_exit_signals.pop(item.request_id, None)
                 if previous is None or previous.generation != item.generation:
@@ -399,7 +396,7 @@ class LLMEngine:
                         previous.generation,
                         previous.position,
                         previous.signal_depth,
-                        previous.source_seq,
+                        previous.ticket.batch.seq,
                         score,
                     )
                 )
