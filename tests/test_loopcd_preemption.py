@@ -36,6 +36,11 @@ def model_for():
     return OuroForCausalLM(tiny_ouro_config()).eval()
 
 
+def gpu_model_for():
+    torch.manual_seed(42)
+    return OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda").eval()
+
+
 def params_for(strength=0.3, decode=4, implementation="two_head"):
     return SamplingParams(
         min_loops=decode,
@@ -53,9 +58,10 @@ def params_for(strength=0.3, decode=4, implementation="two_head"):
     )
 
 
-def engine_for(model, mode="refill"):
+def engine_for(model, mode="refill", attention_backend="torch", static_buffers=False):
     return LLMEngine(
         model,
+        attention_backend=attention_backend,
         cache_config=CacheConfig(num_blocks=128, block_size=2),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
@@ -64,7 +70,9 @@ def engine_for(model, mode="refill"):
             enable_preemption=True,
             mode=mode,
         ),
-        execution_config=ExecutionConfig(loopcd=True, prefill_depth=4),
+        execution_config=ExecutionConfig(
+            loopcd=True, prefill_depth=4, static_buffers=static_buffers
+        ),
     )
 
 
@@ -264,12 +272,26 @@ def test_graph_preemption_stays_rejected_until_separate_qualification():
         )
 
 
+DEVICE_CASES = [
+    pytest.param("cpu", False, id="cpu"),
+    pytest.param("cuda", False, marks=pytest.mark.gpu, id="cuda-static-off"),
+    pytest.param("cuda", True, marks=pytest.mark.gpu, id="cuda-static-on"),
+]
+
+
+@pytest.mark.parametrize("device,static_buffers", DEVICE_CASES)
 @pytest.mark.parametrize("policy", ["priority", "pressure"])
 @torch.inference_mode()
-def test_guided_requests_survive_scheduler_driven_preemption(policy):
-    model = model_for()
+def test_guided_requests_survive_scheduler_driven_preemption(policy, device, static_buffers):
+    if device == "cpu":
+        model = model_for()
+        attention_backend = "torch"
+    else:
+        model = gpu_model_for()
+        attention_backend = "triton"
     engine = LLMEngine(
         model,
+        attention_backend=attention_backend,
         cache_config=CacheConfig(
             num_blocks=64 if policy == "priority" else 24,
             block_size=2,
@@ -282,7 +304,9 @@ def test_guided_requests_survive_scheduler_driven_preemption(policy):
             policy="priority" if policy == "priority" else "fcfs",
             enable_preemption=True,
         ),
-        execution_config=ExecutionConfig(loopcd=True, prefill_depth=4),
+        execution_config=ExecutionConfig(
+            loopcd=True, prefill_depth=4, static_buffers=static_buffers
+        ),
     )
     params = params_for()
     if policy == "priority":
@@ -311,7 +335,7 @@ def test_guided_requests_survive_scheduler_driven_preemption(policy):
     assert engine.cache_manager.num_used_blocks == 0
     if policy == "priority":
         assert list(completed) == ["b", "a"]
-    baseline = engine_for(model)
+    baseline = engine_for(model, attention_backend=attention_backend, static_buffers=static_buffers)
     baseline.add_request("a", PROMPT, params)
     expected = drain(baseline)
     for name in ("a",) if policy == "priority" else ("a", "b", "c"):

@@ -101,5 +101,15 @@ object and cannot inherit the old guidance state.
 `tests/test_loopcd_preemption.py` covers suspend/resume logits and seeded
 sampling, all relevant stage boundaries, asymmetric P4/D2, repeated preemption,
 capacity-blocked restore, cancellation, ID reuse and rejection of corrupted
-reference identity/metadata. Graph preemption, async execution, P/D handoff,
-prefix caching and speculative decoding are outside this contract.
+reference identity/metadata. Scheduler-driven priority and KV-pressure tests
+also check output parity and resource cleanup on CPU and Triton FP32 CUDA.
+The CUDA cases cover static buffers off and on. The CUDA tests use tiny random checkpoints and
+require the `gpu` marker.
+
+Separate official Ouro-1.4B runs cover FP32/BF16 priority preemption and FP32
+multi-request KV pressure. Priority logits match exactly. Pressure tokens,
+exit depths and recurrent-work counts match uninterrupted runs; score
+differences up to `2.4e-5` also occur in an unpreempted batching control.
+Official BF16 multi-request pressure and throughput remain unmeasured.
+Graph preemption, async execution, P/D handoff, prefix caching and speculative
+decoding are outside this contract.
