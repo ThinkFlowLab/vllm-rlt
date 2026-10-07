@@ -2,6 +2,8 @@
 
 This note documents the first Scheduler-focused increment of the M3 refactor:
 
+The later R1 result-application migration is documented in [engine_core_walkthrough.md](engine_core_walkthrough.md). The Engine-owned progression described below is the earlier increment's baseline.
+
 - [scheduler.py](../vllm_rlt/core/scheduler.py): request registration, termination, admission, and batch construction.
 - [scheduling_policy.py](../vllm_rlt/core/scheduling_policy.py): refill/no-refill stage selection and fairness state.
 - [request.py](../vllm_rlt/request.py): request stages, termination reasons, and output conversion.

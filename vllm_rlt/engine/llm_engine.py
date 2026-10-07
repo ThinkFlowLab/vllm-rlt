@@ -4,12 +4,20 @@ from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerC
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
+from vllm_rlt.engine.output_adapter import (
+    SignalHandle,
+    adapt_async_delivery,
+    adapt_async_submit,
+    adapt_speculative_execute,
+    adapt_sync_execute,
+)
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.model_runner import ModelRunner
+from vllm_rlt.worker.output import ExitSignal
 from vllm_rlt.worker.speculative import SpeculativeRunner
 
 
@@ -96,7 +104,16 @@ class LLMEngine:
             or getattr(self.cache_manager.attention, "generation", None) != 4
         ):
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
-        self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
+        eos = config.eos_token_id
+        eos_ids = eos if isinstance(eos, (tuple, list)) else (eos,)
+        self.scheduler = Scheduler(
+            scheduler_config,
+            self.cache_manager,
+            speculative_config,
+            total_ut_steps=config.total_ut_steps,
+            exit_mode=self.exit_config.mode,
+            eos_token_ids=eos_ids,
+        )
         self.speculative_runner = (
             SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)
             if speculative_config is not None
@@ -112,7 +129,7 @@ class LLMEngine:
         self._exit_traces = {
             key: tuple(values) for key, values in (self.exit_config.depths_by_request or {}).items()
         }
-        # Unconsumed exit scores: request ID -> (submission, row, token position, depth).
+        # Unconsumed exit scores: request ID -> device-owned readback handle.
         # Delayed policies consume the preceding loop's score after submitting the next.
         self._pending_exit_signals = {}
         self._pending_coda = []
@@ -186,6 +203,9 @@ class LLMEngine:
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests
 
+    def _is_live(self, item) -> bool:
+        return self.scheduler.get_live(item.request_id, item.generation) is not None
+
     def abort_request(self, request_id: str) -> RequestOutput:
         self.preemption.discard_snapshot(request_id)
         self.model_runner.release(request_id)
@@ -232,6 +252,9 @@ class LLMEngine:
                 self._pending_coda.clear()
                 self._inflight.clear()
                 raise
+        return self._step_sync()
+
+    def _step_sync(self) -> list[RequestOutput]:
         batch = self.scheduler.schedule()
         self.last_schedule = batch
         if batch is None:
@@ -241,182 +264,72 @@ class LLMEngine:
             return []
         try:
             if batch.stage == Stage.SPECULATIVE:
-                result = self.speculative_runner.execute(batch)
-                return self._update_speculative(batch, result)
-            result = self.model_runner.execute(batch)
-            return self._update(batch, result)
+                raw = self.speculative_runner.execute(batch)
+                result = adapt_speculative_execute(batch, raw)
+            else:
+                raw = self.model_runner.execute(batch)
+                result = adapt_sync_execute(batch, raw)
+            update = self.scheduler.update_from_output(batch, result)
+            return self._apply_scheduler_update(batch, update)
         except Exception:
-            # A failed execution may have partially written KV; invalidate the affected requests.
+            # A failed execution or result application invalidates this batch.
             for item in batch.items:
-                if item.request.request_id in self.scheduler.requests:
-                    self.abort_request(item.request.request_id)
+                if self._is_live(item):
+                    self.abort_request(item.request_id)
             raise
 
-    def _update_speculative(self, batch, results):
-        outputs = []
-        for item, result in zip(batch.items, results):
-            request = item.request
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            emitted = 0
-            reason = None
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
-                emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    reason = FinishReason.STOP
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    reason = FinishReason.LENGTH
-                    break
-            self.speculative_runner.stats.committed_tokens += emitted
-            self.speculative_runner.stats.accepted_tokens += min(result.accepted_count, emitted)
-            if reason is not None:
-                self._finish(request, reason)
-            else:
-                # The last emitted token is correction/bonus, not yet forwarded.
-                self.cache_manager.truncate_suffix(request.request_id, item.token_start + emitted)
-                request.loops_done = 0
-                self.scheduler.enqueue(request, Stage.SPECULATIVE)
-            outputs.append(RequestOutput.from_request(request))
-        return outputs
-
-    def _update(self, batch, result) -> list[RequestOutput]:
-        outputs = []
-        for index, item in enumerate(batch.items):
-            request = item.request
-            # Ignore results for a request that is no longer registered: it may
-            # have been cancelled, or its ID may now belong to a new Request.
-            # Compare object identity so an old result cannot update the new request.
-            if self.scheduler.requests.get(request.request_id) is not request:
-                continue
-            params = request.sampling_params
-            if batch.stage == Stage.PREFILL:
-                request.num_prefilled_tokens += item.token_count
-                event = self.model_runner.events.get(request.request_id)
-                self.cache_manager.publish_prefix(
-                    request.request_id,
-                    request.prompt_token_ids,
-                    request.num_prefilled_tokens,
-                    event,
-                )
-                if request.num_prefilled_tokens == len(request.prompt_token_ids):
-                    request.loops_done = self.model.config.total_ut_steps
-                    self.scheduler.enqueue(request, Stage.CODA)
-                else:
-                    self.scheduler.enqueue(request, Stage.PREFILL)
-            elif batch.stage == Stage.PRELUDE:
-                request.loops_done = 0
-                request.remaining_probability = 1.0
-                request.pending_exit_depth = None
-                self._pending_exit_signals.pop(request.request_id, None)
-                self.scheduler.enqueue(request, Stage.RECURRENT)
-            elif batch.stage == Stage.RECURRENT:
-                request.loops_done += 1
-                if self.exit_config.mode == "trace":
-                    should_exit = self._trace_exit(request)
-                elif self.exit_config.mode == "ouro":
-                    request.remaining_probability *= 1.0 - result[index]
-                    should_exit = self._should_exit(request)
-                else:
-                    should_exit = self._delayed_exit(request, result[index])
-                if should_exit:
-                    self.model_runner.finalize(request)
-                    self.scheduler.enqueue(request, Stage.CODA)
-                else:
-                    self.scheduler.enqueue(request, Stage.RECURRENT)
-            elif batch.stage == Stage.CODA:
-                token_id = result[index]
-                request.generated_token_ids.append(token_id)
-                request.exit_depths.append(request.loops_done)
-                eos = self.model.config.eos_token_id
-                eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-                if token_id in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                elif len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
-                else:
-                    self.scheduler.enqueue(
-                        request, Stage.SPECULATIVE if self.speculative_config else Stage.PRELUDE
-                    )
-                outputs.append(RequestOutput.from_request(request))
-        return outputs
-
-    def _should_exit(self, request: Request) -> bool:
-        """Evaluate the policy after recording the completed loop's actual hazard."""
-        params = request.sampling_params
-        max_loops = params.max_loops or self.model.config.total_ut_steps
-        reached_threshold = (
-            params.exit_threshold < 1.0
-            and request.loops_done >= params.min_loops
-            and 1.0 - request.remaining_probability >= params.exit_threshold
-        )
-        return request.loops_done >= max_loops or reached_threshold
-
-    def _finish(self, request, reason: FinishReason):
+    def _finish(self, request: Request, reason: FinishReason) -> None:
         self.model_runner.release(request.request_id)
         self.cache_manager.poll_prefixes()
         self._pending_exit_signals.pop(request.request_id, None)
         self.scheduler.finish(request, reason)
 
-    def _trace_exit(self, request):
-        target = request.exit_trace[request.num_scheduled_outputs]
-        return request.loops_done >= target
+    def _apply_scheduler_update(self, batch, update, ticket=None) -> list[RequestOutput]:
+        if batch.stage == Stage.PRELUDE:
+            for item in batch.items:
+                if self._is_live(item):
+                    self._pending_exit_signals.pop(item.request_id, None)
+        if update.exited:
+            requests = []
+            for rid, generation in update.exited:
+                request = self.scheduler.get_live(rid, generation)
+                if request is not None:
+                    requests.append(request)
+            self.model_runner.finalize_many(requests)
+        for rid, generation, reason in update.finished:
+            request = self.scheduler.get_live(rid, generation)
+            if request is not None:
+                self._finish(request, reason)
+        if update.speculative_committed:
+            stats = self.speculative_runner.stats
+            for committed, accepted in update.speculative_committed:
+                stats.committed_tokens += committed
+                stats.accepted_tokens += accepted
+        if ticket is not None:
+            for row in update.next_prelude:
+                item = batch.items[row]
+                if self._is_live(item):
+                    # R1 shim: the runner still takes its device token from Request.
+                    item.request.input_token_tensor = ticket.device_values[row]
+            for row, rid, generation, position, signal_depth in update.retain_signal:
+                item = batch.items[row]
+                if self._is_live(item):
+                    self._pending_exit_signals[rid] = SignalHandle(
+                        ticket=ticket,
+                        row=row,
+                        generation=generation,
+                        position=position,
+                        signal_depth=signal_depth,
+                        source_seq=batch.seq,
+                    )
+        return [RequestOutput.from_request(item.request) for item in update.output_rows]
 
-    def _delayed_exit(self, request, score):
-        params = request.sampling_params
-        maximum = params.max_loops or self.model.config.total_ut_steps
-        if request.loops_done >= maximum or request.pending_exit_depth == request.loops_done:
-            return True
-        target = request.loops_done + 1
-        if self._delayed_signal(request, score, request.loops_done):
-            request.pending_exit_depth = target
-        return False
+    def _deliver_coda(self, ticket) -> list[RequestOutput]:
+        result = adapt_async_delivery(ticket)
+        update = self.scheduler.update_from_output(ticket.batch, result)
+        return self._apply_scheduler_update(ticket.batch, update, ticket)
 
-    def _delayed_signal(self, request, score, signal_depth):
-        """Consume each signal once; Ouro's minimum applies to the trigger round."""
-        params = request.sampling_params
-        if self.exit_config.mode == "ouro_delayed":
-            request.remaining_probability *= 1.0 - score
-            score = 1.0 - request.remaining_probability
-            eligible_depth = signal_depth
-        else:
-            eligible_depth = signal_depth + 1
-        return (
-            params.exit_threshold < 1
-            and eligible_depth >= params.min_loops
-            and score >= params.exit_threshold
-        )
-
-    def _deliver_coda(self, ticket):
-        outputs = []
-        result = ticket.collect()
-        for index, item in enumerate(ticket.batch.items):
-            request = item.request
-            if self.scheduler.requests.get(request.request_id) is not request:
-                continue
-            if ticket.output_indices[index] != len(request.generated_token_ids):
-                raise RuntimeError("out-of-order coda delivery")
-            if request.num_output_placeholders != 1:
-                raise RuntimeError("invalid pending output count")
-            request.num_output_placeholders -= 1
-            token_id = result[index]
-            request.generated_token_ids.append(token_id)
-            # Current loops_done may already describe the NEXT token.
-            request.exit_depths.append(ticket.depths[index])
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            if token_id in eos_ids and not params.ignore_eos:
-                self._finish(request, FinishReason.STOP)
-            elif len(request.generated_token_ids) >= params.max_tokens:
-                self._finish(request, FinishReason.LENGTH)
-            outputs.append(RequestOutput.from_request(request))
-        return outputs
-
-    def _collect_coda(self, wait=False):
+    def _collect_coda(self, wait=False) -> list[RequestOutput]:
         outputs = []
         pending = []
         for ticket in self._pending_coda:
@@ -428,45 +341,43 @@ class LLMEngine:
         self._pending_coda = pending
         return outputs
 
-    def _step_async(self):
+    def _step_async(self) -> list[RequestOutput]:
         # Hold readback buffers until their DMA completes, even for discarded scores.
         self._inflight = [t for t in self._inflight if not t.ready()]
         outputs = self._collect_coda()
         batch = self.scheduler.schedule(
-            # If the preceding core is still running, boundary work can overlap
-            # the independent next core. Once it has completed, refill first:
-            # splitting on a briefly pending coda readback fragments the batch.
+            # Once a core has completed, refill first; a briefly pending coda
+            # readback should not fragment the next batch.
             prefer_recurrent=self._overlap_boundary
             and any(t.batch.stage == Stage.RECURRENT and not t.ready() for t in self._inflight)
         )
         self._overlap_boundary = False
         self.last_schedule = batch
         if batch is None:
-            # PD imports wait for external KV completion; yield to the IPC loop.
             if self._pending_coda:
                 outputs.extend(self._collect_coda(wait=True))
             elif any(r.stage != Stage.RECEIVING for r in self.scheduler.requests.values()):
                 raise RuntimeError("scheduler made no progress")
             return outputs
         if batch.stage == Stage.CODA:
-            # Bound speculation to one output per request. Its next prelude and
-            # core may run before delivery (including a possible EOS), but never
-            # sample another token until that output's stop decision is known.
-            while any(i.request.num_output_placeholders for i in batch.items):
+            # One outstanding sample per request. Device-token prelude/core may
+            # proceed, but a second sample waits for the first CPU delivery.
+            while True:
+                pending = {
+                    (item.request_id, item.generation)
+                    for ticket in self._pending_coda
+                    for item in ticket.batch.items
+                }
+                if not any((i.request_id, i.generation) in pending for i in batch.items):
+                    break
                 outputs.extend(self._collect_coda(wait=True))
-            batch = replace(
-                batch,
-                items=[
-                    i
-                    for i in batch.items
-                    if self.scheduler.requests.get(i.request.request_id) is i.request
-                ],
-            )
+            batch = replace(batch, items=[i for i in batch.items if self._is_live(i)])
             self.last_schedule = batch
             if not batch.items:
                 return outputs
         ticket = self.model_runner.submit(batch)
         self._inflight.append(ticket)
+        result = adapt_async_submit(batch, self.model_runner.events)
         if batch.stage == Stage.CODA:
             self._pending_coda.append(ticket)
             runner = self.model_runner
@@ -474,50 +385,24 @@ class LLMEngine:
                 runner.boundary_stream is not None
                 and runner.boundary_stream is not runner.core_stream
             )
-            for index, item in enumerate(batch.items):
-                request = item.request
-                request.num_output_placeholders += 1
-                if request.num_scheduled_outputs < request.sampling_params.max_tokens:
-                    request.input_token_tensor = ticket.device_values[index]
-                    self.scheduler.enqueue(request, Stage.PRELUDE)
-        elif batch.stage != Stage.RECURRENT:
-            self._update(batch, None)
-        else:
-            # Submit r FIRST. While the GPU runs r, consume r-1's signal to
-            # determine whether this token may enter r+1. No speculative extra loop.
-            exited = []
-            for index, item in enumerate(batch.items):
-                request = item.request
-                previous = self._pending_exit_signals.pop(request.request_id, None)
-                request.loops_done += 1
-                params = request.sampling_params
-                maximum = params.max_loops or self.model.config.total_ut_steps
-                should_exit = (
-                    self._trace_exit(request)
-                    if self.exit_config.mode == "trace"
-                    else request.loops_done >= maximum
+        elif batch.stage == Stage.RECURRENT:
+            # The next core is submitted before collecting the previous score.
+            # Retained handles are exactly those Scheduler expects to consume.
+            for item in batch.items:
+                previous = self._pending_exit_signals.pop(item.request_id, None)
+                if previous is None or previous.generation != item.generation:
+                    continue
+                score = previous.ticket.collect()[previous.row]
+                result.exit_signals.append(
+                    ExitSignal(
+                        item.request_id,
+                        previous.generation,
+                        previous.position,
+                        previous.signal_depth,
+                        previous.source_seq,
+                        score,
+                    )
                 )
-                if previous is not None and not should_exit:
-                    old_ticket, old_index, position, signal_depth = previous
-                    if position != request.position or signal_depth != request.loops_done - 1:
-                        raise RuntimeError("stale lookahead signal")
-                    score = old_ticket.collect()[old_index]
-                    should_exit = self._delayed_signal(request, score, signal_depth)
-                if should_exit:
-                    request.pending_exit_depth = request.loops_done
-                    exited.append(request)
-                    self.scheduler.enqueue(request, Stage.CODA)
-                else:
-                    if (
-                        self.exit_config.mode in ("ouro_delayed", "random_lookahead")
-                        and params.exit_threshold < 1
-                    ):
-                        self._pending_exit_signals[request.request_id] = (
-                            ticket,
-                            index,
-                            request.position,
-                            request.loops_done,
-                        )
-                    self.scheduler.enqueue(request, Stage.RECURRENT)
-            self.model_runner.finalize_many(exited)
+        update = self.scheduler.update_from_output(batch, result)
+        outputs.extend(self._apply_scheduler_update(batch, update, ticket))
         return outputs

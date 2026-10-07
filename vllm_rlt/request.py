@@ -44,6 +44,8 @@ class Request:
     generator: torch.Generator | None = field(default=None, repr=False)
     finish_reason: FinishReason | None = None
     exit_trace: tuple[int, ...] = field(default=(), repr=False)
+    # Assigned on registration; an ID reused after finish gets a new generation.
+    generation: int = 0
 
     @property
     def num_scheduled_outputs(self) -> int:
