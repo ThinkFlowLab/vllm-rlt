@@ -48,9 +48,9 @@ class RoutingBank:
 
         for slot, table in self.uploads:
             self.owner.tables[slot, :, : table.shape[1]].copy_(table, non_blocking=True)
-        for slot, hidden in self.imports:
-            hidden.record_stream(torch.cuda.current_stream(self.owner.cache.device))
-            self.owner.hidden[slot].copy_(hidden)
+        for pool, slot, value in self.imports:
+            value.record_stream(torch.cuda.current_stream(self.owner.cache.device))
+            pool[slot].copy_(value)
         self.descriptor = (
             self.host
             if self.owner.use_uva
@@ -162,8 +162,11 @@ class AsyncState:
         bank.uploads.append((slot, table))
         self.table_versions[rid] = allocation.block_tables
         if request.hidden_state is not None:
-            bank.imports.append((slot, request.hidden_state))
+            bank.imports.append((self.hidden, slot, request.hidden_state))
             request.hidden_state = self.hidden[slot]
+        # A resumed PRELUDE reads its input from the slot, not the request.
+        if request.input_token_tensor is not None:
+            bank.imports.append((self.tokens, slot, request.input_token_tensor))
         return slot
 
     def prepare(self, requests, depths, positions, size, *, recurrent=False, finalize=False):

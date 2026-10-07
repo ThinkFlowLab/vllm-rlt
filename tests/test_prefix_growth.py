@@ -271,3 +271,50 @@ def test_async_pressure_preemption_with_resident_state():
         if blocks == 24:
             assert e.preemption.preemptions > 0
     assert results[0] == results[1]
+
+
+@pytest.mark.gpu
+def test_async_preemption_restores_prelude_token_in_a_new_slot():
+    # A preempted request releases its async slot. A later arrival takes it
+    # (LIFO), so the victim resumes in another slot whose device token belongs
+    # to a different request. Distinct prompts make a stale token visible.
+    from vllm_rlt import ExecutionConfig, ExitConfig
+    from vllm_rlt.request import Stage
+
+    torch.manual_seed(72)
+    m = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda", dtype=torch.bfloat16)
+    results, victim_stages = [], []
+    for blocks in [128, 24]:
+        e = LLMEngine(
+            m,
+            attention_backend="triton",
+            cache_config=CacheConfig(blocks, 2, incremental_allocation=True),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=2,
+                prefill_chunk_size=2,
+                enable_preemption=True,
+            ),
+            exit_config=ExitConfig("trace", depths_by_request={"t": [4, 1, 2, 3, 4, 1, 2, 3]}),
+            execution_config=ExecutionConfig(async_scheduling=True),
+        )
+        select = e.preemption._select_preemption_victim
+
+        def record_victim(*args, **kwargs):
+            victim = select(*args, **kwargs)
+            if victim is not None:
+                victim_stages.append(victim.stage)
+            return victim
+
+        e.preemption._select_preemption_victim = record_victim
+        for i in range(4):
+            e.add_request(
+                str(i),
+                [2 * i + 1, 2 * i + 2],
+                SamplingParams(max_tokens=8, min_loops=1, ignore_eos=True),
+                trace_id="t",
+            )
+        results.append({rid: out.token_ids for rid, out in finish(e).items()})
+        assert not e.preemption.snapshots and e.cache_manager.num_used_blocks == 0
+    assert Stage.PRELUDE in victim_stages
+    assert results[0] == results[1]
