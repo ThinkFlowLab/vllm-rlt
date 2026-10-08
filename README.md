@@ -130,6 +130,12 @@ The current performance baselines are recorded in
 and [PR #31: prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31).
 These reports provide the reference measurements for subsequent runtime work.
 
+The [synchronous self-speculation evaluation](docs/speculative_evaluation.md)
+measures Ouro-1.4B BF16 on one H800: paired decode speedups range from 0.86×
+to 1.62× across 32 workloads, and exact greedy outputs agree for every request
+in 15 workloads. The report details the setup, regressions, and unresolved
+output differences.
+
 ### Single-GPU runtime
 
 PR #30 evaluates feature stacking on Ouro-1.4B BF16 on B300. The figure
