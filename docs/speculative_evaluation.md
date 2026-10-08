@@ -12,8 +12,8 @@ PR #44 already tests greedy output, fixed-chain reuse on a tiny model,
 rejection/rollback positions, EOS and length limits, RNG isolation, and GPU
 smoke cases. This evaluation adds a pinned real checkpoint, a repeated matched
 decode matrix, real-model hidden/KV/logit measurements, filtered-distribution
-sampling checks, and a client that accounts for failed HTTP streams and
-transport chunking. The scripts do not change production decoding.
+sampling checks, and HTTP measurements that account for failed streams and
+transport chunking. The experiments did not change production decoding.
 
 ## Pinned setup
 
@@ -27,13 +27,14 @@ transport chunking. The scripts do not change production decoding.
 | Attention / precision | FA4 4.0.0b30, BF16; CUDA matmul TF32 disabled |
 | Execution | synchronous eager, `last_exited` KV, `d=2`, `D=4`, refill scheduler, greedy, `ignore_eos=True` |
 
-The `code_sha` in raw JSON pins the **implementation baseline** in PR #44.
-The benchmark and client source used for these results is included in this
-evaluation change.
+The `code_sha` in the archived measurements pins the **implementation
+baseline** in PR #44. The [experiment snapshot](https://github.com/Levius-Fubuki/vllm-rlt/tree/5040d2b209942ed6535a5cfe28cd09b465bde36f)
+retains the benchmark code, tests and raw measurements for reproduction and
+audit.
 
 ## Method
 
-The offline benchmark is `python -m benchmarks.speculative`. It uses eight
+The archived offline benchmark, `python -m benchmarks.speculative`, uses eight
 distinct, semantic questions with a fixed context, clipped at the *front* to
 make exact 32- and 128-token prompts while retaining each question. Repeating a
 short prompt to fill a context caused Ouro to echo that prompt and accept every
@@ -53,14 +54,14 @@ timings, draft/accept/verification counts and exact agreement.
 The five repeats estimate timing variability; because the same deterministic
 inputs are reused, they are not independent accuracy samples.
 
-`python -m benchmarks.speculative_accuracy` replays a fixed candidate chain
-through the reuse verifier and a serial full-depth oracle on the same BF16
-model. It compares hidden states and KV at every depth and final logits, using
+The archived `python -m benchmarks.speculative_accuracy` replays a fixed
+candidate chain through the reuse verifier and a serial full-depth oracle on
+the same BF16 model. It compares hidden states and KV at every depth and final logits, using
 FP32 differences for max absolute and RMS error. The unit tests also exercise
 greedy, rejected suffix rollback, EOS/length boundaries and the rejection
 sampler, including temperature/top-k/top-p filters.
 
-The HTTP client is `python -m benchmarks.speculative_serving`. It sends the
+The archived HTTP client, `python -m benchmarks.speculative_serving`, sends the
 same fixed-length prompts and output limit to separately started native and
 speculative servers. It counts only completed `[DONE]` streams with usage
 matching the requested tokens; native streams additionally require one choice
@@ -75,8 +76,10 @@ event's exact token count.
 
 ## Reproduction
 
-Install the repository's development, serving and FA4 dependencies with the
-pinned model on a compatible Hopper GPU. Then run:
+Check out the [experiment snapshot](https://github.com/Levius-Fubuki/vllm-rlt/tree/5040d2b209942ed6535a5cfe28cd09b465bde36f),
+install its development, serving and FA4 dependencies, and obtain the pinned
+model on a compatible Hopper GPU. Run the following commands from that
+snapshot:
 
 ```bash
 python -m benchmarks.speculative \
@@ -101,8 +104,8 @@ python -m benchmarks.speculative_profile \
   --prompt-tokens 128 --output-tokens 64 --concurrency 1 --k 4
 ```
 
-Raw measurements and exact server commands are recorded below with the final
-results. Benchmark scripts can also be run with `--help` for all options.
+The archived benchmark scripts also accept `--help` for all options. Exact
+server settings and aggregate results are recorded below.
 
 ## Results
 
@@ -127,10 +130,10 @@ diverged at indices 23, 66, 78, 81 and 97. All recorded native prefixes
 matched on replay; at two of the later positions, the replayed top two tied
 and the replayed top-1 differed from the original run. These observations
 indicate shape-sensitive BF16 behavior and ties are relevant. They do not
-establish exact greedy equivalence, nor rule out every state bug. The raw
-token IDs and [short](results/speculative-h800/replay-short.json) and
-[long](results/speculative-h800/replay-long.json) diagnostics permit further
-investigation.
+establish exact greedy equivalence, nor rule out every state bug. The archived
+token IDs and [short replay](https://github.com/Levius-Fubuki/vllm-rlt/blob/5040d2b209942ed6535a5cfe28cd09b465bde36f/docs/results/speculative-h800/replay-short.json)
+and [long replay](https://github.com/Levius-Fubuki/vllm-rlt/blob/5040d2b209942ed6535a5cfe28cd09b465bde36f/docs/results/speculative-h800/replay-long.json)
+diagnostics permit further investigation.
 
 The filtered rejection sampler was checked for three temperature/top-k/top-p
 settings with three independent seeds and 6,000 draws per setting and seed.
@@ -236,8 +239,9 @@ one choice event per HTTP chunk in the burst runs. A separate natural-EOS
 attempt finished at the 64-token length limit for every request in both modes;
 it did not test early termination behavior.
 
-To reproduce, start `python -m vllm_rlt.entrypoints.serve` with the shared
-settings above, first without speculative flags and then with them. For each
+To reproduce from the experiment snapshot, start
+`python -m vllm_rlt.entrypoints.serve` with the shared settings above, first
+without speculative flags and then with them. For each
 server, run `python -m benchmarks.speculative_serving` with `--mode native` or
 `--mode speculative`, `--base-url http://127.0.0.1:8001`,
 `--tokenizer /path/to/Ouro-1.4B`, the pinned `--model-revision`, and the
@@ -270,19 +274,16 @@ python -m benchmarks.speculative_serving \
   --prompt-tokens 128 --output-tokens 64
 ```
 
-### Raw measurements
+### Archived measurements
 
-- [Paired decode trials](results/speculative-h800/decode.json.gz) (`gzip -dc` to read)
-- [Fixed-chain accuracy](results/speculative-h800/accuracy.json)
-- [Filtered sampling draws](results/speculative-h800/sampling.json)
-- [Isolated memory](results/speculative-h800/memory.json)
-- Phase timings: [concurrency 1](results/speculative-h800/profile-c1.json), [concurrency 8](results/speculative-h800/profile-c8.json)
-- Divergent-prefix replays: [short output](results/speculative-h800/replay-short.json), [long output](results/speculative-h800/replay-long.json)
-- [All ten HTTP serving runs](results/speculative-h800/serving.json.gz) (`gzip -dc` to read)
+The [pinned results directory](https://github.com/Levius-Fubuki/vllm-rlt/tree/5040d2b209942ed6535a5cfe28cd09b465bde36f/docs/results/speculative-h800)
+contains all 160 paired decode trials, complete output token IDs, fixed-chain
+accuracy, sampling, memory, phase timings, divergent-prefix replays and ten
+HTTP serving runs. The decode and serving records are gzip-compressed JSON.
 
 ## Validation
 
-On the pinned H800 environment:
+On the pinned H800 environment, using the archived benchmark scripts and tests:
 
 ```text
 pytest -q tests/test_speculative_accuracy.py tests/test_speculative_benchmark.py \
