@@ -10,6 +10,9 @@ import pytest
 from benchmarks import gsm8k
 from benchmarks.gsm8k import (
     DEFAULT_CASE,
+    PROMPT_THINKING,
+    SCORER_LM_EVAL,
+    SCORER_THINKING,
     baseline_fingerprint,
     baseline_result,
     build_records,
@@ -22,8 +25,11 @@ from benchmarks.gsm8k import (
     fixed_exit,
     make_task,
     score,
+    score_thinking,
     select_doc_ids,
     sequence_differences,
+    thinking_close_id,
+    validate_prompt_recipe,
 )
 
 
@@ -48,6 +54,143 @@ def task(monkeypatch):
 
     monkeypatch.setattr(ConfigurableTask, "download", download)
     return make_task()
+
+
+@pytest.fixture
+def thinking_records():
+    # No lm-eval dependency: these new-path checks must execute in default CPU CI.
+    task = SimpleNamespace(
+        eval_docs=[{"question": f"Question {i}", "answer": "#### 18"} for i in range(10)],
+        build_all_requests=lambda *a, **k: pytest.fail("no few-shot requests"),
+    )
+    options = dict(
+        split="test",
+        limit=3,
+        seed=1,
+        max_new_tokens=1024,
+        max_length=2048,
+        prompt_mode=PROMPT_THINKING,
+    )
+    return lambda tokenizer, **changes: build_records(task, tokenizer, **(options | changes))
+
+
+def test_thinking_records_use_the_chat_template_and_eos_only(thinking_records):
+    def template(messages, **options):
+        assert options == dict(tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        assert len(messages) == 1 and messages[0]["role"] == "user"
+        return f"chat:{messages[0]['content']}<think>\n"
+
+    tokenizer = SimpleNamespace(
+        apply_chat_template=template,
+        encode=lambda text, add_special_tokens=True: ([1] if add_special_tokens else [])
+        + list(map(ord, text)),
+    )
+    records, selection = thinking_records(tokenizer)
+    assert [row["id"] for row in records] == selection["ids"]
+    for row in records:
+        assert row["doc"] == {"question": f"Question {row['id']}", "answer": "#### 18"}
+        assert row["prompt"] == f"chat:{row['doc']['question']}<think>\n"
+        assert row["prompt_ids"] == [1, *map(ord, row["prompt"])]
+        assert row["generation_kwargs"]["until"] == []
+    with pytest.raises(ValueError, match="Unknown prompt mode"):
+        thinking_records(tokenizer, prompt_mode="bogus")
+    with pytest.raises(ValueError, match="truncated"):
+        thinking_records(tokenizer, max_length=1)
+
+
+def test_thinking_records_with_real_checkpoint_tokenizer(thinking_records):
+    import os
+
+    source = os.environ.get("OURO_14B_THINKING_TOKENIZER")
+    if source is None:
+        pytest.skip("set OURO_14B_THINKING_TOKENIZER to prepared local assets; no downloads")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        source, local_files_only=True, trust_remote_code=False
+    )
+    records, _ = thinking_records(tokenizer)
+    for row in records:
+        assert row["prompt"].endswith("<think>\n")
+        assert row["prompt_ids"][0] == tokenizer.bos_token_id
+    assert thinking_close_id(tokenizer) == 4
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        {"scorer": SCORER_THINKING},
+        {"prompt_mode": "thinking"},
+        {"apply_chat_template": True},
+        {"add_special_tokens": True},
+        {"prompt_mode": "unknown"},
+    ],
+)
+def test_prompt_recipe_rejects_inconsistent_fields(edits):
+    with pytest.raises(ValueError, match="prompt recipe"):
+        validate_prompt_recipe(edits)
+
+
+@pytest.fixture
+def text_tokenizer():
+    return SimpleNamespace(decode=lambda ids, **kwargs: "".join(map(chr, ids)))
+
+
+@pytest.mark.parametrize("markers", [[], [4], [4, *map(ord, r"\boxed{99}"), 4]])
+def test_thinking_requires_the_last_real_closing(text_tokenizer, markers):
+    final = r"\boxed{18}"
+    ids = [*map(ord, "</think>"), *markers, *map(ord, final)]
+    result = score_thinking({"doc": {"answer": "#### 18"}}, ids, text_tokenizer, close_id=4)
+    assert result["has_closing"] is bool(markers)
+    assert result["correct"] is bool(markers)
+    assert result["unparseable"] is not bool(markers)
+    if markers:
+        assert result["final_text"] == final
+
+
+@pytest.mark.parametrize(
+    "final_text,gold,answer,correct",
+    [
+        (r"The answer is \boxed{18}", "18", "18", True),
+        (r"\boxed{18} then \boxed{19}", "19", "19", True),
+        ("So the total is #### 18", "18", "18", True),
+        (r"\boxed{ $1,234.00. }", "1234", " $1,234.00. ", True),
+        (r"\boxed{-3}", "-3", "-3", True),
+        ("#### $18.00.", "18", "$18.00.", True),
+        (r"\boxed{18} explanatory prose", "18", "18", True),
+        (r"\boxed{17}", "18", "17", False),
+        (r"\boxed{\frac{36}{2}}", "18", None, False),
+        ("The answer is 18.", "18", None, False),
+        (r"\boxed{unbalanced", "18", None, False),
+        (r"\boxed{NaN}", "18", None, False),
+        (r"\boxed{Infinity}", "18", None, False),
+        (r"\boxed{1e1}", "10", None, False),
+        (r"\boxed{17} then \boxed{oops}", "17", None, False),
+        ("", "18", None, False),
+    ],
+)
+def test_score_thinking_extraction(text_tokenizer, final_text, gold, answer, correct):
+    row = {"doc": {"answer": f"work.\n#### {gold}"}}
+    result = score_thinking(row, [4, *map(ord, final_text)], text_tokenizer, close_id=4)
+    assert result["answer"] == answer
+    assert result["correct"] is correct
+    assert result["unparseable"] is (answer is None)
+
+
+@pytest.mark.parametrize("candidate", [4, None, -1, 2, 99, True])
+def test_thinking_scorer_validates_marker(candidate):
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda _: candidate,
+        eos_token_id=2,
+        all_special_ids=[1, 2, 3, 4],
+        convert_ids_to_tokens=lambda _: "</think>",
+        encode=lambda *a, **kw: [4],
+    )
+    if candidate == 4:
+        assert thinking_close_id(tokenizer) == 4
+    else:
+        with pytest.raises(ValueError, match="standalone"):
+            thinking_close_id(tokenizer)
 
 
 def test_three_shot_prompt_and_strict_scoring(task):
@@ -148,6 +291,20 @@ def test_baseline_fingerprint_tracks_recipe_not_checkout():
         "source": {"sha": "old", "packages": {"transformers": "4.55.0"}},
     }
     expected = baseline_fingerprint(protocol)
+    raw = {**protocol, "prompt_mode": "raw", "scorer": SCORER_LM_EVAL}
+    assert baseline_fingerprint(raw) == expected
+    assert (
+        validate_prompt_recipe(protocol) == validate_prompt_recipe(raw) == ("raw", SCORER_LM_EVAL)
+    )
+    thinking = dict(
+        raw,
+        prompt_mode=PROMPT_THINKING,
+        scorer=SCORER_THINKING,
+        apply_chat_template=True,
+        add_special_tokens=True,
+    )
+    assert baseline_fingerprint(thinking) != expected
+    assert validate_prompt_recipe(thinking) == (PROMPT_THINKING, SCORER_THINKING)
     protocol["source"]["sha"] = "new"
     protocol["model"] = "/another/checkpoint/path"
     assert baseline_fingerprint(protocol) == expected

@@ -5,14 +5,61 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import statistics
 import subprocess
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 DATA_REVISION = "740312add88f781978c0658806c59bc2815b9866"
 PACKAGES = ("torch", "transformers", "lm-eval", "datasets", "tokenizers", "triton")
 DEFAULT_CASE = Path(__file__).parent / "fixtures/gsm8k-87.json"
+PROMPT_RAW = "raw"
+PROMPT_THINKING = "thinking"
+SCORER_LM_EVAL = "lm_eval_strict"
+SCORER_THINKING = "thinking_final_v1"
+
+
+def protocol_scorer(protocol):
+    """The scorer implied by the fingerprinted prompt recipe; guards against edits."""
+    if protocol.get("apply_chat_template"):
+        return SCORER_THINKING
+    return SCORER_LM_EVAL
+
+
+def validate_prompt_recipe(protocol):
+    mode = protocol.get("prompt_mode", PROMPT_RAW)
+    scorer = protocol.get("scorer", SCORER_LM_EVAL)
+    thinking = mode == PROMPT_THINKING
+    if (
+        mode not in (PROMPT_RAW, PROMPT_THINKING)
+        or protocol.get("apply_chat_template", False) is not thinking
+        or protocol.get("add_special_tokens", False) is not thinking
+        or scorer != protocol_scorer(protocol)
+    ):
+        raise ValueError("Protocol scorer/prompt mode do not match the prompt recipe")
+    return mode, scorer
+
+
+def thinking_close_id(tokenizer):
+    """Require the actual standalone special marker, not an unknown/EOS alias."""
+    token = "</think>"
+    close_id = tokenizer.convert_tokens_to_ids(token)
+    forbidden = {
+        getattr(tokenizer, name, None)
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+    }
+    if (
+        type(close_id) is not int
+        or close_id < 0
+        or close_id in forbidden
+        or close_id not in tokenizer.all_special_ids
+        or tokenizer.convert_ids_to_tokens(close_id) != token
+        or tokenizer.encode(token, add_special_tokens=False) != [close_id]
+    ):
+        raise ValueError("The thinking scorer requires a standalone </think> special token")
+    return close_id
 
 
 def digest(value):
@@ -121,7 +168,18 @@ def baseline_fingerprint(protocol):
     )
 
 
-def build_records(task, tokenizer, *, split, limit, seed, max_new_tokens, max_length, doc_ids=None):
+def build_records(
+    task,
+    tokenizer,
+    *,
+    split,
+    limit,
+    seed,
+    max_new_tokens,
+    max_length,
+    doc_ids=None,
+    prompt_mode=PROMPT_RAW,
+):
     ids = (
         select_doc_ids(len(task.eval_docs), limit=limit, seed=seed, split=split)
         if doc_ids is None
@@ -129,19 +187,36 @@ def build_records(task, tokenizer, *, split, limit, seed, max_new_tokens, max_le
     )
     if not ids or ids != sorted(set(ids)) or any(i < 0 or i >= len(task.eval_docs) for i in ids):
         raise ValueError("Question IDs must be unique, sorted and present in the dataset")
-    task.build_all_requests(samples=ids, rank=0, world_size=1)
+    if prompt_mode == PROMPT_THINKING:
+        from vllm_rlt.entrypoints.chat_template import render_chat_prompt
+
+        items = ids
+    elif prompt_mode == PROMPT_RAW:
+        task.build_all_requests(samples=ids, rank=0, world_size=1)
+        items = task.instances
+    else:
+        raise ValueError(f"Unknown prompt mode: {prompt_mode}")
     records = []
-    for instance in task.instances:
-        prompt, kwargs = instance.args
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    for item in items:
+        if prompt_mode == PROMPT_THINKING:
+            # Zero-shot chat uses the raw question and EOS only, not few-shot stops.
+            index, doc = item, task.eval_docs[item]
+            prompt = render_chat_prompt(
+                tokenizer, [{"role": "user", "content": doc["question"]}], enable_thinking=True
+            )
+            prompt_ids = tokenizer.encode(prompt)
+            kwargs = {"until": []}
+        else:
+            prompt, kwargs = item.args
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            # lm-eval 0.4.9.2 renumbers samples; restore the original dataset ID.
+            index, doc = ids[item.doc_id], item.doc
         if len(prompt_ids) + max_new_tokens > max_length:
             raise ValueError("Prompt would be truncated; increase --max-length")
-        # lm-eval 0.4.9.2 renumbers explicit samples from zero. Restore the
-        # original dataset ID so paired reports identify the actual question.
         records.append(
             {
-                "id": ids[instance.doc_id],
-                "doc": instance.doc,
+                "id": index,
+                "doc": doc,
                 "prompt": prompt,
                 "prompt_ids": prompt_ids,
                 "generation_kwargs": kwargs,
@@ -168,6 +243,8 @@ def prepare(args):
         raise ValueError("Install the pinned evaluation dependencies first")
     model = Path(args.model).resolve()
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+    if args.prompt_mode == PROMPT_THINKING:
+        thinking_close_id(tokenizer)
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be positive")
     if not 0 < args.max_new_tokens < args.max_length or args.max_regression_pp < 0:
@@ -183,6 +260,11 @@ def prepare(args):
         case = json.loads(DEFAULT_CASE.read_text())
         if case["dataset_revision"] != DATA_REVISION or case["split"] != args.split:
             raise ValueError("Default case does not match the pinned dataset")
+    if args.prompt_mode == PROMPT_THINKING and case is not None:
+        raise ValueError(
+            "The default raw-prompt case cannot combine with --prompt-mode thinking; "
+            "use --limit or --all for a Thinking experiment"
+        )
     records, selection = build_records(
         task,
         tokenizer,
@@ -192,6 +274,7 @@ def prepare(args):
         max_new_tokens=args.max_new_tokens,
         max_length=args.max_length,
         doc_ids=case["source_ids"] if case else None,
+        prompt_mode=args.prompt_mode,
     )
     files = [
         p
@@ -229,8 +312,12 @@ def prepare(args):
         # Fingerprinted: the stored four-loop baseline applies only when this is 4.
         "loops": loops,
         "batch_size": 1,
-        "add_special_tokens": False,
-        "apply_chat_template": False,
+        # Recorded but not separately fingerprinted: apply_chat_template already
+        # distinguishes the recipes, and run() enforces the implied scorer.
+        "prompt_mode": args.prompt_mode,
+        "scorer": SCORER_THINKING if args.prompt_mode == PROMPT_THINKING else SCORER_LM_EVAL,
+        "add_special_tokens": args.prompt_mode == PROMPT_THINKING,
+        "apply_chat_template": args.prompt_mode == PROMPT_THINKING,
         "max_regression_pp": args.max_regression_pp,
         "min_reference_accuracy_pct": args.min_reference_accuracy_pct,
         "source": source(),
@@ -365,6 +452,68 @@ def sequence_differences(pairs):
     return {"token_ids": block(tokens, token_compared), "exit_depths": depth_block}
 
 
+def normalize_number(text):
+    """Normalize one extracted numeric answer or gold field for Decimal comparison."""
+    value = text.strip().strip("$").replace(",", "").strip()
+    if value.endswith("."):
+        value = value[:-1]
+    return value
+
+
+def extract_boxed(text):
+    """Content of the last balanced \\boxed{...}; None when absent or unbalanced."""
+    start = text.rfind("\\boxed{")
+    if start < 0:
+        return None
+    depth, index = 0, start + len("\\boxed{") - 1
+    for index in range(index, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + len("\\boxed{") : index]
+    return None
+
+
+def score_thinking(row, token_ids, tokenizer, close_id):
+    """thinking_final_v1: parse the section after the last real </think> token.
+
+    A missing closing marker is unparseable (length truncation is not exempted);
+    use the last balanced \\boxed{...}, otherwise a terminal #### number.
+    A nonnumeric candidate is unparseable, not merely an incorrect numeric answer.
+    """
+    closing = [i for i, token in enumerate(token_ids) if token == close_id]
+    if not closing:
+        return {"answer": None, "correct": False, "unparseable": True, "has_closing": False}
+    final = tokenizer.decode(token_ids[closing[-1] + 1 :], skip_special_tokens=True)
+    extracted = extract_boxed(final)
+    if extracted is None:
+        match = re.search(r"####\s*([^\r\n]+?)\s*$", final)
+        extracted = match.group(1) if match else None
+    answer = extracted
+    correct = False
+    if answer is not None:
+        normalized = normalize_number(answer)
+        if not re.fullmatch(r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", normalized):
+            answer = None
+        else:
+            try:
+                correct = Decimal(normalized) == Decimal(
+                    normalize_number(row["doc"]["answer"].split("####")[-1])
+                )
+            except InvalidOperation as exc:
+                raise ValueError("Invalid numeric GSM8K gold answer") from exc
+    return {
+        "answer": answer,
+        "extracted_text": extracted,
+        "correct": correct,
+        "unparseable": answer is None,
+        "has_closing": True,
+        "final_text": final,
+    }
+
+
 def score(task, row, text):
     from lm_eval.api.instance import Instance
 
@@ -425,6 +574,7 @@ def run(args):
         args.min_loops,
         args.async_scheduling,
     )
+    prompt_mode, scorer = validate_prompt_recipe(protocol)
     if protocol["source"]["packages"] != source()["packages"]:
         raise ValueError("Evaluation package versions changed after preparation")
     model = Path(protocol["model"])
@@ -454,6 +604,7 @@ def run(args):
     }
     write_json(output / "metadata.json", metadata)
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+    close_id = thinking_close_id(tokenizer) if scorer == SCORER_THINKING else None
     task = make_task(protocol["task_config"])
     start = time.monotonic()
     generator = Generator(args.backend, str(model), tokenizer, protocol["max_length"], exit_policy)
@@ -464,7 +615,10 @@ def run(args):
             stops = row["generation_kwargs"]["until"] + [tokenizer.eos_token]
             start = time.monotonic()
             result = generator.generate(row["prompt_ids"], protocol["max_new_tokens"], stops)
-            result.update(score(task, row, result["text"]))
+            if scorer == SCORER_THINKING:
+                result.update(score_thinking(row, result["token_ids"], tokenizer, close_id))
+            else:
+                result.update(score(task, row, result["text"]))
             result.update(
                 id=row["id"],
                 prompt_sha256=digest(row["prompt_ids"]),
@@ -480,6 +634,8 @@ def run(args):
     summary = {
         **metadata,
         "complete": True,
+        "prompt_mode": prompt_mode,
+        "scorer": scorer,
         "examples": len(rows),
         "accuracy": statistics.mean(r["correct"] for r in rows),
         "correct": sum(r["correct"] for r in rows),
@@ -607,6 +763,13 @@ def main():
     )
     subset.add_argument("--all", action="store_true", help="Use the complete split")
     p.add_argument("--seed", type=int, default=0, help="Fixed subset selection seed (default: 0)")
+    p.add_argument(
+        "--prompt-mode",
+        choices=[PROMPT_RAW, PROMPT_THINKING],
+        default=PROMPT_RAW,
+        help="raw keeps the few-shot lm-eval prompts; thinking renders zero-shot "
+        "chat prompts with the checkpoint template and EOS-only stopping",
+    )
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--max-length", type=int, default=2048)
     p.add_argument("--max-regression-pp", type=float, default=1.0)
