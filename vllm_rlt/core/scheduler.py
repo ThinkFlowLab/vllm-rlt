@@ -299,6 +299,9 @@ class Scheduler:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
             remaining = request.sampling_params.max_tokens - len(request.generated_token_ids)
+            if self.speculative_config.alternate_prob_gap_threshold is not None:
+                # Earliest fork adds count - 1 alternate verification rows.
+                token_budget = (token_budget + 1) // 2
             count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
             return ScheduledItem(request, request.position, count)
         return ScheduledItem(request)
@@ -346,6 +349,11 @@ class Scheduler:
             self.selected_request_ids.add(request.request_id)
             items.append(item)
             token_budget -= item.token_count
+            if (
+                stage == Stage.SPECULATIVE
+                and self.speculative_config.alternate_prob_gap_threshold is not None
+            ):
+                token_budget -= item.token_count - 1
         if not items:
             return None
         self.policy.record_batch(stage)

@@ -105,6 +105,54 @@ The same flags work with the single-device server. A streaming event may contain
 multiple committed tokens. See [RFC #43](https://github.com/ThinkFlowLab/vllm-rlt/issues/43)
 for the design.
 
+### Optional alternate-suffix fallback branch
+
+When the shallow top-1/top-2 full-softmax probabilities are close, the plain
+fixed-depth path can optionally draft one alternate suffix and let the
+full-depth verifier confirm the alternate token before reusing that suffix. The
+branch is opt-in and greedy-only.
+
+```python
+llm = LLM(
+    "../models/Ouro-1.4B",
+    device="cuda",
+    attention_backend="triton",
+    speculative_config=SpeculativeConfig(
+        num_speculative_tokens=4,
+        draft_loops=2,
+        target_loops=4,
+        alternate_prob_gap_threshold=0.2,
+    ),
+)
+outputs = llm.generate(
+    ["Explain why the sky is blue."],
+    SamplingParams(temperature=0, max_tokens=64, max_loops=4, exit_threshold=1.0),
+)
+```
+
+`alternate_prob_gap_threshold=None` (the default) uses the plain speculative
+runner. A value in [0, 1] enables the branch; even zero can open a branch on a
+tie. The branch keeps the same fixed-depth, `last_exited`, synchronous eager and
+refill constraints, and additionally requires greedy requests. If spare KV
+blocks are unavailable, the round continues on the primary path.
+
+For a primary chain of `n` rows, the scheduler reserves at most `2*n - 1`
+verification rows, including the earliest possible alternate suffix. It reduces
+K or the number of scheduled requests to fit `max_num_batched_tokens`.
+
+This is experimental: branch rows add computation and occupy extra KV blocks.
+BF16 greedy sequences can differ from the plain runner, and FP32 comparisons do
+not establish BF16 losslessness. Bounded checks on Ouro-1.4B with Triton cover
+natural EOS, later request admission, cancellation and cache cleanup. FA4 and
+online-serving behavior remain unvalidated for this path. The branch and
+baseline regression tests can be run on a CUDA device with Triton; the command
+below excludes the optional FA4 cases.
+
+```bash
+pytest -q tests/test_branch_speculative.py tests/test_speculative.py \
+    --run-gpu -k "not flash_attn_4"
+```
+
 ## SHARED prefill semantics
 
 SHARED is not equivalent to LAST-EXITED. A later token reads every earlier token's final KV at all depths. To make that meaning independent of chunk boundaries, the shared prefill runner completes all loops for one position before advancing that request. Different requests can still be batched at each position wave. This is a correctness-oriented implementation and can be slower than packed depth-major prefill. It is not a claim to reproduce an unpublished optimized shared-prefill kernel.
