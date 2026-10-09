@@ -40,7 +40,7 @@ class LLMEngine:
         if speculative_config is not None:
             # Keep this guard separate: graph support for the plain runner does
             # not make the fallback's cache copies safe to capture.
-            if speculative_config.fallback_margin is not None and (
+            if speculative_config.alternate_prob_gap_threshold is not None and (
                 self.execution_config.async_scheduling or self.execution_config.cuda_graphs
             ):
                 raise ValueError("fallback branch speculation requires synchronous eager execution")
@@ -106,7 +106,7 @@ class LLMEngine:
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
         if speculative_config is None:
             self.speculative_runner = None
-        elif speculative_config.fallback_margin is None:
+        elif speculative_config.alternate_prob_gap_threshold is None:
             self.speculative_runner = SpeculativeRunner(
                 model, self.cache_manager, speculative_config, self.execution_config
             )
@@ -161,7 +161,7 @@ class LLMEngine:
             raise ValueError("speculative requests require fixed target depth and exit_threshold=1")
         if (
             self.speculative_config is not None
-            and self.speculative_config.fallback_margin is not None
+            and self.speculative_config.alternate_prob_gap_threshold is not None
             and params.temperature != 0
         ):
             raise ValueError("fallback branch speculation is greedy-only; temperature must be 0")

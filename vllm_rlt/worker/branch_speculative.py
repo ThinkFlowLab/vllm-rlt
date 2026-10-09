@@ -114,7 +114,7 @@ class BranchSpeculativeRunner(SpeculativeRunner):
 
     def __init__(self, model, cache, config, execution):
         super().__init__(model, cache, config, execution)
-        self.margin = config.fallback_margin
+        self.margin = config.alternate_prob_gap_threshold
         self.stats = BranchSpeculativeStats()
 
     # ------------------------------------------------------------------ #

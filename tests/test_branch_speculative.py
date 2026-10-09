@@ -30,7 +30,7 @@ def branch_engine(m, k=3, margin=1.0, draft_loops=2, **kwargs):
     return LLMEngine(
         m,
         speculative_config=SpeculativeConfig(
-            k, draft_loops=draft_loops, target_loops=4, fallback_margin=margin
+            k, draft_loops=draft_loops, target_loops=4, alternate_prob_gap_threshold=margin
         ),
         **kwargs,
     )
@@ -69,7 +69,7 @@ def install_controlled_coda(monkeypatch, m, shallow, deep):
 # --------------------------------------------------------------------------- #
 # configuration and runner selection
 # --------------------------------------------------------------------------- #
-def test_fallback_margin_none_keeps_plain_runner():
+def test_alternate_prob_gap_threshold_none_keeps_plain_runner():
     m = model()
     plain = LLMEngine(m, speculative_config=SpeculativeConfig(3))
     assert type(plain.speculative_runner) is SpeculativeRunner
@@ -78,15 +78,15 @@ def test_fallback_margin_none_keeps_plain_runner():
 
 
 @pytest.mark.parametrize("margin", [None, 0.0, 0.5, 1.0])
-def test_valid_fallback_margin(margin):
-    config = SpeculativeConfig(3, fallback_margin=margin)
-    assert config.fallback_margin == margin
+def test_valid_alternate_prob_gap_threshold(margin):
+    config = SpeculativeConfig(3, alternate_prob_gap_threshold=margin)
+    assert config.alternate_prob_gap_threshold == margin
 
 
 @pytest.mark.parametrize("margin", [-0.1, 1.5, float("nan"), float("inf"), True, "0.2"])
-def test_invalid_fallback_margin(margin):
+def test_invalid_alternate_prob_gap_threshold(margin):
     with pytest.raises(ValueError):
-        SpeculativeConfig(3, fallback_margin=margin)
+        SpeculativeConfig(3, alternate_prob_gap_threshold=margin)
 
 
 def test_enabled_fallback_rejects_sampling_before_enqueue():
@@ -120,7 +120,7 @@ def test_enabled_fallback_matches_native_and_plain(draft_loops):
     branch_llm = LLM(
         m,
         speculative_config=SpeculativeConfig(
-            3, draft_loops=draft_loops, target_loops=4, fallback_margin=1.0
+            3, draft_loops=draft_loops, target_loops=4, alternate_prob_gap_threshold=1.0
         ),
         **common,
     )
@@ -136,7 +136,7 @@ def test_enabled_fallback_packs_multiple_requests(monkeypatch):
     m = model()
     llm = LLM(
         m,
-        speculative_config=SpeculativeConfig(3, fallback_margin=1.0),
+        speculative_config=SpeculativeConfig(3, alternate_prob_gap_threshold=1.0),
         cache_config=CacheConfig(256, 2),
         scheduler_config=SchedulerConfig(max_num_batched_tokens=32, max_num_seqs=4),
     )
@@ -160,7 +160,7 @@ def test_forced_later_fork_matches_native(monkeypatch):
     m = model()
     llm = LLM(
         m,
-        speculative_config=SpeculativeConfig(3, fallback_margin=1.0),
+        speculative_config=SpeculativeConfig(3, alternate_prob_gap_threshold=1.0),
         cache_config=CacheConfig(256, 2),
         scheduler_config=SchedulerConfig(max_num_batched_tokens=32),
     )
@@ -183,7 +183,11 @@ def test_forced_later_fork_matches_native(monkeypatch):
 # --------------------------------------------------------------------------- #
 # deterministic branch outcomes through controlled logits
 # --------------------------------------------------------------------------- #
-def test_branch_hit_commits_alternate(monkeypatch):
+@pytest.mark.parametrize(
+    "suffix_target, expected, rollback",
+    [(15, [11, 13, 15, 16], 0), (42, [11, 13, 42], 1)],
+)
+def test_branch_hit_commits_alternate(monkeypatch, suffix_target, expected, rollback):
     m = model()
     e = branch_engine(m)
     e.add_request("r", [2, 3, 4], SamplingParams(max_tokens=12, ignore_eos=True))
@@ -193,14 +197,14 @@ def test_branch_hit_commits_alternate(monkeypatch):
         monkeypatch,
         m,
         shallow=[[10], [12, 13], [14, 15]],
-        deep=[11, 39, 38, 37, 13, 15, 16],
+        deep=[11, 39, 38, 37, 13, suffix_target, 16],
     )
     out = e.step()[0]
     stats = e.speculative_runner.stats
-    assert out.token_ids[-4:] == [11, 13, 15, 16]
+    assert out.token_ids[-len(expected) :] == expected
     assert stats.alternate_selected == 1
     assert stats.primary_rejected_at_fork == 1
-    assert stats.rollback_rounds == 0
+    assert stats.rollback_rounds == rollback
     assert stats.alt_drafted == 3
     e.abort_request("r")
     assert e.cache_manager.num_used_blocks == 0
@@ -228,7 +232,8 @@ def test_branch_discarded_when_primary_accepted(monkeypatch):
     assert e.cache_manager.num_used_blocks == 0
 
 
-def test_branch_rejected_elsewhere_rolls_back(monkeypatch):
+@pytest.mark.parametrize("first_target, expected", [(10, [10, 39]), (20, [20])])
+def test_branch_rejected_elsewhere_rolls_back(monkeypatch, first_target, expected):
     m = model()
     e = branch_engine(m)
     e.add_request("r", [2, 3, 4], SamplingParams(max_tokens=12, ignore_eos=True))
@@ -238,11 +243,11 @@ def test_branch_rejected_elsewhere_rolls_back(monkeypatch):
         monkeypatch,
         m,
         shallow=[[10], [12, 13], [14, 15]],
-        deep=[10, 39, 38, 37, 0, 0, 0],
+        deep=[first_target, 39, 38, 37, 0, 0, 0],
     )
     out = e.step()[0]
     stats = e.speculative_runner.stats
-    assert out.token_ids[-2:] == [10, 39]
+    assert out.token_ids[-len(expected) :] == expected
     assert stats.alternate_selected == 0
     assert stats.primary_rejected_elsewhere == 1
     assert stats.rollback_rounds == 1
@@ -257,7 +262,7 @@ def test_cache_lifecycle_balanced_after_fallback_run():
     m = model()
     llm = LLM(
         m,
-        speculative_config=SpeculativeConfig(3, fallback_margin=1.0),
+        speculative_config=SpeculativeConfig(3, alternate_prob_gap_threshold=1.0),
         cache_config=CacheConfig(256, 2),
         scheduler_config=SchedulerConfig(max_num_batched_tokens=32),
     )
@@ -299,7 +304,7 @@ def test_colliding_public_request_id_keeps_outputs():
     m = model()
     llm = LLM(
         m,
-        speculative_config=SpeculativeConfig(3, fallback_margin=1.0),
+        speculative_config=SpeculativeConfig(3, alternate_prob_gap_threshold=1.0),
         cache_config=CacheConfig(256, 2),
         scheduler_config=SchedulerConfig(max_num_batched_tokens=32, max_num_seqs=2),
     )
@@ -383,7 +388,7 @@ def fork_round(m, monkeypatch, *, backend, draft_loops, fork, prefix_len, block_
     engine = LLMEngine(
         m,
         speculative_config=SpeculativeConfig(
-            3, draft_loops=draft_loops, target_loops=target_loops, fallback_margin=1.0
+            3, draft_loops=draft_loops, target_loops=target_loops, alternate_prob_gap_threshold=1.0
         ),
         cache_config=CacheConfig(256, block_size),
         attention_backend=backend,
@@ -578,7 +583,7 @@ def test_branch_prefix_cache_incremental_cancel_and_later_admission():
     m = model()
     llm = LLM(
         m,
-        speculative_config=SpeculativeConfig(3, fallback_margin=1.0),
+        speculative_config=SpeculativeConfig(3, alternate_prob_gap_threshold=1.0),
         cache_config=CacheConfig(128, 2, enable_prefix_caching=True, incremental_allocation=True),
         scheduler_config=SchedulerConfig(max_num_batched_tokens=32),
     )
