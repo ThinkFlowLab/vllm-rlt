@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.helpers import tiny_ouro_config
+from vllm_rlt.attention import BackendCapabilities
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.models import OuroForCausalLM
 
@@ -289,7 +290,7 @@ def test_one_preparation_and_position_tensor_per_core_across_24_layers(monkeypat
 def test_depth_batches_share_depth_independent_metadata(packed):
     cache = make_cache(num_blocks=64)
     if packed:
-        cache.attention = SimpleNamespace(generation=4)
+        cache.attention = SimpleNamespace(capabilities=BackendCapabilities(packed_prefill=True))
     assert cache.allocate("a", 7) and cache.allocate("b", 5)
     ids = ["a"] * 3 + ["b"] * 2
     positions = [4, 5, 6, 2, 3]

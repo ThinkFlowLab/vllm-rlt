@@ -88,7 +88,15 @@ def main():
     parser.add_argument(
         "--attention-backend",
         type=str.lower,
-        choices=["torch", "triton", "flash_attn", "flash_attn_2", "flash_attn_3", "flash_attn_4"],
+        choices=[
+            "auto",
+            "torch",
+            "triton",
+            "flash_attn",
+            "flash_attn_2",
+            "flash_attn_3",
+            "flash_attn_4",
+        ],
         default="triton",
     )
     parser.add_argument("--mode", choices=["refill", "no_refill"], default="refill")
@@ -106,8 +114,8 @@ def main():
     add_runtime_args(parser)
     args = parser.parse_args()
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
-    if args.device == "cpu" and args.attention_backend != "torch":
-        parser.error("CPU execution requires --attention-backend torch")
+    if args.device == "cpu" and args.attention_backend not in ("auto", "torch"):
+        parser.error("CPU execution requires --attention-backend torch or auto")
     torch.set_num_threads(args.cpu_threads)
     logging.basicConfig(level=logging.INFO)
     app = create_app(

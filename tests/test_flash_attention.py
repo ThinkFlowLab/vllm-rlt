@@ -121,10 +121,11 @@ def test_flash_sync_async_mixed_depths(layout, static):
 def test_packed_prefill_metadata_groups_queries_and_rejects_gaps():
     from types import SimpleNamespace
 
+    from vllm_rlt.attention import BackendCapabilities
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
 
     cache = KVCacheManager(1, 1, 8, 32, 4, 2)
-    cache.attention = SimpleNamespace(generation=4)
+    cache.attention = SimpleNamespace(capabilities=BackendCapabilities(packed_prefill=True))
     cache.allocate("a", 20)
     cache.allocate("b", 20)
     batch = cache._prepare_batch(

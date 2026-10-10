@@ -364,7 +364,7 @@ class ModelRunner:
 
     def _prefill_tokens(self, ids, positions, tokens, requests=()):
         cache = self.cache_manager
-        if cache.layout == "last_exited" and getattr(cache.attention, "generation", None) == 4:
+        if cache.layout == "last_exited" and cache.attention_capabilities.packed_prefill:
             # Prefill has genuinely ragged query sequences. Do not pad token rows
             # or reuse decode's per-query, model-max-width static page tables.
             bank = None
@@ -644,10 +644,8 @@ class ModelRunner:
         copies = []
         for request in requests:
             depth = request.loops_done - 1
-            allocation = cache._get_allocation(request.request_id)
-            for layer in range(cache.num_layers):
-                if request.position not in allocation.written[depth][layer]:
-                    raise RuntimeError("cannot finalize before every layer has written KV")
+            if not cache.token_written(request.request_id, request.position, depth):
+                raise RuntimeError("cannot finalize before every layer has written KV")
             if depth + 1 < cache.max_loops:
                 copies.append(request)
         if not copies:
@@ -688,10 +686,7 @@ class ModelRunner:
             bank.record_done()
             for request in copies:
                 self.events[request.request_id] = bank.done
-                allocation = cache._get_allocation(request.request_id)
-                for depth in range(request.loops_done, cache.max_loops):
-                    for layer in range(cache.num_layers):
-                        allocation.written[depth][layer].add(request.position)
+                cache.mark_finalized(request.request_id, request.position, request.loops_done - 1)
 
     def finalize(self, request):
         # The final core event must precede copies and coda on the boundary stream.

@@ -108,7 +108,6 @@ def advance_to(engine, boundary):
 def suspend(engine):
     # Exercise the existing victim-selection and WAITING/resume path at a
     # completed scheduler boundary, without changing subsequent batch shape.
-    engine.scheduler.selected_request_ids.clear()
     requester = Request("pressure", [2], SamplingParams())
     assert engine.preemption.preempt(requester)
     request = engine.scheduler.requests["a"]

@@ -1,11 +1,11 @@
 from dataclasses import replace
 
+from vllm_rlt.attention import BackendCapabilities, create_backend
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.preemption import PreemptionManager
-from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
@@ -71,22 +71,37 @@ class LLMEngine:
             cache_config = replace(
                 cache_config, memory_reserve_bytes=cache_config.memory_reserve_bytes + scratch
             )
-        if self.execution_config.cuda_graphs and (
-            parameter.device.type != "cuda" or attention_backend not in ("triton", *FLASH_BACKENDS)
-        ):
+        if self.execution_config.cuda_graphs and parameter.device.type != "cuda":
             raise ValueError("CUDA graphs require CUDA with Triton or FlashAttention")
         if self.execution_config.async_scheduling:
             if self.exit_config.mode not in ("ouro_delayed", "random_lookahead", "trace"):
                 raise ValueError(
                     "async scheduling requires ouro_delayed, random_lookahead or trace exit mode"
                 )
-            if parameter.device.type == "cuda" and attention_backend not in (
-                "triton",
-                *FLASH_BACKENDS,
-            ):
-                raise ValueError("CUDA async scheduling requires Triton or FlashAttention")
+        if self.execution_config.prefill_uva and (
+            parameter.device.type != "cuda" or cache_config.layout != "last_exited"
+        ):
+            raise ValueError("prefill_uva requires CUDA packed prefill with last_exited KV")
+        attention = create_backend(
+            attention_backend,
+            parameter.device,
+            parameter.dtype,
+            config.head_dim,
+            cache_config.block_size,
+            required_capabilities=BackendCapabilities(
+                packed_prefill=self.execution_config.prefill_uva,
+                cuda_graphs=self.execution_config.cuda_graphs,
+                async_scheduling=(
+                    parameter.device.type == "cuda" and self.execution_config.async_scheduling
+                ),
+            ),
+        )
         num_blocks, self.memory_plan = plan_cache(
-            model, cache_config, scheduler_config, self.execution_config, attention_backend
+            model,
+            cache_config,
+            scheduler_config,
+            self.execution_config,
+            attention.info["selected_backend"],
         )
         self.memory_plan["loopcd_reserve_bytes"] = reserved_bytes(
             config, scheduler_config, self.execution_config, parameter.element_size()
@@ -102,16 +117,11 @@ class LLMEngine:
             device=parameter.device,
             dtype=parameter.dtype,
             backend=attention_backend,
+            attention=attention,
             enable_prefix_caching=cache_config.enable_prefix_caching,
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
         )
-        if self.execution_config.prefill_uva and (
-            parameter.device.type != "cuda"
-            or cache_config.layout != "last_exited"
-            or getattr(self.cache_manager.attention, "generation", None) != 4
-        ):
-            raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
         self.speculative_runner = (
             SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)

@@ -198,6 +198,27 @@ The equivalent installed command is `vllm-rlt`. Repeat `--prompt` for a batch;
 the CLI prints one JSON result per prompt, including text, token IDs, exit
 depths, and the finish reason.
 
+### Attention backend selection
+
+Use `--attention-backend auto` with the inference CLI or the local HTTP server
+to select a compatible implementation at startup. Auto tries FA4, FA3, FA2,
+Triton, then Torch, checking hardware, dtype, head dimension, block size, installed
+packages, and execution requirements. CPU uses Torch. For example, on an RTX
+4090, the default 16-token block size rules out FA2's 256-token page requirement;
+auto selects Triton if it is installed.
+
+GPU async scheduling and CUDA Graphs require a device backend. UVA packed
+prefill requires declared packed-prefill support and LAST_EXITED KV. Auto reports
+an error if no implementation satisfies these requirements. Selection occurs
+before memory profiling, and the startup log reports the selected backend and
+why earlier candidates were skipped.
+
+Explicit choices (`torch`, `triton`, `flash_attn`, or `flash_attn_2/3/4`) retain
+their validation errors and never fall back. Existing defaults are unchanged:
+the inference CLI defaults to Torch and the local server defaults to Triton.
+The Python equivalent is `attention_backend="auto"`; selection details are also
+available in `engine.cache_manager.attention_info`.
+
 ## Python API
 
 Save the following as `example.py` in the repository root, then run
