@@ -49,6 +49,7 @@ class SpeculativeRoundTicket:
     rounds: tuple[int, ...]
     rows: int
     cached: tuple[list[SpeculativeResult], list[int]] | None = None
+    retired: bool = False
 
     def ready(self):
         assert self.bank.copy_done is not None
@@ -56,6 +57,8 @@ class SpeculativeRoundTicket:
 
     def collect(self):
         if self.cached is None:
+            if self.retired:
+                raise RuntimeError("cannot collect a retired speculative ticket")
             assert self.bank.copy_done is not None
             self.bank.copy_done.synchronize()
             b = len(self.batch.items)
@@ -74,13 +77,20 @@ class SpeculativeRoundTicket:
             self.cached = (results, values[self.rows + b :])
         return self.cached
 
-    def retire(self):
+    def retire(self, *, discard=False):
+        if self.retired:
+            return
         if self.cached is None:
-            raise RuntimeError("collect a speculative ticket before retiring its bank")
-        # collect() waited for copy_done, which follows compute_done.
-        # All readers of this slot have completed; no second host wait is needed.
+            if not discard:
+                raise RuntimeError("collect a speculative ticket before retiring its bank")
+            # Discarding still waits for the final reader, but does not need to
+            # interpret host data that may have caused the original failure.
+            assert self.bank.copy_done is not None
+            self.bank.copy_done.synchronize()
+        # collect() already waited for copy_done; normal delivery adds no wait.
         self.bank.keepalive.clear()
         self.bank.leased = False
+        self.retired = True
 
 
 class AsyncSpeculativeRunner(SpeculativeRunner):

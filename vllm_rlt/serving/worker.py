@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
+from vllm_rlt.request import Stage
 from vllm_rlt.serving.protocol import IncrementalText, ServingError, ServingLimits
 
 logger = logging.getLogger(__name__)
@@ -156,7 +157,10 @@ class EngineWorker:
             except ValueError as exc:
                 failures.append((request_id, ServingError.invalid_request(str(exc))))
         events = []
+        closed = set()
         for output in self.engine.step():
+            if output.request_id in closed:
+                continue
             decoder, delivered = self.decoders[output.request_id]
             try:
                 # A speculative round can commit several IDs. Decode every new
@@ -167,9 +171,11 @@ class EngineWorker:
                 )
                 self.decoders[output.request_id] = (decoder, len(output.token_ids))
             except ValueError as exc:
-                if not output.finished:
+                request = self.engine.scheduler.requests.get(output.request_id)
+                if request is not None and request.stage != Stage.FINISHED:
                     self.engine.abort_request(output.request_id)
                 del self.decoders[output.request_id]
+                closed.add(output.request_id)
                 failures.append((output.request_id, ServingError.invalid_request(str(exc))))
                 continue
             events.append(
@@ -185,6 +191,7 @@ class EngineWorker:
             )
             if output.finished:
                 del self.decoders[output.request_id]
+                closed.add(output.request_id)
         return failures, events, self.engine.has_unfinished_requests()
 
     def _unload(self):
