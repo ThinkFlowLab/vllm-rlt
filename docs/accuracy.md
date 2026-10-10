@@ -112,6 +112,35 @@ revision, split, seed and source row ID, independent of answers. In particular,
 `--limit 87` samples a different set from the fixed default case. Custom protocols
 do not reuse the stored 59/87 baseline: run HF and native, then use `compare`.
 
+## Thinking checkpoints
+
+`--prompt-mode thinking` prepares zero-shot chat cases for the Ouro-Thinking
+checkpoints: each record renders the raw question through
+`vllm_rlt.entrypoints.chat_template.render_chat_prompt` with
+`enable_thinking=True`, encodes with the checkpoint's normal special-token
+behavior (including BOS), and stops only at EOS. The few-shot task scaffolding
+and its stop strings do not apply. Scoring uses `thinking_final_v1`: the section
+after the last generated `</think>` token is decoded independently. Extract the
+last `\boxed{...}` occurrence if its braces balance, otherwise a terminal
+`####` answer. The boxed form need not be at the end; a nonnumeric last box is
+unparseable (no fallback to an earlier answer). Numeric signs, decimals,
+commas, surrounding whitespace/dollar signs and a trailing period are normalized;
+expressions, fractions and nonfinite values are not evaluated. Missing closing
+markers and unparseable final answers count as incorrect, including on length
+truncation. A parseable matching answer may count even on a length finish; length
+counts remain reported separately, and no row is excluded from the denominator.
+This zero-shot protocol is a project choice, not an official paper-score recipe.
+Custom subsets only: the stored raw-prompt baseline never applies, so establish
+a Thinking baseline by running both backends from one protocol and using `compare`.
+
+```bash
+python -m benchmarks.gsm8k prepare --model /path/to/Ouro-1.4B-Thinking \
+  --model-repo ByteDance/Ouro-1.4B-Thinking --model-revision <pinned-commit> \
+  --prompt-mode thinking --limit 20 --seed 1 \
+  --max-new-tokens 1024 --max-length 2048 \
+  --output /path/to/thinking-protocol.json
+```
+
 ## Adaptive-exit runs
 
 The default recipe runs the checkpoint's full depth for every token: `prepare` reads
