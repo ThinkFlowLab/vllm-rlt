@@ -45,10 +45,8 @@ class LLMEngine:
                 raise ValueError("speculative decoding requires fixed-depth ouro exit mode")
             if self.execution_config.async_scheduling:
                 raise ValueError("speculative decoding currently requires synchronous execution")
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
-                raise ValueError(
-                    "speculative decoding requires refill scheduling without preemption"
-                )
+            if scheduler_config.mode != "refill":
+                raise ValueError("speculative decoding requires refill scheduling")
             # Retained q distributions and sampling scratch coexist with target
             # logits. Reserve beyond ordinary prefill/core profiling, even when
             # requests later choose sampling rather than greedy.
@@ -195,6 +193,16 @@ class LLMEngine:
 
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests
+
+    def _release_request_state(self, request):
+        """Release device resources for suspension, retaining the registered request."""
+        self.model_runner.release(request.request_id)
+        self.cache_manager.poll_prefixes()
+        self.cache_manager.free(request.request_id)
+        for queue in self.scheduler.queues.values():
+            while request.request_id in queue:
+                queue.remove(request.request_id)
+        request.hidden_state = request.input_token_tensor = None
 
     def abort_request(self, request_id: str) -> RequestOutput:
         self.preemption.discard_snapshot(request_id)

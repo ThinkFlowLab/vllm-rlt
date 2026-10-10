@@ -84,6 +84,8 @@ class PreemptionManager:
         e = self.engine
         e.model_runner.synchronize()
         cache = e.cache_manager
+        # snapshot copies KV pages individually to CPU, avoiding a temporary
+        # GPU tensor to gather them while device memory is already under pressure.
         snapshot = dict(
             stage=victim.stage,
             kv=cache.snapshot(victim.request_id),
@@ -92,13 +94,7 @@ class PreemptionManager:
             if victim.input_token_tensor is None
             else victim.input_token_tensor.cpu().clone(),
         )
-        e.model_runner.release(victim.request_id)
-        cache.poll_prefixes()
-        cache.free(victim.request_id)
-        for q in e.scheduler.queues.values():
-            while victim.request_id in q:
-                q.remove(victim.request_id)
-        victim.hidden_state = victim.input_token_tensor = None
+        e._release_request_state(victim)
         self.snapshots[victim.request_id] = snapshot
         e.scheduler.enqueue(victim, Stage.WAITING)
         self.preemptions += 1

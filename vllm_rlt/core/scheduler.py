@@ -238,9 +238,15 @@ class Scheduler:
         admission increments earlier blocked requests' bypass counts; reaching
         the limit stops further bypasses so active work can drain.
         """
+        if not self.queues[Stage.WAITING]:
+            return
         active_count = sum(
             r.stage not in (Stage.WAITING, Stage.RECEIVING) for r in self.requests.values()
         )
+        if active_count >= self.config.max_num_seqs and (
+            self.config.policy != "priority" or self.preempt_callback is None
+        ):
+            return
         waiting = self._order_waiting_requests()
         deferred = []
         scan_count = min(len(waiting), self.config.admission_scan_limit)

@@ -331,7 +331,6 @@ def test_probability_filters_match_expected_and_keep_boundary_ties():
     [
         dict(cache_config=CacheConfig(layout="shared")),
         dict(execution_config=ExecutionConfig(async_scheduling=True)),
-        dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
         dict(scheduler_config=SchedulerConfig(mode="no_refill")),
     ],
 )
@@ -464,3 +463,136 @@ def test_speculative_cuda_graph_matches_eager_with_ragged_replay(max_graph_rows)
         assert runner.graphs.fallbacks > 0
     else:
         assert any(rows > 2 for rows, _, _, _ in runner.graphs.entries)
+
+
+@pytest.mark.parametrize(
+    "device,backend,graphs",
+    [
+        ("cpu", "torch", False),
+        pytest.param("cuda", "triton", False, marks=pytest.mark.gpu),
+        pytest.param("cuda", "triton", True, marks=pytest.mark.gpu),
+    ],
+)
+def test_priority_preempts_only_between_speculative_rounds_and_resumes(device, backend, graphs):
+    m = (
+        model()
+        if device == "cpu"
+        else OuroForCausalLM(tiny_ouro_config(hidden_size=256, head_dim=64)).to(
+            "cuda", torch.bfloat16
+        )
+    )
+    prompts = {"low": [2, 3, 4], "high": [7, 8, 9]}
+    params = {
+        "low": SamplingParams(max_tokens=10, ignore_eos=True, priority=10),
+        "high": SamplingParams(max_tokens=7, ignore_eos=True, priority=0),
+    }
+    expected = {
+        rid: LLM(m, attention_backend=backend).generate([prompt], params[rid])[0]
+        for rid, prompt in prompts.items()
+    }
+    e = engine(
+        m,
+        k=3,
+        cache_config=CacheConfig(64, 16 if graphs else 2, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            policy="priority",
+            enable_preemption=True,
+        ),
+        attention_backend=backend,
+        execution_config=ExecutionConfig(cuda_graphs=graphs, cuda_graph_max_batch_size=8),
+    )
+    e.add_request("low", prompts["low"], params["low"])
+    while len(e.scheduler.requests["low"].generated_token_ids) < 2:
+        e.step()
+    e.add_request("high", prompts["high"], params["high"])
+    actual = drain(e)
+    assert e.preemption.preemptions > 0
+    assert e.preemption.resumptions > 0
+    assert {rid: out.token_ids for rid, out in actual.items()} == {
+        rid: out.token_ids for rid, out in expected.items()
+    }
+    assert {rid: out.exit_depths for rid, out in actual.items()} == {
+        rid: out.exit_depths for rid, out in expected.items()
+    }
+    assert e.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("temperature", [0, 0.8])
+def test_speculative_preemption_preserves_request_rng(temperature):
+    m = model()
+    params = {
+        "low": SamplingParams(
+            max_tokens=12, ignore_eos=True, priority=10, temperature=temperature, top_k=7, seed=42
+        ),
+        "high": SamplingParams(
+            max_tokens=7, ignore_eos=True, priority=0, temperature=temperature, top_k=7, seed=17
+        ),
+    }
+    prompts = {"low": [2, 3, 4], "high": [7, 8, 9]}
+    expected = {
+        rid: LLM(m, speculative_config=SpeculativeConfig(3)).generate([prompt], params[rid])[0]
+        for rid, prompt in prompts.items()
+    }
+    e = engine(
+        m,
+        cache_config=CacheConfig(64, 2, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            policy="priority",
+            enable_preemption=True,
+        ),
+    )
+    e.add_request("low", prompts["low"], params["low"])
+    while len(e.scheduler.requests["low"].generated_token_ids) < 2:
+        e.step()
+    e.add_request("high", prompts["high"], params["high"])
+    actual = drain(e)
+    assert e.preemption.preemptions > 0 and e.preemption.resumptions > 0
+    assert {rid: out.token_ids for rid, out in actual.items()} == {
+        rid: out.token_ids for rid, out in expected.items()
+    }
+    assert {rid: out.exit_depths for rid, out in actual.items()} == {
+        rid: out.exit_depths for rid, out in expected.items()
+    }
+    assert not e.preemption.snapshots
+    assert e.cache_manager.num_used_blocks == 0
+
+
+def test_abort_suspended_speculative_request_allows_id_reuse():
+    m = model()
+    e = engine(
+        m,
+        cache_config=CacheConfig(64, 2, incremental_allocation=True),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            policy="priority",
+            enable_preemption=True,
+        ),
+    )
+    low = SamplingParams(max_tokens=12, ignore_eos=True, priority=10)
+    high = SamplingParams(max_tokens=7, ignore_eos=True, priority=0)
+    e.add_request("low", [2, 3, 4], low)
+    while len(e.scheduler.requests["low"].generated_token_ids) < 2:
+        e.step()
+    suspended = e.scheduler.requests["low"]
+    e.add_request("high", [7, 8, 9], high)
+    e.step()
+    assert "low" in e.preemption.snapshots
+    assert suspended.stage == Stage.WAITING
+    assert e.abort_request("low").finished
+    assert "low" not in e.preemption.snapshots
+    e.add_request("low", [5, 6], low)
+    assert e.scheduler.requests["low"] is not suspended
+    actual = drain(e)
+    expected = LLM(m, speculative_config=SpeculativeConfig(3)).generate([[5, 6]], low)[0]
+    assert actual["low"].token_ids == expected.token_ids
+    assert actual["low"].exit_depths == expected.exit_depths
+    assert not e.preemption.snapshots
+    assert e.cache_manager.num_used_blocks == 0

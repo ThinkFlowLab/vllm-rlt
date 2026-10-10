@@ -132,7 +132,7 @@ class ExecutionConfig:
 
 @dataclass(frozen=True)
 class SpeculativeConfig:
-    """Fixed-depth self-speculation; K is explicit until benchmarked."""
+    """Fixed-depth self-speculation; set the number of speculative tokens explicitly."""
 
     num_speculative_tokens: int
     draft_loops: int = 2
