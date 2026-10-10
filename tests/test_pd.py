@@ -1,16 +1,20 @@
 """PD ownership, paged transfer descriptors and real multi-process NIXL execution."""
 
+import json
+import os
 import time
+from contextlib import closing
 from dataclasses import replace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
-from tests.helpers import tiny_ouro_config
+from tests.helpers import tiny_nanbeige_config, tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import OuroForCausalLM
+from vllm_rlt.models import AutoModelForCausalLM, NanbeigeForCausalLM, OuroForCausalLM
 from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.transport import kv_segments, partition_segments
 from vllm_rlt.profiling import Profiler
@@ -339,85 +343,243 @@ def test_pd_prefix_reuse_reduces_transfers_and_preserves_outputs(p_cache, d_cach
     )
     if d_cache:
         assert p["bytes_sent"] < full_bytes
+    assert all(x["used_blocks"] == 0 for x in stats)
 
 
-@pytest.mark.gpu
-def test_pd_nanbeige_1p1d_matches_single_engine():
-    """Verify Nanbeige4.2 fixed 2-loop execution in 1P1D PD configuration."""
+@pytest.fixture
+def nanbeige_checkpoint(tmp_path):
+    # An explicit local checkpoint can qualify the same tests on official weights.
+    checkpoint = os.environ.get("VLLM_RLT_NANBEIGE_CHECKPOINT")
+    if checkpoint:
+        from pathlib import Path
+
+        assert Path(checkpoint).is_dir(), "provide a complete local checkpoint directory"
+        return checkpoint
+    torch.manual_seed(42)
+    model = NanbeigeForCausalLM(tiny_nanbeige_config(head_dim=64))
+    (tmp_path / "config.json").write_text(json.dumps(model.config.to_dict()))
+    save_file(model.state_dict(), str(tmp_path / "model.safetensors"))
+    return str(tmp_path)
+
+
+def test_pd_nanbeige_checkpoint_loading(nanbeige_checkpoint):
+    model = AutoModelForCausalLM.from_pretrained(nanbeige_checkpoint, dtype=torch.float32)
+    assert isinstance(model, NanbeigeForCausalLM)
+    assert model.config.total_ut_steps == 2
+
+
+def test_pd_coordinator_stores_typed_metadata(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_rlt.pd.engine import PDEngine, PDModelInfo
+
+    context = Mock()
+    context.Pipe.side_effect = lambda: (Mock(), Mock())
+    monkeypatch.setattr("vllm_rlt.pd.engine.mp.get_context", lambda _: context)
+    config = tiny_nanbeige_config()
+
+    def ready(engine, condition, deadline):
+        for peer in engine.peers.values():
+            peer.info = dict(
+                fingerprint="same-weights",
+                model=config.to_dict(),
+                info=dict(agent=peer.name),
+                block_size=4,
+                depths=2,
+                num_blocks=128,
+            )
+            peer.ready = peer.connected = True
+        assert condition()
+
+    monkeypatch.setattr(PDEngine, "_wait", ready)
+    # The coordinator consumes worker metadata, not Nanbeige's full config class.
+    engine = PDEngine(tiny_ouro_config(), attention_backend="triton")
+    try:
+        assert engine.model_info == PDModelInfo(64, 2, 128)
+        assert not hasattr(engine, "model")
+        with pytest.raises(ValueError, match="loop bounds"):
+            engine.add_request("invalid", [2], SamplingParams(max_loops=3))
+        engine.add_request("valid", [2, 3], SamplingParams(max_tokens=4, max_loops=2))
+        assert engine.requests["valid"].prompt_token_ids == [2, 3]
+        engine.abort_request("valid")
+        assert not engine.requests and not engine.transfers
+        # A late control completion for generation A must not mutate generation B.
+        engine.add_request("reuse", [2], SamplingParams(max_tokens=1))
+        old = next(iter(engine.transfers.values()))
+        engine.abort_request("reuse")
+        engine.add_request("reuse", [3], SamplingParams(max_tokens=1))
+        replacement = next(iter(engine.transfers.values()))
+        engine._message(next(iter(engine.peers.values())), dict(kind="activated", tid=old.tid))
+        assert replacement.phase == "waiting"
+        assert engine.requests["reuse"] is replacement.request
+        assert replacement.request.generated_token_ids == []
+        engine.abort_request("reuse")
+    finally:
+        engine._terminate()
+
+
+def create_nanbeige_pd(checkpoint):
     pytest.importorskip("nixl")
-    from tests.helpers import tiny_nanbeige_config
-    from vllm_rlt.models import NanbeigeForCausalLM
     from vllm_rlt.pd.engine import PDEngine
 
     if torch.cuda.device_count() < 2:
-        pytest.skip("requires 2 visible GPUs")
-    
-    config = tiny_nanbeige_config(head_dim=16)
-    params = SamplingParams(max_tokens=4, temperature=0.0)  # greedy
-    
-    # Nanbeige fixed 2-loop: prefill uses depth=2, decode also uses depth=2
-    # Trace needs: [prefill_depth, decode_token1, decode_token2, ...]
-    trace_depths = [2] * (1 + params.max_tokens)  # 1 prefill + max_tokens decode
-    
-    # Create PD engine with Nanbeige
-    pd_engine = PDEngine(
-        config,
+        pytest.skip("requires 2 reserved visible GPUs")
+    return PDEngine(
+        checkpoint,
         pd_config=PDConfig(
             prefill_devices=(0,),
             decode_devices=(1,),
             transfer_chunk_bytes=4096,
             max_inflight_bytes=16384,
             request_timeout=90,
-            startup_timeout=90,
+            startup_timeout=180,
         ),
-        prefill_cache_config=CacheConfig(64, 4, "last_exited"),
-        decode_cache_config=CacheConfig(64, 4, "last_exited"),
+        prefill_cache_config=CacheConfig(128, 4, "last_exited"),
+        decode_cache_config=CacheConfig(128, 4, "last_exited"),
         prefill_scheduler_config=SchedulerConfig(
             max_num_seqs=2, max_num_batched_tokens=8, prefill_chunk_size=8
         ),
         decode_scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=2),
-        exit_config=ExitConfig("trace", depths_by_request={"pd_0": trace_depths, "pd_1": trace_depths}),
         execution_config=ExecutionConfig(async_scheduling=True),
         attention_backend="triton",
-        seed=42,
     )
-    
-    # Create single-engine reference
-    torch.manual_seed(42)
-    model = NanbeigeForCausalLM(config).to("cuda:0", torch.bfloat16)
-    reference_engine = LLMEngine(
+
+
+def nanbeige_reference(checkpoint):
+    model = AutoModelForCausalLM.from_pretrained(checkpoint, device="cuda:0", dtype=torch.bfloat16)
+    assert isinstance(model, NanbeigeForCausalLM)
+    assert model.config.total_ut_steps == 2
+    return LLMEngine(
         model,
-        cache_config=CacheConfig(64, 4, "last_exited"),
+        cache_config=CacheConfig(128, 4, "last_exited"),
         scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
-        exit_config=ExitConfig("trace", depths_by_request={"ref_0": trace_depths, "ref_1": trace_depths}),
         attention_backend="triton",
     )
-    
-    prompts = [[1, 2, 3, 4, 5], [5, 4, 3]]
-    
+
+
+def assert_nanbeige_idle(engine):
+    assert not engine.requests and not engine.transfers
+    assert engine.cache_manager.num_used_blocks == 0
+    assert all(
+        p.slots == 0 and p.blocks == 0 and p.compute_slots == 0 for p in engine.peers.values()
+    )
+
+
+def assert_nanbeige_stopped(engine):
+    assert all(not p.process.is_alive() for p in engine.peers.values())
+    assert len(engine.worker_metrics) == 2
+    assert all(m["used_blocks"] == 0 for m in engine.worker_metrics.values())
+
+
+@pytest.mark.gpu
+def test_pd_nanbeige_1p1d_matches_single_engine(nanbeige_checkpoint):
+    """Real checkpoint loading and NIXL KV/hidden handoff, without forced exit traces."""
+    params = SamplingParams(max_tokens=4, temperature=0.0, ignore_eos=True)
+    with create_nanbeige_pd(nanbeige_checkpoint) as engine:
+        with closing(nanbeige_reference(nanbeige_checkpoint)) as reference:
+            for i, prompt in enumerate(([2, 3, 4, 5, 6] * 3, [6, 5, 4])):
+                for target in (engine, reference):
+                    target.add_request(str(i), prompt, params)
+            actual, expected = drain(engine), drain(reference)
+            assert actual == expected
+            assert len(actual) == 2
+            for output in actual.values():
+                assert output.finished and output.finish_reason == "length"
+                assert len(output.token_ids) == params.max_tokens
+                assert output.exit_depths == [2] * params.max_tokens
+            # Single output exercises hidden-state handoff without a recurrent decode.
+            for request_id, options in (
+                ("first-only", replace(params, max_tokens=1)),
+                ("seeded", replace(params, temperature=0.7, top_k=32, seed=947)),
+            ):
+                for target in (engine, reference):
+                    target.add_request(request_id, [6, 5, 4], options)
+                result = drain(engine)
+                assert result == drain(reference)
+                assert result[request_id].exit_depths == [2] * options.max_tokens
+        assert_nanbeige_idle(engine)
+    assert_nanbeige_stopped(engine)
+    assert sum(m["bytes_sent"] for m in engine.worker_metrics.values()) > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("phase", ["prefill", "handoff", "decode", "decode_output"])
+def test_pd_nanbeige_cancel_reuse_and_close(nanbeige_checkpoint, phase, monkeypatch):
+    params = SamplingParams(max_tokens=32, temperature=0.0, ignore_eos=True)
+    engine = create_nanbeige_pd(nanbeige_checkpoint)
     try:
-        for i, prompt in enumerate(prompts):
-            pd_engine.add_request(f"pd_{i}", prompt, params, trace_id=f"pd_{i}")
-            reference_engine.add_request(f"ref_{i}", prompt, params, trace_id=f"ref_{i}")
-        
-        pd_outputs = drain(pd_engine)
-        ref_outputs = drain(reference_engine)
-        
-        # Compare outputs
-        for i in range(len(prompts)):
-            pd_out = pd_outputs[f"pd_{i}"]
-            ref_out = ref_outputs[f"ref_{i}"]
-            assert pd_out.token_ids == ref_out.token_ids, (
-                f"Token mismatch for prompt {i}: PD={pd_out.token_ids}, Ref={ref_out.token_ids}"
-            )
-            assert pd_out.finished == ref_out.finished
-        
-        # Verify resource cleanup
-        assert all(p.slots == 0 and p.blocks == 0 for p in pd_engine.peers.values())
-        
+        engine.add_request("reuse", [2, 3, 4, 5] * 12, params)
+        old = next(iter(engine.transfers.values()))
+        message = engine._message
+        boundary = dict(
+            prefill="prefill_started", handoff="commit", decode="activated", decode_output="output"
+        )[phase]
+        replacement = replace(params, max_tokens=4)
+        prompt = [6, 5, 4, 3, 2]
+        cancelled = False
+
+        def cancel_at_boundary(peer, event):
+            nonlocal cancelled
+            # Commit marks P's submitted handoff, before the coordinator activates D.
+            # Observe protocol boundaries rather than racing sleeps against CUDA.
+            reached = event.get("tid") == old.tid and event["kind"] == boundary
+            if phase == "decode_output" and reached:
+                reached = len(event["output"].token_ids) >= 2
+            if reached and not cancelled:
+                if phase in ("decode", "decode_output"):
+                    message(peer, event)
+                if phase == "decode_output":
+                    assert event["output"].token_ids and not event["output"].finished
+                aborted = engine.abort_request("reuse")
+                assert aborted.finished and aborted.finish_reason == "abort"
+                cancelled = True
+                assert old.tid in engine.transfers
+                engine.add_request("reuse", prompt, replacement)
+                if phase in ("decode", "decode_output"):
+                    return
+            message(peer, event)
+
+        monkeypatch.setattr(engine, "_message", cancel_at_boundary)
+        deadline = time.monotonic() + 60
+        while not cancelled:
+            engine.step()
+            assert time.monotonic() < deadline, f"did not reach {phase} boundary"
+        new = next(w for w in engine.transfers.values() if not w.cancelled)
+        assert new.tid != old.tid
+        with closing(nanbeige_reference(nanbeige_checkpoint)) as reference:
+            reference.add_request("reuse", prompt, replacement)
+            actual = drain(engine)
+            assert actual == drain(reference)
+            assert actual["reuse"].exit_depths == [2] * replacement.max_tokens
+        assert_nanbeige_idle(engine)
+        # Closing with a live request must drain cancellation before worker exit.
+        engine.add_request("live", [2, 3] * 24, params)
+        engine.step()
     finally:
-        pd_engine.close()
-    
-    assert all(not p.process.is_alive() for p in pd_engine.peers.values())
-    stats = pd_engine.worker_metrics.values()
-    assert all(m["used_blocks"] == 0 for m in stats)
+        engine.close()
+    assert_nanbeige_idle(engine)
+    assert_nanbeige_stopped(engine)
+
+
+@pytest.mark.gpu
+def test_pd_nanbeige_eos_after_handoff(tmp_path):
+    """Deterministic EOS on the first output, through the unchanged P/D path."""
+    torch.manual_seed(42)
+    model = NanbeigeForCausalLM(tiny_nanbeige_config(head_dim=64, eos_token_id=0))
+    with torch.no_grad():
+        model.lm_head.weight.zero_()  # Greedy tie-breaking produces token 0 (EOS).
+    (tmp_path / "config.json").write_text(json.dumps(model.config.to_dict()))
+    save_file(model.state_dict(), str(tmp_path / "model.safetensors"))
+    checkpoint = str(tmp_path)
+    with create_nanbeige_pd(checkpoint) as engine:
+        with closing(nanbeige_reference(checkpoint)) as reference:
+            params = SamplingParams(max_tokens=4)
+            for target in (engine, reference):
+                target.add_request("eos", [2, 3, 4], params)
+            result = drain(engine)
+            assert result == drain(reference)
+            assert result["eos"].token_ids == [0]
+            assert result["eos"].exit_depths == [2]
+            assert result["eos"].finished and result["eos"].finish_reason == "stop"
+        assert_nanbeige_idle(engine)
+    assert_nanbeige_stopped(engine)
