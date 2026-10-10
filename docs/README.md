@@ -18,6 +18,7 @@ an environment to receiving the first generated response. The
 | [FlashAttention](https://github.com/hsliuustc0106/vllm-rlt/pull/30) | FA2/FA3/FA4 installation, hardware selection, and constraints |
 | [Cache and scheduling features](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Prefix reuse, incremental KV, priorities, and preemption |
 | [Prefill/decode disaggregation](https://github.com/hsliuustc0106/vllm-rlt/pull/31) | Single-host GPU worker pools and NIXL transfer |
+| [PD refactoring draft](pd_refactoring.md) | M9 ownership, handoff contracts, migration dependencies, and validation plan for RFC #32 |
 | [HTTP serving](serving.md) | Completions API, streaming, and service lifecycle |
 | [Profiling](profiling.md) | Core profiler options, Python/HTTP controls, PD collection, and per-rank archives |
 | [Accuracy evaluation](accuracy.md) | GSM8K regression setup and comparison methodology |
