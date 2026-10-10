@@ -1,4 +1,6 @@
-<h1 align="center">vllm-rlt</h1>
+<h1 align="center">
+  <img src="docs/assets/vllm-rlt-logo.png" alt="vLLM-RLT" width="640">
+</h1>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2608.09444"><img src="https://img.shields.io/badge/arXiv-2608.09444-b31b1b?style=flat-square&amp;logo=arxiv&amp;logoColor=white" alt="Paper: arXiv 2608.09444"></a>
