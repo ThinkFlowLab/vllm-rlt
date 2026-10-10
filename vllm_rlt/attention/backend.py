@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.kernels.flash_attention import FLASH_BACKENDS, FlashPagedAttention
+from vllm_rlt.kernels.flashinfer_attention import FlashInferPagedAttention
 from vllm_rlt.kernels.paged_attention import torch_paged_attention, triton_paged_attention
 
 
@@ -47,7 +48,8 @@ _FLASH_CAPABILITIES = {
     3: BackendCapabilities(cuda_graphs=True, async_scheduling=True),
     4: BackendCapabilities(packed_prefill=True, cuda_graphs=True, async_scheduling=True),
 }
-_AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "triton", "torch")
+_FLASHINFER_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
+_AUTO_PRIORITY = ("flash_attn_4", "flash_attn_3", "flash_attn_2", "flashinfer", "triton", "torch")
 
 
 def backend_capabilities(implementation) -> BackendCapabilities:
@@ -55,7 +57,7 @@ def backend_capabilities(implementation) -> BackendCapabilities:
 
 
 def validate_backend_name(backend: str) -> None:
-    if backend not in {"auto", "torch", "triton", *FLASH_BACKENDS}:
+    if backend not in {"auto", "torch", "triton", "flashinfer", *FLASH_BACKENDS}:
         raise ValueError("unknown attention backend")
 
 
@@ -70,6 +72,9 @@ def _create_explicit(backend, device, dtype, head_dim, block_size):
         # Probe the actual module, including its dependency imports, before selection.
         importlib.import_module("vllm_rlt.kernels.triton_attention")
         return AttentionBackend(triton_paged_attention, _TRITON_CAPABILITIES, {"backend": backend})
+    if backend == "flashinfer":
+        kernel = FlashInferPagedAttention(device, dtype, head_dim, block_size)
+        return AttentionBackend(kernel, _FLASHINFER_CAPABILITIES, dict(kernel.info))
     if backend in FLASH_BACKENDS:
         kernel = FlashPagedAttention(device, dtype, head_dim, block_size, backend)
         return AttentionBackend(kernel, _FLASH_CAPABILITIES[kernel.generation], dict(kernel.info))
@@ -85,7 +90,7 @@ def create_backend(
     *,
     required_capabilities: BackendCapabilities = BackendCapabilities(),
 ) -> AttentionBackend:
-    """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
+    """Explicit choices fail without fallback; auto tries FA4/3/2, FlashInfer, Triton, then Torch.
 
     Each candidate validates hardware/configuration and imports its implementation.
     Only compatibility and import failures permit auto to try the next candidate;
@@ -118,7 +123,7 @@ def create_backend(
             f"flash_attn_{implementation.generation}" if candidate in FLASH_BACKENDS else candidate
         )
         reason = (
-            "first compatible candidate in FA4 > FA3 > FA2 > Triton > Torch priority"
+            "first compatible candidate in FA4 > FA3 > FA2 > FlashInfer > Triton > Torch priority"
             if backend == "auto"
             else f"explicitly requested {backend}"
         )
