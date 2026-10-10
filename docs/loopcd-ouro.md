@@ -69,12 +69,10 @@ request-ID reuse. It also covers zero-strength equivalence, refill/drain,
 configuration rejection, stale owners and memory reservation. These use real
 in-memory tiny FP32 CPU models. The affine FP32/FP64 test does not qualify BF16.
 
-Official Ouro-1.4B checkpoint
-`574fa66cb8bf5abdc979642d01cf2b79b16bfab1` qualification, BF16 fused development
-measurements, generation/multiple-choice quality and matched GPU cost remain
-pending. Existing exploratory Huginn results are separate evidence. This initial
-PR does not establish official Ouro quality, learning gains, throughput gains,
-long-context behavior or compatibility with the rejected combinations.
+Official-checkpoint continuation and fixed-work results are tracked in
+[Task 0's audited results](loopcd-scale-results.md), including its retained
+BF16 independent-oracle failure and uncertain quality confirmation.
+Preemption qualification is described below.
 
 
 ## Single-worker preemption contract
@@ -106,10 +104,47 @@ also check output parity and resource cleanup on CPU and Triton FP32 CUDA.
 The CUDA cases cover static buffers off and on. The CUDA tests use tiny random checkpoints and
 require the `gpu` marker.
 
-Separate official Ouro-1.4B runs cover FP32/BF16 priority preemption and FP32
-multi-request KV pressure. Priority logits match exactly. Pressure tokens,
-exit depths and recurrent-work counts match uninterrupted runs; score
-differences up to `2.4e-5` also occur in an unpreempted batching control.
-Official BF16 multi-request pressure and throughput remain unmeasured.
-Graph preemption, async execution, P/D handoff, prefix caching and speculative
-decoding are outside this contract.
+`tests/test_loopcd_preemption_continuation.py` uses the stateful
+`OuroContinuation` oracle for P4D2/P4D3, with resumed CODA, PRELUDE and
+RECURRENT stages, delayed KV allocation, cancellation and ID reuse. At each
+readout it compares final hidden state, every historical K/V plane, guided
+vocabulary logits and selected-token log probability. The original
+`atol=rtol=1e-4` gates are unchanged. Reference-hidden error is recorded as a
+separate diagnostic; saved references are checked bit-exactly.
+
+Official Ouro-1.4B FP32/Triton passes all 12 combinations of decode depth 2/3,
+prompt length 3/4/5 and guidance strength 0/0.3 in two fresh processes:
+264 readouts including the reused requests. Native BF16 B1 priority resumption
+also has bit-exact vocabulary logits with static buffers off/on in both
+processes. This BF16 parity result does not qualify the retained independent
+BF16 numerical failure in [Task 0's results](loopcd-scale-results.md).
+
+Earlier official FP32 KV-pressure runs match tokens, exit depths and recurrent
+work; score differences up to `2.4e-5` also occur in an uninterrupted batching
+control. BF16 multi-request pressure remains unqualified.
+
+### Fixed-work preemption cost
+
+The RTX 5090 comparison uses FP32/eager Triton, P4D3, two_head/ref1/strength0.3,
+B16, initial-total C32, P512/F128 and a common 18 GiB KV pool. The interrupted
+arm suspends one request at completed-step CODA before output index 4, then
+uses the native FCFS scheduler to restore it. Two reversed configuration orders
+each run five warmups and five measurements per arm. The four-arm run retains
+80 trials; the two guided arms have ten measured trials each.
+
+| Guided arm | Mean tokens/s | Mean native request latency |
+| --- | ---: | ---: |
+| Uninterrupted | 224.60 | 13.67 s |
+| One controlled preemption | 214.55 | 14.55 s |
+
+All 20 trials per guided arm match request IDs, output tokens, exit depths and
+finish state; model-row work is unchanged. Batch regrouping changes head calls
+from 1670 to 1694. The snapshot contains 960 MiB of KV tensors and an 8 KiB
+guidance reference, plus hidden state and written metadata. Actual successful
+restore callbacks average 115.1 ms; suspension averages 546.3 ms.
+
+The paused request's next-token delivery gap averages 7.63 s, reaching 7.74 s;
+it waits at the back of the FCFS queue. Copy time alone therefore understates
+its interruption. These timings include native scheduling, KV transfer and
+batch regrouping; they do not isolate the reference-copy cost or estimate HTTP
+SLOs. See [raw trials, source hashes and retained diagnostics](https://github.com/prettygirlisnotme/vllm-rlt/releases/tag/loopcd-preemption-evidence-20261010).
