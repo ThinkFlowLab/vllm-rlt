@@ -8,6 +8,7 @@ no per-request state: the caller stores and passes in the RNG generator.
 import torch
 
 from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.worker.sampling import check_seed, processed_logits, raw_logprobs
 
 
 class Sampler:
@@ -24,22 +25,39 @@ class Sampler:
     ) -> tuple[torch.Tensor, torch.Generator | None]:
         """Return a 0-dim long device tensor and the possibly created generator.
 
-        ``params`` is assumed to be validated by ``SamplingParams.__post_init__``.
-        No host synchronization happens here: the returned tensor stays on the
-        logits device so the async CODA path can feed it to the next prelude.
+        ``params`` is assumed to be validated by ``SamplingParams.__post_init__``
+        and to carry an engine-resolved seed. No host synchronization happens
+        here: the returned tensor stays on the logits device so the async CODA
+        path can feed it to the next prelude.
         """
+        check_seed(params)
         if params.temperature == 0:
             return logits.argmax(), generator
-        logits = logits.float() / params.temperature
-        if params.top_k > 0:
-            threshold = logits.topk(min(params.top_k, logits.numel())).values[-1]
-            logits = logits.masked_fill(logits < threshold, -torch.inf)
-        if params.top_p < 1:
-            sorted_logits, indices = logits.sort(descending=True)
-            remove = sorted_logits.softmax(-1).cumsum(-1) > params.top_p
-            remove[1:] = remove[:-1].clone()
-            remove[0] = False
-            logits = logits.scatter(0, indices, sorted_logits.masked_fill(remove, -torch.inf))
+        return self._draw(processed_logits(logits, params), params, generator)
+
+    def sample_with_logprob(
+        self,
+        logits: torch.Tensor,
+        params: SamplingParams,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Generator | None, torch.Tensor]:
+        """``sample()`` plus the 0-dim FP32 processed logprob of the drawn token.
+
+        The logprob is ``log_softmax`` of the same processed logits the token is
+        drawn from, so it equals ``token_logprob(..., "processed_logprobs")``
+        without rebuilding them; greedy rows report the unscaled distribution.
+        Tokens and RNG consumption are those of ``sample()``.
+        """
+        check_seed(params)
+        if params.temperature == 0:
+            token = logits.argmax()
+            return token, generator, raw_logprobs(logits[None], token.view(1))[0]
+        processed = processed_logits(logits, params)
+        token, generator = self._draw(processed, params, generator)
+        return token, generator, raw_logprobs(processed[None], token.view(1))[0]
+
+    def _draw(self, processed, params, generator):
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(params.seed)
-        return torch.multinomial(logits.softmax(-1), 1, generator=generator).squeeze(0), generator
+        token = torch.multinomial(processed.softmax(-1), 1, generator=generator).squeeze(0)
+        return token, generator
