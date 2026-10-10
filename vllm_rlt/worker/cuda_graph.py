@@ -170,16 +170,25 @@ class CodaGraphs:
         self.entries = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.stream = torch.cuda.Stream(device=next(model.parameters()).device)
+        self.last_event = None
         self.captures = self.replays = self.fallbacks = 0
 
     @torch.inference_mode()
     def run(self, hidden):
         count = len(hidden)
-        if count > self.execution.cuda_graph_max_batch_size or (
-            count not in self.entries and len(self.entries) >= self.execution.cuda_graph_max_graphs
+        if (
+            not count
+            or count > self.execution.cuda_graph_max_batch_size
+            or (
+                count not in self.entries
+                and len(self.entries) >= self.execution.cuda_graph_max_graphs
+            )
         ):
             self.fallbacks += 1
             return self.model.coda(hidden)
+        stream = torch.cuda.current_stream(hidden.device)
+        if self.last_event is not None:
+            stream.wait_event(self.last_event)
         entry = self.entries.get(count)
         if entry is None:
             entry = SimpleNamespace(hidden=torch.empty_like(hidden))
@@ -191,5 +200,8 @@ class CodaGraphs:
             self.entries[count] = entry
             self.captures += 1
         entry.graph.replay()
+        output = entry.output.clone()
+        self.last_event = torch.cuda.Event()
+        self.last_event.record(stream)
         self.replays += 1
-        return entry.output.clone()
+        return output
