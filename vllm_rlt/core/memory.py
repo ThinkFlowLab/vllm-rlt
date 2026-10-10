@@ -66,6 +66,7 @@ def plan_cache(model, cache, scheduler, execution, backend):
         device=device,
         dtype=parameter.dtype,
         backend=backend,
+        recurrent_layers=getattr(model, "recurrent_kv_layers", None),
     )
     ids, positions = [], []
     for index, length in enumerate(lengths):
@@ -73,10 +74,19 @@ def plan_cache(model, cache, scheduler, execution, backend):
         probe.allocate(rid, length)
         ids.extend([rid] * length)
         positions.extend(range(length))
-    hidden = model.prelude(torch.zeros(count, dtype=torch.long, device=device))
+    tokens = torch.zeros(count, dtype=torch.long, device=device)
+    if getattr(model, "requires_boundary_kv", False):
+        boundary = probe._prepare_batch(ids, [0] * count, positions)
+        hidden = model.prelude_prepared(tokens, boundary, probe)
+    else:
+        hidden = model.prelude(tokens)
     for depth in range(config.total_ut_steps):
         hidden, _ = model.recurrent(hidden, ids, [depth] * count, positions, probe)
-    logits = model.coda(hidden)
+    logits = (
+        model.coda_prepared(hidden, boundary, probe)
+        if getattr(model, "requires_boundary_kv", False)
+        else model.coda(hidden)
+    )
     torch.cuda.synchronize(device)
     peak = max(0, torch.cuda.max_memory_allocated(device) - allocated)
     del hidden, logits, probe

@@ -120,6 +120,7 @@ class KVCacheManager:
         enable_prefix_caching: bool = False,
         incremental_allocation: bool = False,
         watermark_ratio: float = 0.0,
+        recurrent_layers: Sequence[int] | None = None,
         *,
         attention: AttentionBackend | None = None,
     ):
@@ -140,6 +141,17 @@ class KVCacheManager:
         if layout not in {"last_exited", "shared"}:
             raise ValueError("unsupported KV layout")
         self.layout = layout
+        self.recurrent_layers = (
+            tuple(range(num_layers)) if recurrent_layers is None else tuple(recurrent_layers)
+        )
+        if not self.recurrent_layers or len(set(self.recurrent_layers)) != len(
+            self.recurrent_layers
+        ):
+            raise ValueError("recurrent_layers must be nonempty and unique")
+        if any(
+            type(layer) is not int or not 0 <= layer < num_layers for layer in self.recurrent_layers
+        ):
+            raise ValueError("recurrent_layers must be valid cache layer indices")
         self.storage_depths = max_loops if layout == "last_exited" else 1
         self.device = torch.device(device)
         self.dtype = dtype
@@ -457,7 +469,10 @@ class KVCacheManager:
         allocation = self._get_allocation(request_id)
         self._validate_depth(exit_depth)
         self._validate_position(allocation, position)
-        if not self._token_written(allocation, position, exit_depth):
+        if any(
+            position not in allocation.written[self._plane(exit_depth)][layer]
+            for layer in self.recurrent_layers
+        ):
             raise RuntimeError(
                 "cannot finalize a token before every layer has written its exit depth"
             )
@@ -467,7 +482,7 @@ class KVCacheManager:
         if self.layout == "shared":
             return
         for depth in range(exit_depth + 1, self.max_loops):
-            for layer in range(self.num_layers):
+            for layer in self.recurrent_layers:
                 allocation.written[self._plane(depth)][layer].add(position)
 
     def snapshot(self, request_id: str) -> KVSnapshot:
@@ -823,8 +838,17 @@ class KVCacheManager:
         # Basic-index copies avoid a blocking host->device index tensor on the
         # boundary stream. That transfer would serialize final core and routing.
         for destination in destinations:
-            self.key_cache[destination, :, offset].copy_(self.key_cache[source, :, offset])
-            self.value_cache[destination, :, offset].copy_(self.value_cache[source, :, offset])
+            if len(self.recurrent_layers) == self.num_layers:
+                self.key_cache[destination, :, offset].copy_(self.key_cache[source, :, offset])
+                self.value_cache[destination, :, offset].copy_(self.value_cache[source, :, offset])
+            else:
+                for layer in self.recurrent_layers:
+                    self.key_cache[destination, layer, offset].copy_(
+                        self.key_cache[source, layer, offset]
+                    )
+                    self.value_cache[destination, layer, offset].copy_(
+                        self.value_cache[source, layer, offset]
+                    )
         self._record_finalized(allocation, position, exit_depth)
 
     @torch.no_grad()

@@ -8,12 +8,14 @@ from typing import Any
 
 import torch
 
+from .huginn import HuginnConfig, HuginnForCausalLM
 from .nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from .ouro import OuroConfig, OuroForCausalLM
 
 MODEL_MAPPING = {
     "ouro": OuroForCausalLM,
     "nanbeige": NanbeigeForCausalLM,
+    "huginn_raven": HuginnForCausalLM,
 }
 
 
@@ -158,6 +160,8 @@ __all__ = [
     "OuroForCausalLM",
     "NanbeigeConfig",
     "NanbeigeForCausalLM",
+    "HuginnConfig",
+    "HuginnForCausalLM",
     "AutoModelForCausalLM",
     "resolve_local_model_path",
     "resolve_model_source",
