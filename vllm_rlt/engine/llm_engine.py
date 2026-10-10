@@ -10,6 +10,7 @@ from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
 from vllm_rlt.sampling_params import SamplingParams
 from vllm_rlt.worker.model_runner import ModelRunner
+from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeRunner
 
 
@@ -107,8 +108,18 @@ class LLMEngine:
             watermark_ratio=cache_config.watermark_ratio,
         )
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
+        # One RNG registry per engine, shared by both runners: the CODA and
+        # speculative paths must advance the same per-request slot, and only the
+        # engine knows when a request terminates.
+        self.rng = RngRegistry()
         self.speculative_runner = (
-            SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)
+            SpeculativeRunner(
+                model,
+                self.cache_manager,
+                speculative_config,
+                self.execution_config,
+                rng=self.rng,
+            )
             if speculative_config is not None
             else None
         )
@@ -118,6 +129,7 @@ class LLMEngine:
             exit_config=self.exit_config,
             execution_config=self.execution_config,
             scheduler_config=scheduler_config,
+            rng=self.rng,
         )
         self._exit_traces = {
             key: tuple(values) for key, values in (self.exit_config.depths_by_request or {}).items()

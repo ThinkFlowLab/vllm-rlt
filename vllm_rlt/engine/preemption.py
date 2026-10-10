@@ -1,8 +1,10 @@
 """Lossless pressure preemption for recurrent-depth KV.
 
-CPU snapshots retain exact KV planes, hidden state and request RNG ownership.
-Full-depth replay of generated tokens is deliberately avoided: it changes RLT
-semantics. Snapshots are bounded by the admitted request population.
+CPU snapshots retain exact KV planes and hidden state. The sampling RNG is not
+part of the snapshot: ModelRunner.suspend keeps the request's registry slot, so
+resuming continues the same random stream. Full-depth replay of generated tokens
+is deliberately avoided: it changes RLT semantics. Snapshots are bounded by the
+admitted request population.
 """
 
 import torch
@@ -92,7 +94,9 @@ class PreemptionManager:
             if victim.input_token_tensor is None
             else victim.input_token_tensor.cpu().clone(),
         )
-        e.model_runner.release(victim.request_id)
+        # Suspend rather than release: the victim is not terminating, so its
+        # sampling RNG must survive for the resumed sequence to be lossless.
+        e.model_runner.suspend(victim.request_id)
         cache.poll_prefixes()
         cache.free(victim.request_id)
         for q in e.scheduler.queues.values():
