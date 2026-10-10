@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
-from vllm_rlt.models import OuroConfig, resolve_model_config
+from vllm_rlt.models import resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
@@ -21,6 +21,15 @@ from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
 from .worker import worker_main
+
+
+@dataclass(frozen=True)
+class PDModelInfo:
+    """Model metadata required by the CPU coordinator, not a model config."""
+
+    vocab_size: int
+    total_ut_steps: int
+    max_position_embeddings: int
 
 
 @dataclass
@@ -149,8 +158,11 @@ class PDEngine:
             fingerprints = {p.info["fingerprint"] for p in self.peers.values()}
             if len(fingerprints) != 1:
                 raise ValueError("P/D model weights or KV configuration do not match")
-            self.model = SimpleNamespace(
-                config=OuroConfig(**next(iter(self.peers.values())).info["model"])
+            model_info = next(iter(self.peers.values())).info["model"]
+            self.model_info = PDModelInfo(
+                vocab_size=model_info["vocab_size"],
+                total_ut_steps=model_info["total_ut_steps"],
+                max_position_embeddings=model_info["max_position_embeddings"],
             )
             for peer in self.peers.values():
                 self._send(
@@ -301,7 +313,7 @@ class PDEngine:
         if len(self.transfers) >= self.config.max_pending_requests:
             raise ValueError("PD pending-request limit reached")
         params = sampling_params or SamplingParams()
-        cfg = self.model.config
+        cfg = self.model_info
         if not prompt_token_ids or any(
             type(t) is not int or not 0 <= t < cfg.vocab_size for t in prompt_token_ids
         ):
