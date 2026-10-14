@@ -69,7 +69,9 @@ class LLMEngine:
                 parameter.device.type != "cuda" or attention_backend != "triton"
             ):
                 raise ValueError("async speculative decoding requires CUDA and Triton attention")
-            if scheduler_config.enable_preemption or scheduler_config.mode != "refill":
+            if scheduler_config.mode != "refill" or (
+                self.async_speculative and scheduler_config.enable_preemption
+            ):
                 raise ValueError(
                     "speculative decoding requires refill scheduling without preemption"
                 )
@@ -282,6 +284,16 @@ class LLMEngine:
         for buffer in cast("AsyncSpeculativeRunner", self.speculative_runner).buffers:
             buffer.keepalive.clear()
             buffer.leased = False
+
+    def _release_request_state(self, request):
+        """Release device resources for suspension, retaining the request and its RNG."""
+        self.model_runner.suspend(request.request_id)
+        self.cache_manager.poll_prefixes()
+        self.cache_manager.free(request.request_id)
+        for queue in self.scheduler.queues.values():
+            while request.request_id in queue:
+                queue.remove(request.request_id)
+        request.hidden_state = request.input_token_tensor = None
 
     def abort_request(self, request_id: str) -> RequestOutput:
         if self.async_speculative:
