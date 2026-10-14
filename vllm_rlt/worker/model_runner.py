@@ -709,4 +709,7 @@ class ModelRunner:
             if params.temperature == 0
             else self.rng.acquire(request.request_id, params, logits.device)
         )
-        return self.sampler.sample(logits, params, generator)
+        token = self.sampler.sample(logits, params, generator)
+        if params.logprobs is not None:
+            request.log_probs.append(self.sampler.selected_logprob(logits, token, params))
+        return token

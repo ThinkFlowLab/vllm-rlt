@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
@@ -35,6 +36,11 @@ class LLMEngine:
         speculative_config=None,
     ):
         self.model = model
+        self._weight_version = 0
+        self._update_version: int | None = None
+        self._update_failed = False
+        self._updated_names: set[str] = set()
+        self._paused = False
         self.profiling = Profiler(next(model.parameters()).device)
         cache_config = cache_config or CacheConfig()
         scheduler_config = scheduler_config or SchedulerConfig()
@@ -203,11 +209,15 @@ class LLMEngine:
         *,
         trace_id: str | None = None,
     ):
+        if self._update_version is not None or self._paused:
+            raise RuntimeError("Generation admission is paused")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
         if self.async_speculative and params.temperature != 0:
             raise ValueError("async speculative decoding currently requires greedy sampling")
+        if self.async_speculative and params.logprobs is not None:
+            raise ValueError("async speculative decoding does not yet support logprobs")
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config
@@ -215,9 +225,12 @@ class LLMEngine:
             raise ValueError("prompt must contain at least one token")
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
+        if any(t >= config.vocab_size for t in params.stop_token_ids):
+            raise ValueError("stop token IDs must be within the model vocabulary")
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
+        params = replace(params, max_loops=max_loops, top_k=min(params.top_k, config.vocab_size))
         if self.speculative_config is not None and (
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
@@ -255,8 +268,75 @@ class LLMEngine:
                 "increase num_blocks or reduce prompt/max_tokens"
             )
         self.scheduler.add_request(
-            Request(request_id, list(prompt_token_ids), params, exit_trace=trace)
+            Request(
+                request_id,
+                list(prompt_token_ids),
+                params,
+                exit_trace=trace,
+                weight_version=self._weight_version,
+            )
         )
+
+    def get_weight_version(self) -> int:
+        return self._weight_version
+
+    def pause_generation(self):
+        # Existing requests can drain through step(); no new requests are admitted.
+        self._paused = True
+
+    def resume_generation(self):
+        if self._update_version is not None:
+            raise RuntimeError("Complete the weight update before resuming generation")
+        self._paused = False
+
+    def reset_prefix_cache(self):
+        if self.has_unfinished_requests():
+            raise RuntimeError("Finish active requests before resetting cached KV")
+        self.model_runner.synchronize()
+        self.cache_manager.reset_prefix_cache()
+
+    def start_weight_update(self, version: int | None = None):
+        if self.has_unfinished_requests():
+            raise RuntimeError("Weight updates require an idle engine")
+        version = self._weight_version + 1 if version is None else version
+        if type(version) is not int or version <= self._weight_version:
+            raise ValueError("Weight version must increase")
+        self.reset_prefix_cache()
+        self._update_version, self._update_failed = version, False
+        self._updated_names.clear()
+
+    @torch.no_grad()
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("Start a full weight update first")
+        parameters = dict(self.model.named_parameters())
+        weights = list(weights)
+        names = [name for name, _ in weights]
+        try:
+            if len(set(names)) != len(names) or self._updated_names.intersection(names):
+                raise ValueError("Duplicate weight in full update")
+            for name, value in weights:
+                if name not in parameters or value.shape != parameters[name].shape:
+                    raise ValueError(f"Weight name or shape mismatch: {name}")
+            for name, value in weights:
+                parameters[name].copy_(value)
+            self._updated_names.update(names)
+        except Exception:
+            # A failed transfer may have copied some tensors. A fresh full update
+            # is the only recovery; generation never sees that mixed policy.
+            self._update_failed = True
+            raise
+
+    def finish_weight_update(self):
+        if self._update_version is None or self._update_failed:
+            raise RuntimeError("No successful weight update to finish")
+        if self._updated_names != dict(self.model.named_parameters()).keys():
+            raise ValueError("Full update must include every physical parameter")
+        device = next(self.model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self._weight_version, self._update_version = self._update_version, None
+        self._updated_names.clear()
 
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished_requests or bool(self._pending_speculative)
@@ -306,6 +386,8 @@ class LLMEngine:
         return self.profiling.wait(timeout)
 
     def step(self) -> list[RequestOutput]:
+        if self._update_version is not None:
+            raise RuntimeError("Generation is unavailable during a weight update")
         if not self.profiling.recording:
             return self._step()
         try:
@@ -367,9 +449,11 @@ class LLMEngine:
             reason = None
             for token in result.token_ids:
                 request.generated_token_ids.append(token)
+                if params.logprobs is not None:
+                    request.log_probs.append(result.log_probs[emitted])
                 request.exit_depths.append(self.speculative_config.target_loops)
                 emitted += 1
-                if token in eos_ids and not params.ignore_eos:
+                if token in params.stop_token_ids or (token in eos_ids and not params.ignore_eos):
                     reason = FinishReason.STOP
                     break
                 if len(request.generated_token_ids) >= params.max_tokens:
@@ -437,7 +521,9 @@ class LLMEngine:
                 request.exit_depths.append(request.loops_done)
                 eos = self.model.config.eos_token_id
                 eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-                if token_id in eos_ids and not params.ignore_eos:
+                if token_id in params.stop_token_ids or (
+                    token_id in eos_ids and not params.ignore_eos
+                ):
                     self._finish(request, FinishReason.STOP)
                 elif len(request.generated_token_ids) >= params.max_tokens:
                     self._finish(request, FinishReason.LENGTH)
@@ -528,7 +614,7 @@ class LLMEngine:
                 request.generated_token_ids.append(token)
                 request.exit_depths.append(self.speculative_config.target_loops)
                 emitted += 1
-                if token in eos_ids and not params.ignore_eos:
+                if token in params.stop_token_ids or (token in eos_ids and not params.ignore_eos):
                     self._finish(request, FinishReason.STOP)
                     break
                 if len(request.generated_token_ids) >= params.max_tokens:
@@ -633,7 +719,7 @@ class LLMEngine:
             params = request.sampling_params
             eos = self.model.config.eos_token_id
             eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            if token_id in eos_ids and not params.ignore_eos:
+            if token_id in params.stop_token_ids or (token_id in eos_ids and not params.ignore_eos):
                 self._finish(request, FinishReason.STOP)
             elif len(request.generated_token_ids) >= params.max_tokens:
                 self._finish(request, FinishReason.LENGTH)

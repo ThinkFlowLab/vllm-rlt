@@ -1,4 +1,4 @@
-"""One CUDA owner process per P/D worker. Control messages never carry tensors."""
+"""One CUDA owner per P/D worker; full updates use staged CPU tensor chunks."""
 
 import hashlib
 import json
@@ -170,6 +170,25 @@ class PDWorker:
 
     def command(self, command):
         kind = command["kind"]
+        if kind == "weight_control":
+            try:
+                if self.work:
+                    raise RuntimeError("Finish PD transfers before updating weights")
+                operations = {
+                    "start_weight_update": self.engine.start_weight_update,
+                    "update_weights": self.engine.update_weights,
+                    "finish_weight_update": self.engine.finish_weight_update,
+                    "reset_prefix_cache": self.engine.reset_prefix_cache,
+                }
+                operations[command["action"]](**command["arguments"])
+                self.send(
+                    "weight_reply",
+                    control_id=command["control_id"],
+                    version=self.engine.get_weight_version(),
+                )
+            except Exception as error:
+                self.send("weight_reply", control_id=command["control_id"], error=str(error))
+            return
         if kind.startswith("profile_"):
             try:
                 action = kind.removeprefix("profile_")
@@ -408,6 +427,16 @@ class PDWorker:
             if not self.work and not self.channel.poll():
                 time.sleep(0.001)
         self.engine.model_runner.synchronize()
+        graphs = self.engine.model_runner.graphs
+        graph_stats = (
+            dict(
+                graph_captures=graphs.captures,
+                graph_replays=graphs.replays,
+                graph_fallbacks=graphs.fallbacks,
+            )
+            if graphs is not None
+            else {}
+        )
         self.engine.close()
         self.connector.close()
         self.send(
@@ -417,6 +446,8 @@ class PDWorker:
             transfers=self.connector.transfers,
             transfer_seconds=self.connector.transfer_seconds,
             used_blocks=self.cache.num_used_blocks,
+            weight_version=self.engine.get_weight_version(),
+            **graph_stats,
         )
 
 

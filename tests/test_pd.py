@@ -244,6 +244,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
+    engine._update_version = None
     engine.profiling = Profiler("cpu")
     engine.preemption = PreemptionManager(engine)
     engine.execution_config = ExecutionConfig(async_scheduling=async_scheduling)
