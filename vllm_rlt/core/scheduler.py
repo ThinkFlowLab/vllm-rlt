@@ -1,12 +1,13 @@
 """CPU scheduling at stage/loop boundaries, independent of model execution."""
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.core.scheduling_policy import NoRefillPolicy, RefillPolicy, SpeculativePolicy
 from vllm_rlt.request import FinishReason, Request, Stage
+from vllm_rlt.worker.output import ExitSignal, ModelRunnerOutput
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,17 @@ class SchedulerOutput:
     @property
     def num_tokens(self) -> int:
         return sum(item.token_count for item in self.items)
+
+
+@dataclass
+class SchedulerUpdate:
+    exited: list[Request] = field(default_factory=list)
+    finished: list[Request] = field(default_factory=list)
+    outputs: list[Request] = field(default_factory=list)
+    next_prelude: list[int] = field(default_factory=list)
+    retain_signal: list[int] = field(default_factory=list)
+    committed_tokens: int = 0
+    accepted_tokens: int = 0
 
 
 class ResumeResult(Enum):
@@ -57,10 +69,22 @@ class AdmissionPlan:
 
 
 class Scheduler:
-    def __init__(self, config: SchedulerConfig, cache_manager, speculative_config=None):
+    def __init__(
+        self,
+        config: SchedulerConfig,
+        cache_manager,
+        speculative_config=None,
+        *,
+        total_ut_steps=0,
+        exit_mode="ouro",
+        eos_token_ids=(),
+    ):
         self.config = config
         self.cache_manager = cache_manager
         self.speculative_config = speculative_config
+        self.total_ut_steps = total_ut_steps
+        self.exit_mode = exit_mode
+        self.eos_token_ids = frozenset(eos_token_ids)
         self.requests: dict[str, Request] = {}
         self.queues: dict[Stage, deque[str]] = {s: deque() for s in Stage}
         # Bound by Engine when preemption is enabled. These callbacks can copy
@@ -81,18 +105,22 @@ class Scheduler:
         self.queues[stage].append(request.request_id)
 
     def finish(self, request: Request, reason: FinishReason):
-        # A delayed EOS can stop a request already queued for its next stage.
-        for queue in self.queues.values():
-            while request.request_id in queue:
-                queue.remove(request.request_id)
+        self.stop(request, reason)
         self.cache_manager.free(request.request_id)
-        request.stage = Stage.FINISHED
-        request.finish_reason = reason
         request.hidden_state = None
         request.input_token_tensor = None
         request.num_output_placeholders = 0
         request.num_speculative_rounds = 0
         self.requests.pop(request.request_id)
+
+    def stop(self, request: Request, reason: FinishReason):
+        """Stop scheduling now; Engine may defer finish until device work retires."""
+        # A delayed EOS can stop a request already queued for its next stage.
+        for queue in self.queues.values():
+            while request.request_id in queue:
+                queue.remove(request.request_id)
+        request.stage = Stage.FINISHED
+        request.finish_reason = reason
 
     def abort(self, request_id: str) -> Request:
         request = self.requests[request_id]
@@ -329,8 +357,8 @@ class Scheduler:
 
         Requests that cannot grow return to the tail. Scan at most the initial
         queue length so a blocked request cannot cycle forever in this call.
-        Successful items leave the queue; the engine later updates progress and
-        enqueues their next stage after handling execution results.
+        Successful items leave the queue; result application advances progress
+        and enqueues their next stage.
 
         The selection set is local to this one batch construction. Direct
         callers such as the PD prefill worker, and later scheduling calls, can
@@ -381,3 +409,202 @@ class Scheduler:
         if not self.requests:
             return None
         return self.policy.schedule(self, prefer_recurrent=prefer_recurrent)
+
+    def _should_exit(self, request: Request) -> bool:
+        params = request.sampling_params
+        maximum = params.max_loops or self.total_ut_steps
+        return request.loops_done >= maximum or (
+            params.exit_threshold < 1.0
+            and request.loops_done >= params.min_loops
+            and 1.0 - request.remaining_probability >= params.exit_threshold
+        )
+
+    def _trace_exit(self, request: Request) -> bool:
+        return request.loops_done >= request.exit_trace[request.num_scheduled_outputs]
+
+    def _delayed_signal(self, request: Request, score: float, signal_depth: int) -> bool:
+        """Consume each hazard once, with the existing policy's eligible depth."""
+        params = request.sampling_params
+        if self.exit_mode == "ouro_delayed":
+            request.remaining_probability *= 1.0 - score
+            score = 1.0 - request.remaining_probability
+            eligible_depth = signal_depth
+        else:
+            eligible_depth = signal_depth + 1
+        return (
+            params.exit_threshold < 1
+            and eligible_depth >= params.min_loops
+            and score >= params.exit_threshold
+        )
+
+    def needs_exit_signal(self, request: Request) -> bool:
+        """Whether the next submitted loop needs its predecessor's readback."""
+        maximum = request.sampling_params.max_loops or self.total_ut_steps
+        return self.exit_mode != "trace" and request.loops_done + 1 < maximum
+
+    def _record_token(self, request: Request, token: int, depth: int) -> bool:
+        request.generated_token_ids.append(token)
+        request.exit_depths.append(depth)
+        params = request.sampling_params
+        if token in self.eos_token_ids and not params.ignore_eos:
+            request.finish_reason = FinishReason.STOP
+        elif len(request.generated_token_ids) >= params.max_tokens:
+            request.finish_reason = FinishReason.LENGTH
+        return request.finish_reason is not None
+
+    def update_from_output(
+        self, batch: SchedulerOutput, result: ModelRunnerOutput
+    ) -> SchedulerUpdate:
+        """Apply completed sync work or delivered async results; never wait here."""
+        update = SchedulerUpdate()
+        for row, item in enumerate(batch.items):
+            request = item.request
+            if (
+                self.requests.get(request.request_id) is not request
+                or request.stage == Stage.FINISHED
+            ):
+                continue
+            if batch.stage == Stage.PREFILL:
+                request.num_prefilled_tokens += item.token_count
+                self.cache_manager.publish_prefix(
+                    request.request_id,
+                    request.prompt_token_ids,
+                    request.num_prefilled_tokens,
+                    result.completion,
+                )
+                if request.num_prefilled_tokens == len(request.prompt_token_ids):
+                    request.loops_done = self.total_ut_steps
+                    self.enqueue(request, Stage.CODA)
+                else:
+                    self.enqueue(request, Stage.PREFILL)
+            elif batch.stage == Stage.PRELUDE:
+                request.loops_done = 0
+                request.remaining_probability = 1.0
+                request.pending_exit_depth = None
+                self.enqueue(request, Stage.RECURRENT)
+            elif batch.stage == Stage.RECURRENT:
+                request.loops_done += 1
+                if self.exit_mode == "trace":
+                    should_exit = self._trace_exit(request)
+                else:
+                    score = result.gate_scores[row]
+                    if self.exit_mode == "ouro":
+                        request.remaining_probability *= 1.0 - score
+                        should_exit = self._should_exit(request)
+                    else:
+                        maximum = request.sampling_params.max_loops or self.total_ut_steps
+                        should_exit = (
+                            request.loops_done >= maximum
+                            or request.pending_exit_depth == request.loops_done
+                        )
+                        if not should_exit and self._delayed_signal(
+                            request, score, request.loops_done
+                        ):
+                            request.pending_exit_depth = request.loops_done + 1
+                if should_exit:
+                    update.exited.append(request)
+                self.enqueue(request, Stage.CODA if should_exit else Stage.RECURRENT)
+            elif batch.stage == Stage.CODA:
+                delivered = bool(result.output_indices)
+                if delivered:
+                    if result.output_indices[row] != len(request.generated_token_ids):
+                        raise RuntimeError("out-of-order coda delivery")
+                    if request.num_output_placeholders != 1:
+                        raise RuntimeError("invalid pending output count")
+                    request.num_output_placeholders -= 1
+                depth = result.depths[row] if delivered else request.loops_done
+                if self._record_token(request, result.token_ids[row], depth):
+                    update.finished.append(request)
+                elif not delivered:
+                    self.enqueue(
+                        request, Stage.SPECULATIVE if self.speculative_config else Stage.PRELUDE
+                    )
+                update.outputs.append(request)
+            elif batch.stage == Stage.SPECULATIVE:
+                spec = result.speculative[row]
+                if result.frontiers is not None:
+                    request.num_output_placeholders -= item.token_count
+                    request.num_speculative_rounds -= 1
+                    if request.num_output_placeholders < 0 or request.num_speculative_rounds < 0:
+                        raise RuntimeError("invalid speculative reservation count")
+                    expected = len(request.prompt_token_ids) + len(request.generated_token_ids) - 1
+                    if result.frontiers[row] != expected + len(spec.token_ids):
+                        raise RuntimeError(
+                            "speculative GPU frontier disagrees with committed prefix"
+                        )
+                emitted = 0
+                for token in spec.token_ids:
+                    emitted += 1
+                    if self._record_token(request, token, self.speculative_config.target_loops):
+                        update.finished.append(request)
+                        break
+                update.committed_tokens += emitted
+                update.accepted_tokens += min(spec.accepted_count, emitted)
+                if request.finish_reason is None:
+                    if result.frontiers is None:
+                        # The final correction/bonus token has not been forwarded.
+                        self.cache_manager.truncate_suffix(
+                            request.request_id, item.token_start + emitted
+                        )
+                        request.loops_done = 0
+                    # Async work may already be writing the next round: never truncate it.
+                    if request.request_id not in self.queues[Stage.SPECULATIVE]:
+                        self.enqueue(request, Stage.SPECULATIVE)
+                update.outputs.append(request)
+        return update
+
+    def update_after_submission(
+        self,
+        batch: SchedulerOutput,
+        *,
+        completion=None,
+        signals: dict[int, ExitSignal] | None = None,
+    ) -> SchedulerUpdate:
+        """Advance logical submissions without requiring CPU token/score delivery."""
+        if batch.stage in (Stage.PREFILL, Stage.PRELUDE):
+            return self.update_from_output(batch, ModelRunnerOutput(completion=completion))
+        update = SchedulerUpdate()
+        for row, item in enumerate(batch.items):
+            request = item.request
+            if (
+                self.requests.get(request.request_id) is not request
+                or request.stage == Stage.FINISHED
+            ):
+                continue
+            if batch.stage == Stage.CODA:
+                request.num_output_placeholders += 1
+                if request.num_scheduled_outputs < request.sampling_params.max_tokens:
+                    update.next_prelude.append(row)
+                    self.enqueue(request, Stage.PRELUDE)
+            elif batch.stage == Stage.SPECULATIVE:
+                request.num_output_placeholders += item.token_count
+                request.num_speculative_rounds += 1
+                self.enqueue(request, Stage.SPECULATIVE)
+            elif batch.stage == Stage.RECURRENT:
+                consume_signal = self.needs_exit_signal(request)
+                request.loops_done += 1
+                should_exit = (
+                    self._trace_exit(request)
+                    if self.exit_mode == "trace"
+                    else request.loops_done
+                    >= (request.sampling_params.max_loops or self.total_ut_steps)
+                )
+                signal = signals.get(row) if signals else None
+                if consume_signal and signal is not None:
+                    if (
+                        signal.request is not request
+                        or signal.position != request.position
+                        or signal.depth != request.loops_done - 1
+                    ):
+                        raise RuntimeError("stale lookahead signal")
+                    should_exit = self._delayed_signal(request, signal.score, signal.depth)
+                if should_exit:
+                    request.pending_exit_depth = request.loops_done
+                    update.exited.append(request)
+                elif (
+                    self.exit_mode in ("ouro_delayed", "random_lookahead")
+                    and request.sampling_params.exit_threshold < 1
+                ):
+                    update.retain_signal.append(row)
+                self.enqueue(request, Stage.CODA if should_exit else Stage.RECURRENT)
+        return update

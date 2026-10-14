@@ -9,8 +9,9 @@ from vllm_rlt.config import ExecutionConfig
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request
+from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
 from vllm_rlt.worker.sampler import RngRegistry
-from vllm_rlt.worker.speculative import SpeculativeResult, SpeculativeRunner
+from vllm_rlt.worker.speculative import SpeculativeRunner
 
 
 @dataclass
@@ -49,14 +50,14 @@ class SpeculativeRoundTicket:
     states: tuple[SpeculativeRequestState, ...]
     rounds: tuple[int, ...]
     rows: int
-    cached: tuple[list[SpeculativeResult], list[int]] | None = None
+    cached: ModelRunnerOutput | None = None
     retired: bool = False
 
     def ready(self):
         assert self.buffer.copy_done is not None
         return self.buffer.copy_done.query()
 
-    def collect(self):
+    def collect(self) -> ModelRunnerOutput:
         if self.cached is None:
             if self.retired:
                 raise RuntimeError("cannot collect a retired speculative ticket")
@@ -69,13 +70,12 @@ class SpeculativeRoundTicket:
                 accepted = values[self.rows + i]
                 results.append(
                     SpeculativeResult(
-                        values[start : start + accepted + 1],
-                        accepted,
-                        item.token_count - 1,
+                        token_ids=values[start : start + accepted + 1],
+                        accepted_count=accepted,
                     )
                 )
                 start += item.token_count
-            self.cached = (results, values[self.rows + b :])
+            self.cached = ModelRunnerOutput(speculative=results, frontiers=values[self.rows + b :])
         return self.cached
 
     def retire(self, *, discard=False):

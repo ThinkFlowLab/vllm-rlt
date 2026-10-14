@@ -1,7 +1,7 @@
 """Synchronous block self-speculation with depth-specific KV/activation reuse.
 
 Temporary tensors belong to one execute call. Requests expose only committed
-outputs; the engine applies returned tokens and owns KV commit/truncation.
+outputs; Scheduler applies returned tokens and KV commits; Engine coordinates cleanup.
 """
 
 from dataclasses import dataclass
@@ -9,14 +9,8 @@ from dataclasses import dataclass
 import torch
 
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.output import ModelRunnerOutput, SpeculativeResult
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
-
-
-@dataclass(frozen=True)
-class SpeculativeResult:
-    token_ids: list[int]
-    accepted_count: int
-    draft_count: int
 
 
 @dataclass
@@ -117,7 +111,7 @@ class SpeculativeRunner:
         )
 
     @torch.inference_mode()
-    def execute(self, batch):
+    def execute(self, batch) -> ModelRunnerOutput:
         items = batch.items
         proposals = [[] for _ in items]
         states = [[] for _ in items]
@@ -187,7 +181,7 @@ class SpeculativeRunner:
                     candidates[i], targets[start : start + item.token_count]
                 )
                 start += item.token_count
-                results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+                results.append(SpeculativeResult(token_ids=tokens, accepted_count=accepted))
                 continue
             start += item.token_count
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
@@ -210,8 +204,8 @@ class SpeculativeRunner:
                     self._acquire_generator(request, rows[-1]),
                 )
                 tokens.append(int(token.item()))
-            results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
+            results.append(SpeculativeResult(token_ids=tokens, accepted_count=accepted))
         self.stats.rounds += len(items)
         self.stats.drafted_tokens += sum(len(c) for c in candidates)
         self.stats.verified_rows += len(ids)
-        return results
+        return ModelRunnerOutput(speculative=results)

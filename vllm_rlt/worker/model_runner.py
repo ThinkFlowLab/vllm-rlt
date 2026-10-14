@@ -12,6 +12,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.output import ModelRunnerOutput
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
@@ -38,10 +39,11 @@ class Submission:
     batch: SchedulerOutput
     values: torch.Tensor | None
     event: object = None
-    cached: list | None = None
+    cached: ModelRunnerOutput | None = None
     slot: ReadbackSlot | None = None
     device_values: torch.Tensor | None = None
     depths: tuple[int, ...] = ()
+    positions: tuple[int, ...] = ()
     output_indices: tuple[int, ...] = ()
 
     def __del__(self):
@@ -51,17 +53,23 @@ class Submission:
     def ready(self):
         return self.event is None or self.event.query()
 
-    def collect(self):
+    def collect(self) -> ModelRunnerOutput:
         if self.cached is not None:
             return self.cached
         if self.event is not None:
             self.event.synchronize()
-        if self.cached is None and self.values is not None:
-            self.cached = self.values.tolist()
-            self.values = None
-            if self.slot is not None:
-                self.slot.leased = False
-                self.slot = None
+        values = self.values.tolist() if self.values is not None else None
+        self.cached = ModelRunnerOutput(
+            gate_scores=values if self.batch.stage == Stage.RECURRENT else None,
+            token_ids=values if self.batch.stage == Stage.CODA else None,
+            completion=self.event,
+            depths=self.depths,
+            output_indices=self.output_indices,
+        )
+        self.values = None
+        if self.slot is not None:
+            self.slot.leased = False
+            self.slot = None
         return self.cached
 
 
@@ -518,10 +526,14 @@ class ModelRunner:
             workspace.release()
         return result
 
-    def execute(self, batch: SchedulerOutput):
+    def execute(self, batch: SchedulerOutput) -> ModelRunnerOutput:
         # Baseline explicitly synchronizes signals; delayed routing can be tested here.
         result = self._execute(batch)
-        return result.cpu().tolist() if result is not None else None
+        values = result.cpu().tolist() if result is not None else None
+        return ModelRunnerOutput(
+            gate_scores=values if batch.stage == Stage.RECURRENT else None,
+            token_ids=values if batch.stage == Stage.CODA else None,
+        )
 
     def _readback_slot(self, result):
         for slot in self.readback_slots:
@@ -586,6 +598,7 @@ class ModelRunner:
                 slot=slot,
                 device_values=device_values,
                 depths=prepared.depths,
+                positions=prepared.positions,
                 output_indices=prepared.output_indices,
             )
 

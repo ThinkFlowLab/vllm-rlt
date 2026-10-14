@@ -1,20 +1,22 @@
 # vllm-rlt engine design
 
-The engine schedules one traversal of Ouro's shared transformer layers at a time. It owns request state and depth-aware KV allocation.
+The runtime schedules one traversal of Ouro's shared transformer layers at a time. Scheduler owns logical request progress; Engine coordinates execution and cleanup.
 
 ## Components and ownership
 
 ```text
 LLM facade: tokenization, output collection
-    -> engine: request lifecycle
-        -> scheduler: admission and stage selection
+    -> engine: execution, pending submissions, cleanup and public outputs
+        -> scheduler: admission, stage/loop progress, exits and termination
         -> model runner: execute a selected batch
             -> native Ouro: embedding, recurrent core, output head
             -> attention backend: PyTorch reference or Triton
         -> KV manager: reservations, block tables, release
 ```
 
-The scheduler owns queue membership, request progress, and loop depth. The runner owns tensor execution and the hidden states that survive between stages. The KV manager owns physical block allocation. Model code receives the positions and cache addresses required by a batch; it does not admit requests or decide which request executes next.
+`ModelRunner.execute()` and `SpeculativeRunner.execute()` return `ModelRunnerOutput` directly. `Submission.collect()` and speculative tickets expose the same typed result contract after readback. Scheduler applies completed results through `update_from_output()` and records asynchronous submissions through `update_after_submission()`; these paths preserve their different timing.
+
+The scheduler owns queue membership, request progress, loop depth, exit decisions and termination decisions. The runner owns tensor execution and the hidden states that survive between stages. The KV manager owns physical block allocation. Model code receives the positions and cache addresses required by a batch; it does not admit requests or decide which request executes next.
 
 Each request has at most one token undergoing autoregressive decoding. Different requests may contribute tokens at different positions and loop depths to the same recurrent batch. Their data remains separate through per-request positions, block tables, and lengths.
 
@@ -32,10 +34,11 @@ Refill scheduling allows newly prepared decode tokens to join continuing recurre
 
 No-refill holds a decode cohort. Tokens leave its recurrent batch when they exit, but its coda waits until the remaining cohort finishes. The next cohort starts after that boundary. Both modes use the same model, gate, and cache semantics.
 
-Synchronous execution remains the default. Optional random lookahead or trace replay
+Synchronous execution remains the default. Optional delayed Ouro, random lookahead or trace replay
 supports a pipeline that submits the next required loop before consuming the previous
-signal, and allows boundary stages on another CUDA stream. Async mode uses pinned,
-reusable inputs and event-protected resource lifetimes. CUDA graphs are deferred.
+signal, and allows boundary stages on another CUDA stream. GPU samples feed the next
+prelude before CPU token delivery; a second coda waits for the preceding stop decision. Async mode uses pinned,
+reusable inputs and event-protected resource lifetimes.
 See [CDB runtime details](cdb_runtime.md) for implementation, semantics and validation.
 
 ## Gate and model contract

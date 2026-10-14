@@ -241,9 +241,11 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     from vllm_rlt.core.scheduler import Scheduler
     from vllm_rlt.engine.preemption import PreemptionManager
     from vllm_rlt.request import Request, Stage
+    from vllm_rlt.worker.output import ModelRunnerOutput
 
     engine = object.__new__(LLMEngine)
     engine.async_speculative = False
+    engine.speculative_runner = None
     engine.profiling = Profiler("cpu")
     engine.preemption = PreemptionManager(engine)
     engine.execution_config = ExecutionConfig(async_scheduling=async_scheduling)
@@ -266,11 +268,12 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
         active.num_output_placeholders = 1
         engine.model = SimpleNamespace(config=SimpleNamespace(eos_token_id=2))
         ticket = Mock()
+        ticket.batch.stage = Stage.CODA
         ticket.batch.items = [SimpleNamespace(request=active)]
         ticket.ready.return_value = True
-        ticket.collect.return_value = [3]
-        ticket.output_indices = [0]
-        ticket.depths = [4]
+        ticket.collect.return_value = ModelRunnerOutput(
+            token_ids=[3], output_indices=(0,), depths=(4,)
+        )
         engine._pending_coda = [ticket]
         outputs = engine.step()
         assert len(outputs) == 1 and outputs[0].finished

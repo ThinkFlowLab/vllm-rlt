@@ -262,7 +262,7 @@ def test_two_round_kv_matches_serial_replay_at_every_depth(dtype):
     request = bootstrap(e)
     e.step()
     e.step()
-    results = [ticket.collect()[0][0] for ticket in e._pending_speculative]
+    results = [ticket.collect().speculative[0] for ticket in e._pending_speculative]
     tokens = request.prompt_token_ids + request.generated_token_ids
     tokens += [token for result in results for token in result.token_ids]
     # Last emitted token has not been forwarded; all earlier tokens have KV.
