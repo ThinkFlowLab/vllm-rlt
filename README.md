@@ -95,7 +95,9 @@ for supported combinations and limitations.
   of decode recurrent cores.
 - **Offline and online inference.** A Python API, a command-line interface,
   and an OpenAI-compatible completions endpoint with streaming, greedy decoding,
-  and seeded top-k/top-p sampling.
+  and seeded top-k/top-p sampling. RL rollouts can request per-token
+  log-probabilities aligned with exit depths, engine-chosen seeds, and stop
+  token IDs.
 - **Prefill/decode disaggregation.** Separate prefill and decode worker pools
   across GPUs on one host, with NIXL KV transfer and overlap between chunked
   prefill computation and transfer.

@@ -11,7 +11,8 @@ from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.preemption import PreemptionManager
 from vllm_rlt.profiling import Profiler
 from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
-from vllm_rlt.sampling_params import SamplingParams
+from vllm_rlt.sampling_params import SamplingParams, resolve_seed
+from vllm_rlt.worker.logprobs import check_logprobs_mode
 from vllm_rlt.worker.model_runner import ModelRunner
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeRunner
@@ -33,7 +34,9 @@ class LLMEngine:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        logprobs_mode="raw_logprobs",
     ):
+        check_logprobs_mode(logprobs_mode)
         self.model = model
         self.profiling = Profiler(next(model.parameters()).device)
         cache_config = cache_config or CacheConfig()
@@ -155,6 +158,7 @@ class LLMEngine:
                 speculative_config,
                 self.execution_config,
                 rng=self.rng,
+                logprobs_mode=logprobs_mode,
             )
             if speculative_config is not None
             else None
@@ -166,6 +170,7 @@ class LLMEngine:
             execution_config=self.execution_config,
             scheduler_config=scheduler_config,
             rng=self.rng,
+            logprobs_mode=logprobs_mode,
         )
         if self.async_speculative:
             from vllm_rlt.worker.async_speculative import AsyncSpeculativeRunner
@@ -177,6 +182,7 @@ class LLMEngine:
                 scheduler_config,
                 multi_stream=self.execution_config.multi_stream,
                 rng=self.rng,
+                logprobs_mode=logprobs_mode,
             )
         self._pending_speculative = []
         self._retiring_speculative = {}
@@ -205,7 +211,7 @@ class LLMEngine:
     ):
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
-        params = sampling_params or SamplingParams()
+        params = resolve_seed(sampling_params or SamplingParams())
         if self.async_speculative and params.temperature != 0:
             raise ValueError("async speculative decoding currently requires greedy sampling")
         if request_id in self._retiring_speculative:
@@ -215,6 +221,8 @@ class LLMEngine:
             raise ValueError("prompt must contain at least one token")
         if any(type(t) is not int or not 0 <= t < config.vocab_size for t in prompt_token_ids):
             raise ValueError("prompt token IDs must be integers within the model vocabulary")
+        if any(t >= config.vocab_size for t in params.stop_token_ids):
+            raise ValueError("stop_token_ids must be within the model vocabulary")
         max_loops = params.max_loops or config.total_ut_steps
         if max_loops > config.total_ut_steps or params.min_loops > max_loops:
             raise ValueError("requested loop bounds exceed the model's supported depth")
@@ -347,8 +355,8 @@ class LLMEngine:
             if batch.stage == Stage.SPECULATIVE:
                 result = self.speculative_runner.execute(batch)
                 return self._update_speculative(batch, result)
-            result = self.model_runner.execute(batch)
-            return self._update(batch, result)
+            output = self.model_runner.execute(batch)
+            return self._update(batch, output.values, output.logprobs)
         except Exception:
             # A failed execution may have partially written KV; invalidate the affected requests.
             for item in batch.items:
@@ -360,20 +368,15 @@ class LLMEngine:
         outputs = []
         for item, result in zip(batch.items, results):
             request = item.request
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
             emitted = 0
             reason = None
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
+            for index, token in enumerate(result.token_ids):
+                logprob = result.logprobs[index] if request.logprobs is not None else None
+                reason = self._append_output(
+                    request, token, self.speculative_config.target_loops, logprob
+                )
                 emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    reason = FinishReason.STOP
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    reason = FinishReason.LENGTH
+                if reason is not None:
                     break
             self.speculative_runner.stats.committed_tokens += emitted
             self.speculative_runner.stats.accepted_tokens += min(result.accepted_count, emitted)
@@ -387,7 +390,7 @@ class LLMEngine:
             outputs.append(RequestOutput.from_request(request))
         return outputs
 
-    def _update(self, batch, result) -> list[RequestOutput]:
+    def _update(self, batch, result, logprobs=None) -> list[RequestOutput]:
         outputs = []
         for index, item in enumerate(batch.items):
             request = item.request
@@ -396,7 +399,6 @@ class LLMEngine:
             # Compare object identity so an old result cannot update the new request.
             if self.scheduler.requests.get(request.request_id) is not request:
                 continue
-            params = request.sampling_params
             if batch.stage == Stage.PREFILL:
                 request.num_prefilled_tokens += item.token_count
                 event = self.model_runner.events.get(request.request_id)
@@ -432,21 +434,37 @@ class LLMEngine:
                 else:
                     self.scheduler.enqueue(request, Stage.RECURRENT)
             elif batch.stage == Stage.CODA:
-                token_id = result[index]
-                request.generated_token_ids.append(token_id)
-                request.exit_depths.append(request.loops_done)
-                eos = self.model.config.eos_token_id
-                eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-                if token_id in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                elif len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
+                logprob = logprobs[index] if request.logprobs is not None else None
+                reason = self._append_output(request, result[index], request.loops_done, logprob)
+                if reason is not None:
+                    self._finish(request, reason)
                 else:
                     self.scheduler.enqueue(
                         request, Stage.SPECULATIVE if self.speculative_config else Stage.PRELUDE
                     )
                 outputs.append(RequestOutput.from_request(request))
         return outputs
+
+    def _append_output(self, request, token_id, exit_depth, logprob) -> FinishReason | None:
+        """Record one sampled token and return its finish reason, or None to continue.
+
+        EOS stops unless ignore_eos; stop_token_ids stop even with ignore_eos, as
+        in vLLM. Either stop token stays in the output. Then max_tokens is LENGTH.
+        """
+        request.generated_token_ids.append(token_id)
+        request.exit_depths.append(exit_depth)
+        if request.logprobs is not None:
+            if logprob is None:
+                raise RuntimeError("missing logprob for a request that asked for logprobs")
+            request.logprobs.append(logprob)
+        params = request.sampling_params
+        eos = self.model.config.eos_token_id
+        eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
+        if token_id in params.stop_token_ids or (token_id in eos_ids and not params.ignore_eos):
+            return FinishReason.STOP
+        if len(request.generated_token_ids) >= params.max_tokens:
+            return FinishReason.LENGTH
+        return None
 
     def _should_exit(self, request: Request) -> bool:
         """Evaluate the policy after recording the completed loop's actual hazard."""
@@ -520,19 +538,15 @@ class LLMEngine:
             expected = len(request.prompt_token_ids) + len(request.generated_token_ids) - 1
             if frontier != expected + len(result.token_ids):
                 raise RuntimeError("speculative GPU frontier disagrees with committed prefix")
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
             emitted = 0
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
+            for index, token in enumerate(result.token_ids):
+                logprob = result.logprobs[index] if request.logprobs is not None else None
+                reason = self._append_output(
+                    request, token, self.speculative_config.target_loops, logprob
+                )
                 emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
+                if reason is not None:
+                    self._finish(request, reason)
                     break
             runner.stats.committed_tokens += emitted
             runner.stats.accepted_tokens += min(result.accepted_count, emitted)
@@ -571,12 +585,12 @@ class LLMEngine:
                 # Prefill/bootstrap retain native semantics. All model compute
                 # shares the speculative stream; the first coda is a CPU boundary.
                 with torch.cuda.stream(runner.compute_stream):
-                    result = self.model_runner.execute(batch)
+                    output = self.model_runner.execute(batch)
                     event = torch.cuda.Event()
                     event.record(runner.compute_stream)
                     for item in batch.items:
                         self.model_runner.events[item.request.request_id] = event
-                    outputs.extend(self._update(batch, result))
+                    outputs.extend(self._update(batch, output.values, output.logprobs))
         elif self._pending_speculative:
             outputs.extend(self._collect_speculative())
         elif self._retiring_speculative:
@@ -617,6 +631,7 @@ class LLMEngine:
     def _deliver_coda(self, ticket):
         outputs = []
         result = ticket.collect()
+        logprobs = ticket.collect_logprobs()
         for index, item in enumerate(ticket.batch.items):
             request = item.request
             if self.scheduler.requests.get(request.request_id) is not request:
@@ -626,17 +641,11 @@ class LLMEngine:
             if request.num_output_placeholders != 1:
                 raise RuntimeError("invalid pending output count")
             request.num_output_placeholders -= 1
-            token_id = result[index]
-            request.generated_token_ids.append(token_id)
+            logprob = logprobs[index] if request.logprobs is not None else None
             # Current loops_done may already describe the NEXT token.
-            request.exit_depths.append(ticket.depths[index])
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
-            if token_id in eos_ids and not params.ignore_eos:
-                self._finish(request, FinishReason.STOP)
-            elif len(request.generated_token_ids) >= params.max_tokens:
-                self._finish(request, FinishReason.LENGTH)
+            reason = self._append_output(request, result[index], ticket.depths[index], logprob)
+            if reason is not None:
+                self._finish(request, reason)
             outputs.append(RequestOutput.from_request(request))
         return outputs
 
