@@ -106,6 +106,7 @@ class ExecutionConfig:
     cuda_graphs: bool = False
     cuda_graph_max_batch_size: int = 128
     cuda_graph_max_graphs: int = 16
+    # Automatic KV planning reserves this headroom per graph pool.
     cuda_graph_memory_reserve_bytes: int = 1024**3
     prefill_uva: bool = False
 

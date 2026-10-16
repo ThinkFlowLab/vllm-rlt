@@ -764,8 +764,15 @@ def test_http_trace_selection_and_concurrent_reuse(asynchronous):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("asynchronous", [False, pytest.param(True, marks=pytest.mark.gpu)])
-def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronous):
+@pytest.mark.parametrize(
+    "asynchronous,graphs",
+    [
+        (False, False),
+        pytest.param(True, False, marks=pytest.mark.gpu),
+        pytest.param(True, True, marks=pytest.mark.gpu),
+    ],
+)
+def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronous, graphs):
     from vllm_rlt import ExecutionConfig, SpeculativeConfig
 
     def load():
@@ -786,7 +793,7 @@ def test_speculative_http_and_stream_deliver_entire_committed_suffix(asynchronou
         return LLMEngine(
             m,
             speculative_config=SpeculativeConfig(4),
-            execution_config=ExecutionConfig(async_scheduling=asynchronous),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous, cuda_graphs=graphs),
             attention_backend="triton" if asynchronous else "torch",
             cache_config=CacheConfig(128, 2),
         ), TinyTokenizer()

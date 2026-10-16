@@ -44,7 +44,12 @@ def add_runtime_args(parser):
     )
     parser.add_argument("--cuda-graph-max-batch-size", type=int, default=128)
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
-    parser.add_argument("--cuda-graph-memory-reserve-bytes", type=int, default=1024**3)
+    parser.add_argument(
+        "--cuda-graph-memory-reserve-bytes",
+        type=int,
+        default=1024**3,
+        help="Automatic KV planning headroom per CUDA Graph pool (plus retained spec logits)",
+    )
     parser.add_argument("--single-stream", action="store_true")
     parser.add_argument("--static-buffers", action="store_true")
     parser.add_argument("--pad-to-power-of-two", action="store_true")

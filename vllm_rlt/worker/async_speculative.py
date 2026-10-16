@@ -9,6 +9,7 @@ from vllm_rlt.config import ExecutionConfig
 from vllm_rlt.core.kv_cache_manager import _Allocation
 from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request
+from vllm_rlt.worker.cuda_graph import CodaGraphs, DeviceRecurrentGraphs
 from vllm_rlt.worker.sampler import RngRegistry
 from vllm_rlt.worker.speculative import SpeculativeResult, SpeculativeRunner
 
@@ -108,10 +109,21 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         config,
         scheduler,
         *,
+        execution: ExecutionConfig | None = None,
         multi_stream=True,
         rng: RngRegistry | None = None,
     ):
         super().__init__(model, cache, config, ExecutionConfig(), rng=rng)
+        execution = execution or ExecutionConfig()
+        self.graphs = (
+            DeviceRecurrentGraphs(model, cache, execution, False) if execution.cuda_graphs else None
+        )
+        self.coda_graphs = (
+            CodaGraphs(model, execution, bucketed=True) if execution.cuda_graphs else None
+        )
+        if self.graphs is not None:
+            self.graphs.prepare()
+            self.coda_graphs.prepare()
         self.compute_stream = torch.cuda.Stream(device=self.device)
         self.copy_stream = (
             torch.cuda.Stream(device=self.device) if multi_stream else self.compute_stream
@@ -150,12 +162,15 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             block_tables=table,
             context_lengths=(positions + 1).int(),
         )
-        hidden, _ = self.model.recurrent_prepared(
-            hidden,
-            metadata,
-            self.cache,
-            compute_gate=False,
-        )
+        if self.graphs is not None:
+            hidden, _ = self.graphs.run(hidden, metadata)
+        else:
+            hidden, _ = self.model.recurrent_prepared(
+                hidden,
+                metadata,
+                self.cache,
+                compute_gate=False,
+            )
         return hidden
 
     def _prepare_round(self, batch):
@@ -214,9 +229,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 if offset + 1 < items[i].token_count:
                     drafting.append((row, i))
             if drafting:
-                proposed = self.model.coda(
-                    torch.stack([hidden[row] for row, _ in drafting])
-                ).argmax(-1)
+                proposed = self._coda(torch.stack([hidden[row] for row, _ in drafting])).argmax(-1)
                 for row, (_, i) in enumerate(drafting):
                     candidates[i].append(proposed[row])
         return starts, candidates, hidden_rows
@@ -234,7 +247,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         hidden = torch.stack([h for rows in hidden_rows for h in rows])
         for depth in range(self.config.draft_loops, self.config.target_loops):
             hidden = self._execute_recurrent_step(hidden, positions, row_tables, depth, allocations)
-        target = self.model.coda(hidden).argmax(-1)
+        target = self._coda(hidden).argmax(-1)
         return target
 
     def _accept_and_update_state(self, items, states, starts, candidates, target, buffer):

@@ -101,3 +101,41 @@ def test_graph_cache_limit_fallback_and_abort():
         assert engine.cache_manager.num_used_blocks == 0
     assert engine.model_runner.graphs.captures == 1
     assert engine.model_runner.graphs.fallbacks > 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_speculative_graph_memory_budget_scales_with_pools_and_retained_outputs(enabled):
+    from dataclasses import replace
+
+    from vllm_rlt import SpeculativeConfig
+    from vllm_rlt.core.memory import graph_memory_reserve
+
+    model = OuroForCausalLM(tiny_ouro_config())
+    scheduler = SchedulerConfig(max_num_seqs=256, max_num_batched_tokens=4096)
+    execution = ExecutionConfig(cuda_graphs=enabled, cuda_graph_max_batch_size=768)
+    base = graph_memory_reserve(model, scheduler, execution)
+    spec = graph_memory_reserve(model, scheduler, execution, SpeculativeConfig(2))
+    if not enabled:
+        assert base == spec == 0
+        return
+    assert base == execution.cuda_graph_memory_reserve_bytes
+    logits = 16 * 768 * model.config.vocab_size * next(model.parameters()).element_size()
+    assert spec == 3 * base + logits
+    # Reducing token/row capacity also reduces the persistent-output allowance.
+    limited = graph_memory_reserve(
+        model, replace(scheduler, max_num_batched_tokens=64), execution, SpeculativeConfig(4)
+    )
+    assert limited == 3 * base + logits // 12
+
+
+def test_async_graph_memory_accounts_for_every_precaptured_bucket():
+    from vllm_rlt import SpeculativeConfig
+    from vllm_rlt.core.memory import graph_memory_reserve
+
+    model = OuroForCausalLM(tiny_ouro_config())
+    execution = ExecutionConfig(cuda_graphs=True, async_scheduling=True)
+    # Even tiny admitted work has the configured capture capacity prepared.
+    scheduler = SchedulerConfig(max_num_seqs=1, max_num_batched_tokens=1)
+    reserve = graph_memory_reserve(model, scheduler, execution, SpeculativeConfig(2))
+    retained = 255 * model.config.vocab_size * next(model.parameters()).element_size()
+    assert reserve == 3 * execution.cuda_graph_memory_reserve_bytes + retained
