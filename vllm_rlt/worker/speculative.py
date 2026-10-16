@@ -76,7 +76,8 @@ class SpeculativeRunner:
         self.coda_graphs = CodaGraphs(model, execution) if execution.cuda_graphs else None
 
     def _packed(self, packed):
-        return packed and self.cache.attention_capabilities.packed_prefill
+        capabilities = self.cache.attention_capabilities
+        return packed and capabilities.packed_prefill and capabilities.packed_matches_decode
 
     def _cores(self, hidden, ids, positions, depths, *, packed=False):
         # Depth-independent metadata is prepared and copied once for all depths.
