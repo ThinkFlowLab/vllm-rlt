@@ -18,6 +18,8 @@ class BackendCapabilities:
     packed_prefill: bool = False
     cuda_graphs: bool = False
     async_scheduling: bool = False
+    # Reads an FP8 e4m3 KV pool with per-vector float32 scales.
+    fp8_kv: bool = False
 
 
 @dataclass
@@ -40,8 +42,8 @@ class AttentionBackend:
         return getattr(self.kernel, "generation", None)
 
 
-_TORCH_CAPABILITIES = BackendCapabilities()
-_TRITON_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True)
+_TORCH_CAPABILITIES = BackendCapabilities(fp8_kv=True)
+_TRITON_CAPABILITIES = BackendCapabilities(cuda_graphs=True, async_scheduling=True, fp8_kv=True)
 _FLASH_CAPABILITIES = {
     2: BackendCapabilities(cuda_graphs=True, async_scheduling=True),
     3: BackendCapabilities(cuda_graphs=True, async_scheduling=True),
@@ -103,7 +105,7 @@ def create_backend(
             implementation = _create_explicit(candidate, device, dtype, head_dim, block_size)
             missing = [
                 name
-                for name in ("packed_prefill", "cuda_graphs", "async_scheduling")
+                for name in ("packed_prefill", "cuda_graphs", "async_scheduling", "fp8_kv")
                 if getattr(required_capabilities, name)
                 and not getattr(implementation.capabilities, name)
             ]

@@ -117,6 +117,7 @@ class LLMEngine:
                 async_scheduling=(
                     parameter.device.type == "cuda" and self.execution_config.async_scheduling
                 ),
+                fp8_kv=cache_config.kv_cache_dtype == "fp8_e4m3",
             ),
         )
         num_blocks, self.memory_plan = plan_cache(
@@ -142,6 +143,7 @@ class LLMEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
+            kv_cache_dtype=cache_config.kv_cache_dtype,
         )
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
         # One RNG registry per engine, shared by both runners: the CODA and
