@@ -5,9 +5,9 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
 
 
 def engine(*, asynchronous=True, static=False, graph=False, shared=False):
@@ -71,13 +71,15 @@ def test_resident_state_trace_refill_abort_and_slot_reuse(use_uva, static, graph
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("use_uva", [False, True])
-def test_bank_is_not_reused_until_its_final_gpu_reader_finishes(use_uva):
+@pytest.mark.parametrize("all_busy", [False, True])
+def test_bank_is_not_reused_until_its_final_gpu_reader_finishes(use_uva, all_busy):
     e = engine()
     state = e.model_runner.async_state
     state.use_uva = use_uva
     e.add_request("a", [2], SamplingParams(max_tokens=2, min_loops=1), trace_id="a")
     e.step()
     request = e.scheduler.requests["a"]
+    e.model_runner.synchronize()
     # Force wraparound while the first bank is still referenced by queued work.
     bank = state.banks[state.index]
     stream = torch.cuda.Stream()
@@ -95,8 +97,14 @@ def test_bank_is_not_reused_until_its_final_gpu_reader_finishes(use_uva):
         gather_kernel[(1, 1)](descriptor, slots, actual, 1, 3, 3, 3, 256)
         bank.record_done()
     assert not bank.done.query()
+    if all_busy:
+        for candidate in state.banks:
+            candidate.done = bank.done
     reused, _ = state.prepare([request], [0], [0], 1)
-    assert reused is bank and bank.done.query()
+    assert (reused is bank) is all_busy
+    # Selection must leave the still-live descriptor untouched; waiting happens
+    # only when every bank is busy.
+    stream.synchronize()
     assert torch.equal(actual.cpu(), expected)
     e.abort_request("a")
 
@@ -110,7 +118,7 @@ def test_execution_error_retires_routing_readers_before_request_reuse(monkeypatc
 
     def fail(batch, prepared=None):
         result = execute(batch, prepared)
-        if batch.stage == Stage.RECURRENT:
+        if batch.works == frozenset((WorkKey.DECODE_RECURRENT,)):
             torch.cuda._sleep(10_000_000)
             raise RuntimeError("injected failure after GPU submission")
         return result
@@ -164,3 +172,43 @@ def test_batched_exit_copies_only_target_positions_and_depths(use_uva):
     assert torch.equal(cache.value_cache, expected_v)
     for request in requests:
         e.abort_request(request.request_id)
+
+
+@pytest.mark.gpu
+def test_page_table_growth_uploads_only_new_pages_from_reusable_pinned_storage():
+    from vllm_rlt.request import Request
+
+    e = engine()
+    state, cache = e.model_runner.async_state, e.cache_manager
+    request = Request("growth", [2], SamplingParams(max_tokens=7))
+    assert cache.allocate("growth", 8, initial_tokens=2)
+    try:
+        first, _ = state.prepare([request], [0], [0], 1)
+        assert len(first.uploads) == state.planes
+        assert all(table.numel() == 1 for _, _, _, table in first.uploads)
+        first.transfer()
+        first.record_done()
+        first.done.synchronize()
+        previous = state.tables[state.slots["growth"], :, :1].clone()
+        assert cache.ensure_capacity("growth", 4)
+        grown, _ = state.prepare([request], [0], [2], 1)
+        assert len(grown.uploads) == state.planes
+        assert all(start == 1 and table.numel() == 1 for _, _, start, table in grown.uploads)
+        assert all(table.is_pinned() for _, _, _, table in grown.uploads)
+        assert all(
+            table.untyped_storage().data_ptr() == grown.table_updates.untyped_storage().data_ptr()
+            for _, _, _, table in grown.uploads
+        )
+        grown.transfer()
+        grown.record_done()
+        grown.done.synchronize()
+        actual = state.tables[state.slots["growth"], :, :2]
+        expected = torch.tensor(cache._get_allocation("growth").block_tables, device="cuda")
+        assert torch.equal(actual, expected)
+        assert torch.equal(actual[:, :1], previous)
+        unchanged, _ = state.prepare([request], [0], [2], 1)
+        assert not unchanged.uploads
+    finally:
+        state.release("growth")
+        cache.free("growth")
+        e.close()

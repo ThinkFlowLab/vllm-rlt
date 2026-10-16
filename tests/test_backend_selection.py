@@ -185,7 +185,7 @@ def test_cpu_engine_resolves_auto_before_cache_planning():
     "execution", [ExecutionConfig(cuda_graphs=True), ExecutionConfig(async_scheduling=True)]
 )
 def test_cuda_engine_resolves_auto_before_profiling(packages, monkeypatch, execution):
-    from vllm_rlt.engine import llm_engine
+    from vllm_rlt.engine import stage_engine as llm_engine
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
     model = SimpleNamespace(

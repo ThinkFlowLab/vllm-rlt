@@ -9,7 +9,7 @@ admitted request population.
 
 import torch
 
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 
 
 class PreemptionManager:
@@ -22,17 +22,17 @@ class PreemptionManager:
         """Discard saved CPU state when a request will not be resumed."""
         self.snapshots.pop(request_id, None)
 
-    def _is_preemption_candidate(self, request, requester, *, priority_only, excluded):
+    def _is_preemption_candidate(self, request, requesting_request, *, priority_only, excluded):
         """Check safety before considering a victim's priority.
 
         Pending outputs, transfer leases and the current batch's selected
         requests must remain alive. priority_only additionally forbids evicting
-        equal/higher priority work to admit a new arrival.
+        equal/higher priority requests to admit a new arrival.
         """
         e = self.engine
         if (
-            request is requester
-            or request.stage in (Stage.WAITING, Stage.RECEIVING)
+            request is requesting_request
+            or request.status != RequestStatus.ACTIVE
             or request.num_output_placeholders
             or request.request_id in excluded
         ):
@@ -40,10 +40,10 @@ class PreemptionManager:
         if e.cache_manager.has_transfer_lease(request.request_id):
             return False
         return not priority_only or (
-            request.sampling_params.priority > requester.sampling_params.priority
+            request.sampling_params.priority > requesting_request.sampling_params.priority
         )
 
-    def _select_preemption_victim(self, requester, *, priority_only, excluded):
+    def _select_preemption_victim(self, requesting_request, *, priority_only, excluded):
         """Prefer lower priority, then a larger current-position KV footprint.
 
         Priority 10 loses to priority 0. The footprint tie-breaker uses
@@ -55,7 +55,7 @@ class PreemptionManager:
             request
             for request in self.engine.scheduler.requests.values()
             if self._is_preemption_candidate(
-                request, requester, priority_only=priority_only, excluded=excluded
+                request, requesting_request, priority_only=priority_only, excluded=excluded
             )
         )
         return max(
@@ -67,27 +67,31 @@ class PreemptionManager:
             default=None,
         )
 
-    def preempt(self, requester, *, priority_only=False, excluded=frozenset()):
+    def preempt(self, requesting_request, *, priority_only=False, excluded=frozenset()):
         """Suspend one other request, preserving its recurrent execution state.
 
         Returns False if no safe victim exists. True means the victim's device
         resources have been released and it has been moved to WAITING; the
-        requester must still retry its own allocation.
+        requesting_request must still retry its own allocation.
 
         excluded names requests this call must not suspend. The Scheduler passes
         the batch it is currently assembling explicitly, rather than exposing
         that selection for the manager to read.
         """
         victim = self._select_preemption_victim(
-            requester, priority_only=priority_only, excluded=excluded
+            requesting_request, priority_only=priority_only, excluded=excluded
         )
         if victim is None:
             return False
         e = self.engine
+        resume_work = e.scheduler.pending_work(victim)
+        if resume_work is None:
+            return False
         e.model_runner.synchronize()
+        resume_work = e._rewind_split_prefill(victim, resume_work)
         cache = e.cache_manager
         snapshot = dict(
-            stage=victim.stage,
+            resume_work=resume_work,
             kv=cache.snapshot(victim.request_id),
             hidden=None if victim.hidden_state is None else victim.hidden_state.cpu().clone(),
             token=None
@@ -99,12 +103,9 @@ class PreemptionManager:
         e.model_runner.suspend(victim.request_id)
         cache.poll_prefixes()
         cache.free(victim.request_id)
-        for q in e.scheduler.queues.values():
-            while victim.request_id in q:
-                q.remove(victim.request_id)
         victim.hidden_state = victim.input_token_tensor = None
         self.snapshots[victim.request_id] = snapshot
-        e.scheduler.enqueue(victim, Stage.WAITING)
+        e.scheduler.park_waiting(victim)
         self.preemptions += 1
         return True
 
@@ -131,7 +132,8 @@ class PreemptionManager:
         # Restored buffers become visible to every runner stream before resumption.
         if cache.device.type == "cuda":
             torch.cuda.current_stream(cache.device).synchronize()
-        e.scheduler.enqueue(request, state["stage"])
+        e.scheduler.activate_request(request)
+        e.scheduler.enqueue_work(request, state["resume_work"])
         del self.snapshots[request.request_id]
         self.resumptions += 1
         return True

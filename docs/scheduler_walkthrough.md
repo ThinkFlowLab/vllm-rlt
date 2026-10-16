@@ -385,10 +385,10 @@ Interfaces should expose required inputs, distinguish outcomes, and make resourc
 
 - `CacheConfig.watermark_ratio` is a ratio in `[0,1)`, defaulting to zero.
 - The `KVCacheManager` constructor accepts the same ratio as `watermark_ratio`.
-- `KVCacheManager.watermark_blocks` equals `int(watermark_ratio * num_blocks)` and is measured in physical blocks.
+- `KVCacheManager.watermark_blocks` equals `int(watermark_ratio * num_blocks)` for incremental allocation and is forced to zero for full allocation, even when a nonzero ratio is supplied. It is measured in physical blocks.
 - `AdmissionPlan.admission_headroom_blocks` is the headroom included in a particular admission attempt: the watermark block count when active requests exist, or zero otherwise.
 
-For 100 blocks and `watermark_ratio=0.1`, `watermark_blocks=10`. An admission attempt with existing active work includes those ten blocks in its budget. An idle engine includes zero so a large request can start. This is an admission margin, not a separate allocation of ten blocks. The budget algorithm is unchanged.
+With incremental allocation, 100 blocks and `watermark_ratio=0.1`, `watermark_blocks=10`. An admission attempt with existing active work includes those ten blocks in its budget. An idle engine includes zero so a large request can start. This is an admission margin, not a separate allocation of ten blocks. Full allocation does not add watermark headroom.
 
 ### Caller migration
 

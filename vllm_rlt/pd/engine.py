@@ -16,7 +16,7 @@ from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerC
 from vllm_rlt.models import resolve_model_config
 from vllm_rlt.profiling import ProfileConfig
 from vllm_rlt.profiling_artifacts import _write_json_atomic, profile_timestamp
-from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestStatus
 from vllm_rlt.sampling_params import SamplingParams
 
 from .config import PDConfig
@@ -250,6 +250,8 @@ class PDEngine:
                 peer.compute_slots -= 1
                 w.p_compute_released = True
             w.timings["prefill_compute_completed"] = now
+            w.timings["prefill_transfer_boundaries"] = m["boundaries"]
+            w.timings["prefill_transfer_overlaps"] = m["overlaps"]
         elif kind == "commit":
             w.timings["prefill_submitted"] = now
             if not w.cancelled:
@@ -422,7 +424,7 @@ class PDEngine:
                 self._send(w.d, "cancel_safe", tid=w.tid)
             else:
                 self._send(w.p, "cancel", tid=w.tid)
-        request.stage = Stage.FINISHED
+        request.status = RequestStatus.FINISHED
         request.finish_reason = FinishReason.ABORT
         return RequestOutput.from_request(request)
 

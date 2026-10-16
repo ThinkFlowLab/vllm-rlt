@@ -145,9 +145,13 @@ flowchart LR
     class E recurrent
 ```
 
-The diagram shows logical token flow; asynchronous execution can overlap
-stages. See the [runtime guide](docs/cdb_runtime.md) for scheduling, exit policies,
-and depth-aware KV caching.
+**Stage is the deployment and resource boundary; loop is the unit of execution
+and scheduling within a stage.** Prefill, decode and mixed stages share one
+execution architecture.
+
+See the [architecture and flow diagrams](docs/unified_execution.md) and the
+[runtime guide](docs/cdb_runtime.md) for implementation details and supported
+configurations.
 
 <a href="docs/assets/inference/ouro-inference.mp4">
   <picture>
@@ -284,7 +288,7 @@ group and discuss usage and development.
 
 <p align="center">
   <a href="docs/assets/wechat-group-qrcode.jpg">
-    <img src="docs/assets/wechat-group-qrcode.jpg" alt="vllm-rlt WeChat developer group QR code / 微信开发者交流群二维码" width="320">
+    <img src="docs/assets/wechat-group-qrcode.jpg" alt="vllm-rlt WeChat developer group QR code" width="320">
   </a>
 </p>
 

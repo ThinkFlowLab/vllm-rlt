@@ -1,0 +1,40 @@
+flowchart TB
+    local(["Local request<br/>add_request"])
+    imported(["Cross-stage request<br/>Connector.reserve → Receive commit + All sequence numbers<br/>→ Engine.activate_import"])
+    req["Reuse the stage-local Request<br/>Snapshot token / depth positions per submission"]
+    schedule["StageEngine.step → Scheduler.schedule<br/>Select policy at initialization; no runtime role dispatch"]
+    ready{"Executable batch available?"}
+    wait["Yield this scheduling tick<br/>Await connector progress or pending execution"]
+    exe["Executor.submit → ticket"]
+    mode{"Speculative round?"}
+    ordinary["Ordinary execution<br/>ExecutionBatch → ModelRunner"]
+    speculative["Local speculative control<br/>Submit dependent draft / verify steps"]
+    forward["Shared ExecutionRuntime.forward<br/>PRELUDE / RECURRENT / CODA"]
+    resident["Continuous execution on device<br/>Atomic prefill: N loops / Speculative steps<br/>No cross-stage communication"]
+    progress["StageEngine applies submission results<br/>Advance logical progress under event / ticket constraints"]
+    route{"Explicit route for this request<br/>to export prompt results?"}
+    export["Connector.prefill_submitted<br/>Record dependencies / Stage hidden / Queue transfers<br/>Separate progress tick polls completion without blocking"]
+    next{"More work in this stage?"}
+    done(["Return output or await handoff acknowledgment<br/>Release resources according to lifetime"])
+    local & imported --> req --> schedule --> ready
+    ready -->|No| wait
+    wait -.->|Later tick| schedule
+    ready -->|Yes| exe --> mode
+    mode -->|No| ordinary --> forward
+    mode -->|Yes| speculative --> forward
+    forward --- resident
+    forward --> progress --> route
+    route -->|Yes| export --> next
+    route -->|No| next
+    next -->|Next loop / chunk / decode| schedule
+    next -->|Done or handed off| done
+    classDef entry fill:#e2e8f0,stroke:#64748b,color:#0f172a;
+    classDef control fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef compute fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef decide fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef transport fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    class local,imported,done entry;
+    class req,schedule,exe,progress,wait control;
+    class ordinary,speculative,forward,resident compute;
+    class ready,mode,route,next decide;
+    class export transport;

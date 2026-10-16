@@ -99,7 +99,7 @@ def main():
         ],
         default="triton",
     )
-    parser.add_argument("--mode", choices=["refill", "no_refill"], default="refill")
+    parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--num-blocks", type=int, help="Override automatic KV sizing")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=8)

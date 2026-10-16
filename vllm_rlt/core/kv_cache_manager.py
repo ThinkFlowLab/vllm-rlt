@@ -25,6 +25,7 @@ from vllm_rlt.attention import (
     plan_attention_metadata,
     validate_backend_name,
 )
+from vllm_rlt.core.execution import ExecutionBatch
 
 
 @dataclass
@@ -190,7 +191,8 @@ class KVCacheManager:
         self._allocations: dict[str, _Allocation] = {}
         self.enable_prefix_caching = enable_prefix_caching
         self.incremental_allocation = incremental_allocation
-        self.watermark_blocks = int(watermark_ratio * num_blocks)
+        # Full allocation already reserves each request's maximum KV capacity.
+        self.watermark_blocks = int(watermark_ratio * num_blocks) if incremental_allocation else 0
         self._refs = [0] * num_blocks
         self._prefixes = OrderedDict()
         self._pending_prefixes = []
@@ -597,6 +599,20 @@ class KVCacheManager:
             self._validate_position(allocation, position)
             rows.append((allocation, int(depth), int(position)))
         return rows
+
+    def prepare_recurrent(self, batch: ExecutionBatch, *, packed=False) -> _PreparedKVBatch:
+        """Resolve a recurrence address snapshot against current allocations.
+
+        This does not reserve pages or prove causal readiness. The caller owns
+        admission and keeps the returned view live until execution completes.
+        """
+        ids, depths, positions = batch.addresses()
+        return self._prepare_batch(
+            ids,
+            depths,
+            positions,
+            packed_prefill=packed and self.attention_capabilities.packed_prefill,
+        )
 
     def _prepare_batch(
         self,

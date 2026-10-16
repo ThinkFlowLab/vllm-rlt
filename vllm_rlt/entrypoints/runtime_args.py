@@ -24,6 +24,12 @@ def add_runtime_args(parser):
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
     parser.add_argument("--prefill-uva", action="store_true")
+    parser.add_argument(
+        "--no-atomic-prefill",
+        dest="atomic_prefill",
+        action="store_false",
+        help="Split prompt prefill into a staged prelude plus one boundary per recurrence depth",
+    )
     parser.add_argument("--kv-layout", choices=["last_exited", "shared"], default="last_exited")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
@@ -45,7 +51,11 @@ def add_runtime_args(parser):
     parser.add_argument("--cuda-graph-max-batch-size", type=int, default=128)
     parser.add_argument("--cuda-graph-max-graphs", type=int, default=16)
     parser.add_argument("--cuda-graph-memory-reserve-bytes", type=int, default=1024**3)
-    parser.add_argument("--single-stream", action="store_true")
+    parser.add_argument(
+        "--single-stream",
+        action="store_true",
+        help="Disable multi-stream CUDA execution independently of async scheduling",
+    )
     parser.add_argument("--static-buffers", action="store_true")
     parser.add_argument("--pad-to-power-of-two", action="store_true")
     parser.add_argument("--prefill-chunk-size", type=int, default=128)
@@ -88,6 +98,7 @@ def runtime_configs(args):
         ),
         execution_config=ExecutionConfig(
             prefill_uva=args.prefill_uva,
+            atomic_prefill=args.atomic_prefill,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,
             cuda_graph_max_graphs=args.cuda_graph_max_graphs,

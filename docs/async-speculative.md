@@ -192,7 +192,7 @@ they are not complete-round or E2E timings.
 | 8 | Active (8 x 4 x 5) | 640 | 34.45 | 7.23 |
 
 This supports the reduced host preparation and transfer work in `_prepare_round()`
-and the contiguous table copy in `submit_round()`. It does not imply that the same
+and the contiguous table copy in `submit()`. It does not imply that the same
 microsecond savings appear on the complete request's critical path.
 
 ### Separate profiling diagnostics

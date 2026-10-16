@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 from vllm_rlt.serving.protocol import IncrementalText, ServingError, ServingLimits
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ class EngineWorker:
                 self.decoders[output.request_id] = (decoder, len(output.token_ids))
             except ValueError as exc:
                 request = self.engine.scheduler.requests.get(output.request_id)
-                if request is not None and request.stage != Stage.FINISHED:
+                if request is not None and request.status != RequestStatus.FINISHED:
                     self.engine.abort_request(output.request_id)
                 del self.decoders[output.request_id]
                 closed.add(output.request_id)

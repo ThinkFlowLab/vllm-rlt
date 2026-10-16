@@ -1,0 +1,54 @@
+flowchart TB
+    host["API / Deployment host / PD Coordinator<br/>Request routing · Process management · Control protocol"]
+    subgraph owner["Deployment and resource boundary · Stage A owner process"]
+      direction TB
+      config["StageEngine<br/>role → Capabilities and scheduling policy"]
+      subgraph control["Requests and scheduling"]
+        direction LR
+        req["Request registry<br/>Local requests and logical progress"]
+        sched["Scheduler<br/>PromptOnly / refill / mixed / speculation<br/>Readiness · Token budget · Loop scheduling"]
+        req <--> sched
+      end
+      subgraph execution["Unified execution · Within one device"]
+        direction TB
+        exe["Executor<br/>Single submission entry point"]
+        runner["ModelRunner<br/>metadata · buffer · event<br/>Optional streams: core / boundary / copy / readback"]
+        spec["Speculative controller<br/>Local draft / verify / acceptance"]
+        forward["ExecutionRuntime.forward<br/>PRELUDE · RECURRENT · CODA"]
+        fast["Preserved execution optimizations<br/>packed prefill · static decode · CUDA Graph"]
+        exe --> runner & spec
+        runner & spec --> forward
+        forward --> fast
+      end
+      kv["KVCacheManager<br/>Allocation · Valid ranges · Transfer lease"]
+      conn["Connector<br/>Local RequestTransfer / Staging slot owner<br/>reserve · progress · cancel · commit · ack"]
+      config --> req
+      sched -->|Request references and execution snapshots| exe
+      sched -.->|Capacity and validity| kv
+      runner -.->|Device access and resource binding| kv
+      conn -.->|Backpressure and readiness| sched
+      config -->|Submitted ranges + Completion event| conn
+      conn -->|Activate / Suspend / Release compute state / Release lease| config
+      transport["Transport · NIXL<br/>Registration · WRITE · Completion notifications"]
+      conn --> transport
+    end
+    subgraph peer["Separate deployment boundary · Stage B owner process"]
+      remote["Same StageEngine implementation<br/>Independent Request / Scheduler / KV / Executor"]
+    end
+    host --> config
+    host -.->|Deployment and control| remote
+    transport <-->|Across stages: KV / Hidden / Completion notifications| remote
+    classDef api fill:#e2e8f0,stroke:#64748b,color:#0f172a;
+    classDef engine fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef compute fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef state fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef transport fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    class host api;
+    class config,remote,sched,exe engine;
+    class runner,spec,forward,fast compute;
+    class req,kv state;
+    class conn,transport transport;
+    style owner fill:#f8fafc,stroke:#2563eb,stroke-width:2px
+    style control fill:#f5f3ff,stroke:#c4b5fd
+    style execution fill:#f0fdf4,stroke:#86efac
+    style peer fill:#eff6ff,stroke:#2563eb,stroke-width:2px

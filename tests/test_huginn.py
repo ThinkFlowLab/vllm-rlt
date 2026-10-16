@@ -243,6 +243,7 @@ def test_prefill_populates_history_without_projecting_unused_logits(model, padde
     [
         (CacheConfig(layout="shared"), ExecutionConfig(), "last_exited"),
         (CacheConfig(enable_prefix_caching=True), ExecutionConfig(), "prefix caching"),
+        (CacheConfig(), ExecutionConfig(atomic_prefill=False), "atomic prefill"),
         (CacheConfig(), ExecutionConfig(async_scheduling=True), "synchronous"),
     ],
 )

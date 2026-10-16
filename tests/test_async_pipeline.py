@@ -5,9 +5,9 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import Operation, WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
 from vllm_rlt.worker.model_runner import Submission
 
 
@@ -37,7 +37,8 @@ def drain(engine):
     for _ in range(300):
         if not engine.has_unfinished_requests():
             assert engine.cache_manager.num_used_blocks == 0
-            assert all(not q for q in engine.scheduler.queues.values())
+            assert not engine.scheduler.waiting
+            assert all(not queue for queue in engine.scheduler.work_queues.values())
             return results
         results.extend(engine.step())
     pytest.fail("async pipeline failed to drain")
@@ -71,7 +72,11 @@ def test_delayed_delivery_uses_snapshot_depths_and_bounds_placeholders(
 
     def ready(ticket):
         # Force delivery to lag until the one-output speculation bound drains it.
-        return False if ticket.batch.stage == Stage.CODA else original_ready(ticket)
+        return (
+            False
+            if ticket.batch.works == frozenset((WorkKey.DECODE_CODA,))
+            else original_ready(ticket)
+        )
 
     monkeypatch.setattr(Submission, "ready", ready)
     actual = drain(engine)
@@ -107,11 +112,11 @@ def test_prelude_consumes_device_sample_before_cpu_delivery(monkeypatch, device,
 
     monkeypatch.setattr(engine.model, "prelude", prelude)
     engine.step()
-    assert engine.last_schedule.stage == Stage.PRELUDE
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE,))
     assert not held.complete and not request.generated_token_ids
     assert request.loops_done == 0
     engine.step()
-    assert engine.last_schedule.stage == Stage.RECURRENT
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_RECURRENT,))
     assert not held.complete and not request.generated_token_ids
     engine.model_runner.synchronize()
     assert torch.equal(observed[0], ticket.device_values)
@@ -169,21 +174,26 @@ def test_cpu_prepare_finishes_while_previous_gpu_forward_is_inflight(monkeypatch
     engine.add_request("warm", [2], params)
     drain(engine)
     runner = engine.model_runner
-    execute, prepare = runner._execute, runner.prepare
+    execute, prepare = runner._execute, runner.prepare_batch
     delayed = torch.cuda.Event()
     injected = False
     observations = []
 
     def execute_with_delay(batch, prepared=None):
         nonlocal injected
-        if injected and not delayed.query() and multi_stream and batch.stage == Stage.RECURRENT:
+        if (
+            injected
+            and not delayed.query()
+            and multi_stream
+            and batch.works == frozenset((WorkKey.DECODE_RECURRENT,))
+        ):
             # H2D completes on the copy stream while the preceding core is
             # still busy. It must not depend on core or boundary completion.
             assert prepared.kv.position_ids.is_cuda
             runner.copy_stream.synchronize()
             assert not delayed.query()
         result = execute(batch, prepared)
-        if batch.stage == Stage.RECURRENT and not injected:
+        if batch.works == frozenset((WorkKey.DECODE_RECURRENT,)) and not injected:
             # Extend a forward to make the ordering test deterministic. This is
             # a topology test, not performance evidence.
             torch.cuda._sleep(150_000_000)
@@ -193,7 +203,7 @@ def test_cpu_prepare_finishes_while_previous_gpu_forward_is_inflight(monkeypatch
 
     def inspect_prepare(batch):
         result = prepare(batch)
-        if injected and not observations and batch.stage == Stage.RECURRENT:
+        if injected and not observations and batch.operation == Operation.RECURRENT:
             assert not delayed.query(), "prepare waited for the preceding forward"
             assert result.kv.position_ids.device.type == "cpu"
             assert result.kv.position_ids.is_pinned()
@@ -201,11 +211,11 @@ def test_cpu_prepare_finishes_while_previous_gpu_forward_is_inflight(monkeypatch
         return result
 
     monkeypatch.setattr(runner, "_execute", execute_with_delay)
-    monkeypatch.setattr(runner, "prepare", inspect_prepare)
+    monkeypatch.setattr(runner, "prepare_batch", inspect_prepare)
     engine.add_request("a", [2], params)
     drain(engine)
     assert observations == [True]
-    assert not runner.workspaces
+    assert not runner.requestspaces
     assert runner.states is runner.async_state.hidden
     assert not runner.async_state.owners
     assert len(runner.submission_events) <= 3
@@ -228,7 +238,7 @@ def test_bounded_pipeline_survives_slow_gpu_and_dma_bank_reuse(monkeypatch, mult
     def execute(batch, prepared=None):
         nonlocal maximum
         maximum = max(maximum, len(runner.submission_events))
-        if batch.stage == Stage.RECURRENT:
+        if batch.works == frozenset((WorkKey.DECODE_RECURRENT,)):
             torch.cuda._sleep(10_000_000)
         return original(batch, prepared)
 
@@ -253,7 +263,7 @@ def test_abort_speculative_core_then_reuse_id(monkeypatch, multi_stream):
     ticket.event = HeldEvent()
     engine.step()
     engine.step()
-    assert engine.last_schedule.stage == Stage.RECURRENT
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_RECURRENT,))
     output = engine.abort_request("reuse")
     assert output.finish_reason == "abort" and output.token_ids == []
     assert engine.cache_manager.num_used_blocks == 0
@@ -269,22 +279,22 @@ def test_completed_core_refills_even_when_coda_cpu_delivery_is_pending(monkeypat
     engine = make_engine(device="cuda", multi_stream=True)
     engine.add_request("fast", [2], SamplingParams(max_tokens=3, exit_threshold=0, ignore_eos=True))
     engine.add_request("slow", [3], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True))
-    original = engine.model_runner.submit
+    original = engine.executor.submit
     held = HeldEvent()
     target = []
 
     def submit(batch):
         ticket = original(batch)
         if (
-            batch.stage == Stage.CODA
-            and len(batch.items) == 1
-            and batch.items[0].request.request_id == "fast"
+            batch.works == frozenset((WorkKey.DECODE_CODA,))
+            and len(batch.requests) == 1
+            and batch.requests[0].request.request_id == "fast"
         ):
             target.append((ticket, ticket.event))
             ticket.event = held
         return ticket
 
-    monkeypatch.setattr(engine.model_runner, "submit", submit)
+    monkeypatch.setattr(engine.executor, "submit", submit)
     for _ in range(30):
         engine.step()
         if target:
@@ -292,12 +302,60 @@ def test_completed_core_refills_even_when_coda_cpu_delivery_is_pending(monkeypat
     assert target
     engine.model_runner.synchronize()  # GPU is done; ONLY CPU delivery lags.
     engine.step()
-    assert engine.last_schedule.stage == Stage.PRELUDE
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE,))
     assert not held.complete
     engine.step()
-    assert engine.last_schedule.stage == Stage.RECURRENT
-    assert {i.request.request_id for i in engine.last_schedule.items} == {"fast", "slow"}
+    assert engine.last_schedule.works == frozenset((WorkKey.DECODE_RECURRENT,))
+    assert {i.request.request_id for i in engine.last_schedule.requests} == {"fast", "slow"}
     assert not held.complete
     target[0][0].event = target[0][1]
-    monkeypatch.setattr(engine.model_runner, "submit", original)
+    monkeypatch.setattr(engine.executor, "submit", original)
     drain(engine)
+
+
+@pytest.mark.gpu
+def test_device_progress_does_not_wait_for_readback_stream():
+    engine = make_engine(device="cuda", multi_stream=True)
+    runner = engine.model_runner
+    engine.add_request("a", [2], SamplingParams(max_tokens=3, ignore_eos=True, exit_threshold=1))
+    try:
+        engine.step()  # Prefill has no host result.
+        with torch.cuda.stream(runner.readback_stream):
+            torch.cuda._sleep(1_000_000_000)
+        engine.step()  # Coda submits D2H behind the delay.
+        ticket = engine._pending_coda[0]
+        compute_done = runner.events["a"]
+        assert compute_done is not ticket.event
+        compute_done.synchronize()
+        assert not ticket.ready()
+        engine.step()  # Prelude consumes the device token, not the host result.
+        assert engine.last_schedule.works == frozenset((WorkKey.DECODE_PRELUDE,))
+        runner.events["a"].synchronize()
+        assert not ticket.ready()
+        assert not engine.scheduler.requests["a"].generated_token_ids
+        assert drain(engine)[-1].exit_depths == [4, 4, 4]
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_fixed_depth_async_does_not_read_back_unused_gates(monkeypatch, device):
+    engine = make_engine(device=device, multi_stream=True)
+    engine.add_request("a", [2], SamplingParams(max_tokens=3, ignore_eos=True, exit_threshold=1))
+    submit = engine.executor.submit
+    recurrent = []
+
+    def record(batch):
+        ticket = submit(batch)
+        if batch.works == frozenset((WorkKey.DECODE_RECURRENT,)):
+            recurrent.append(ticket)
+            assert not ticket.has_result
+            assert ticket.slot is None
+        return ticket
+
+    monkeypatch.setattr(engine.executor, "submit", record)
+    try:
+        assert drain(engine)[-1].exit_depths == [4, 4, 4]
+        assert recurrent
+    finally:
+        engine.close()

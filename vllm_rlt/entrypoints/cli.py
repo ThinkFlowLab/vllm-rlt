@@ -77,7 +77,7 @@ def main():
         ],
         default="torch",
     )
-    parser.add_argument("--mode", choices=["refill", "no_refill"], default="refill")
+    parser.add_argument("--mode", choices=["refill", "no_refill", "mixed"], default="refill")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--max-loops", type=int, default=None)
     parser.add_argument("--min-loops", type=int, default=None)

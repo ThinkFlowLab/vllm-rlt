@@ -15,9 +15,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import AutoModelForCausalLM, OuroForCausalLM
-from vllm_rlt.request import Stage
 from vllm_rlt.serving.protocol import (
     CompletionRequest,
     IncrementalText,
@@ -45,24 +45,24 @@ class TinyTokenizer:
 class PauseAt:
     """Hold one engine step while a test exercises HTTP or worker lifecycle."""
 
-    def __init__(self, stage, *, fail=False):
-        self.stage, self.fail = stage, fail
+    def __init__(self, work, *, fail=False):
+        self.work, self.fail = work, fail
         self.entered, self.release = threading.Event(), threading.Event()
         self.engine = None
 
     def __call__(self, engine):
         self.engine = engine
-        execute = engine.model_runner.execute
+        submit = engine.executor.submit
 
         def pause(batch):
-            if batch.stage == self.stage and not self.entered.is_set():
+            if batch.works == frozenset((self.work,)) and not self.entered.is_set():
                 self.entered.set()
                 assert self.release.wait(5)
                 if self.fail:
                     raise RuntimeError("injected engine failure")
-            return execute(batch)
+            return submit(batch)
 
-        engine.model_runner.execute = pause
+        engine.executor.submit = pause
 
 
 def factory(*, seqs=8, blocks=256, hook=None):
@@ -366,7 +366,7 @@ def test_http_output_matches_direct_and_stream_has_exact_token_events():
 @pytest.mark.parametrize("expired", [False, True])
 def test_shutdown_cleans_http_and_engine_state(caplog, expired):
     async def run():
-        pause, cleaned = PauseAt(Stage.PREFILL), asyncio.Event()
+        pause, cleaned = PauseAt(WorkKey.PROMPT_ATOMIC), asyncio.Event()
         app = create_app(
             lambda: factory(hook=pause),
             model="test-model",
@@ -489,17 +489,25 @@ def test_owner_thread_dynamic_batching_cancellation_and_overload():
 
         def hook(engine):
             engines.append(engine)
-            execute = engine.model_runner.execute
+            submit = engine.executor.submit
 
             def record(batch):
                 owner_threads.append(threading.get_ident())
-                trace.append((batch.stage, [item.request.request_id for item in batch.items]))
-                if batch.stage == Stage.RECURRENT and not blocked.is_set():
+                trace.append(
+                    (
+                        batch.works,
+                        [
+                            scheduled_request.request.request_id
+                            for scheduled_request in batch.requests
+                        ],
+                    )
+                )
+                if batch.works == frozenset((WorkKey.DECODE_RECURRENT,)) and not blocked.is_set():
                     blocked.set()
                     assert release.wait(5)
-                return execute(batch)
+                return submit(batch)
 
-            engine.model_runner.execute = record
+            engine.executor.submit = record
             for name in ["add_request", "abort_request"]:
                 method = getattr(engine, name)
 
@@ -572,7 +580,7 @@ def test_slow_channel_does_not_block_other_requests():
 def test_request_failure_and_disconnect_cleanup(monkeypatch, failure, stream, max_tokens):
     from vllm_rlt.serving import worker as worker_module
 
-    pause = PauseAt(Stage.RECURRENT, fail=failure == "engine")
+    pause = PauseAt(WorkKey.DECODE_RECURRENT, fail=failure == "engine")
 
     class BadTokenizer(TinyTokenizer):
         calls = 0

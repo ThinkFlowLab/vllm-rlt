@@ -5,9 +5,10 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import LLM, CacheConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import FinishReason, Request, RequestOutput, Stage
+from vllm_rlt.request import FinishReason, Request, RequestOutput, RequestStatus
 
 
 def tiny_model():
@@ -22,7 +23,7 @@ def drain(engine, limit=1000):
             return outputs, trace
         emitted = engine.step()
         batch = engine.last_schedule
-        trace.append((batch.stage, tuple(i.request.request_id for i in batch.items)))
+        trace.append((batch.works, tuple(i.request.request_id for i in batch.requests)))
         for output in emitted:
             if output.finished:
                 outputs[output.request_id] = output
@@ -80,7 +81,7 @@ def test_refill_recycles_exited_token_before_slow_token_coda(mode):
     engine.add_request("fast", [1], SamplingParams(max_tokens=3, exit_threshold=0, ignore_eos=True))
     engine.add_request("slow", [2], SamplingParams(max_tokens=3, exit_threshold=1, ignore_eos=True))
     outputs, trace = drain(engine)
-    recurrent = [ids for stage, ids in trace if stage == Stage.RECURRENT]
+    recurrent = [ids for works, ids in trace if WorkKey.DECODE_RECURRENT in works]
     # In refill mode fast returns with its next token while slow is on its first.
     assert recurrent[:4] == (
         [("fast", "slow")] * 2 + [("slow", "fast")] * 2
@@ -96,7 +97,7 @@ def test_memory_pressure_waits_then_reuses_pages_and_abort_reclaims():
     for name in ["a", "b", "c"]:
         engine.add_request(name, [2, 3], params)
     engine.step()
-    assert engine.scheduler.requests["b"].stage == Stage.WAITING
+    assert engine.scheduler.requests["b"].status == RequestStatus.WAITING
     assert engine.abort_request("b").finish_reason == "abort"
     assert engine.cache_manager.num_used_blocks == 8
     assert engine.abort_request("a").finished
@@ -141,7 +142,10 @@ def test_eos_finishes_without_extra_decode_and_invalid_requests_do_not_poison_qu
     outputs, trace = drain(engine)
     assert outputs["eos"].token_ids == [0]
     assert outputs["eos"].finish_reason == "stop"
-    assert [stage for stage, _ in trace] == [Stage.PREFILL, Stage.CODA]
+    assert [works for works, _ in trace] == [
+        frozenset((WorkKey.PROMPT_ATOMIC,)),
+        frozenset((WorkKey.DECODE_CODA,)),
+    ]
     assert engine.cache_manager.num_used_blocks == 0
 
 
@@ -281,7 +285,7 @@ def test_execution_failure_releases_affected_requests(monkeypatch):
     def fail(_):
         raise RuntimeError("injected runner failure")
 
-    monkeypatch.setattr(engine.model_runner, "execute", fail)
+    monkeypatch.setattr(engine.executor, "submit", fail)
     with pytest.raises(RuntimeError, match="injected"):
         engine.step()
     assert not engine.has_unfinished_requests()
@@ -333,8 +337,9 @@ def test_repeated_short_arrivals_cannot_starve_existing_decode(mode):
         for _ in range(100):
             engine.step()
             batch = engine.last_schedule
-            if batch.stage == Stage.RECURRENT and any(
-                item.request.request_id == "long" for item in batch.items
+            if WorkKey.DECODE_RECURRENT in batch.works and any(
+                scheduled_request.request.request_id == "long"
+                for scheduled_request in batch.requests
             ):
                 recurrent_steps += 1
             if request_id not in engine.scheduler.requests:
@@ -353,16 +358,16 @@ def test_failed_prefill_batch_does_not_consume_decode_fairness_budget(monkeypatc
         engine.add_request(rid, [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     scheduler = engine.scheduler
     scheduler._admit()
-    scheduler.queues[Stage.PREFILL].remove("decode")
-    scheduler.enqueue(scheduler.requests["decode"], Stage.RECURRENT)
+    scheduler.work_queues[WorkKey.PROMPT_ATOMIC].remove("decode")
+    scheduler.enqueue_work(scheduler.requests["decode"], WorkKey.DECODE_RECURRENT)
     ensure_capacity = engine.cache_manager.ensure_capacity
     monkeypatch.setattr(
         engine.cache_manager, "ensure_capacity", lambda rid, frontier: rid != "prefill"
     )
     assert scheduler.schedule() is None
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", ensure_capacity)
-    assert scheduler.schedule().stage == Stage.PREFILL
-    assert scheduler.schedule().stage == Stage.RECURRENT
+    assert scheduler.schedule().works == frozenset((WorkKey.PROMPT_ATOMIC,))
+    assert scheduler.schedule().works == frozenset((WorkKey.DECODE_RECURRENT,))
 
 
 def test_failed_recurrent_batch_keeps_decode_due(monkeypatch):
@@ -371,15 +376,15 @@ def test_failed_recurrent_batch_keeps_decode_due(monkeypatch):
         engine.add_request(rid, [1, 2], SamplingParams(max_tokens=2, ignore_eos=True))
     scheduler = engine.scheduler
     scheduler._admit()
-    scheduler.queues[Stage.PREFILL].remove("decode")
-    scheduler.enqueue(scheduler.requests["decode"], Stage.RECURRENT)
-    assert scheduler.schedule().stage == Stage.PREFILL
+    scheduler.work_queues[WorkKey.PROMPT_ATOMIC].remove("decode")
+    scheduler.enqueue_work(scheduler.requests["decode"], WorkKey.DECODE_RECURRENT)
+    assert scheduler.schedule().works == frozenset((WorkKey.PROMPT_ATOMIC,))
     ensure_capacity = engine.cache_manager.ensure_capacity
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", lambda rid, frontier: False)
     assert scheduler.schedule() is None
-    scheduler.enqueue(scheduler.requests["prefill"], Stage.PREFILL)
+    scheduler.enqueue_work(scheduler.requests["prefill"], WorkKey.PROMPT_ATOMIC)
     monkeypatch.setattr(engine.cache_manager, "ensure_capacity", ensure_capacity)
-    assert scheduler.schedule().stage == Stage.RECURRENT
+    assert scheduler.schedule().works == frozenset((WorkKey.DECODE_RECURRENT,))
 
 
 def test_abort_removes_all_queued_work_and_serializes_reason():
@@ -388,12 +393,12 @@ def test_abort_removes_all_queued_work_and_serializes_reason():
     engine.scheduler._admit()
     request = engine.scheduler.requests["r"]
     # A delayed termination must remove every queued occurrence.
-    engine.scheduler.queues[Stage.PREFILL].append("r")
-    engine.scheduler.enqueue(request, Stage.RECURRENT)
+    engine.scheduler.work_queues[WorkKey.PROMPT_ATOMIC].append("r")
+    engine.scheduler.work_queues[WorkKey.DECODE_RECURRENT].append("r")
     output = engine.abort_request("r")
     assert request.finish_reason is FinishReason.ABORT
     assert type(output.finish_reason) is str and output.finish_reason == "abort"
-    assert all("r" not in queue for queue in engine.scheduler.queues.values())
+    assert all("r" not in queue for queue in engine.scheduler.work_queues.values())
     assert engine.cache_manager.num_used_blocks == 0
     assert not engine.has_unfinished_requests()
 

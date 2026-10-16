@@ -44,7 +44,7 @@ llm = LLM(
 
 The default exit mode remains `ouro`, with the original cumulative hazard policy. For random lookahead, sigmoid is a direct score for exiting after one more loop, not a hazard/CDF. `SamplingParams.exit_threshold` compares this score directly. Threshold 1 disables adaptive exit; `max_loops` always caps execution. Adaptive lookahead cannot exit before round 2, although an explicitly configured hard maximum of 1 is honored. All prompt tokens still run the model's full depth.
 
-Async execution requires `ouro_delayed`, `random_lookahead` or `trace`. It automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream=False` shares the core stream for controlled comparisons.
+Async execution requires `ouro_delayed`, `random_lookahead` or `trace`. It automatically enables reusable static inputs to avoid blocking device metadata transfers. CPU supports the same scheduling state machine for tests, with immediately completed operations; it does not simulate GPU parallel execution. `multi_stream` is an independent CUDA execution feature: `False` uses one stream for core, boundary and copies; `True` separates those streams, with or without async scheduling.
 
 CLI flags are shared by offline and serving entrypoints:
 
@@ -56,6 +56,79 @@ OMP_NUM_THREADS=1 python -m vllm_rlt.entrypoints.cli --toy --dtype float32 \
 ```
 
 For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --attention-backend triton`. Use `--single-stream` for the single-stream pipeline. `--num-blocks` overrides automatic sizing, or specify `--kv-cache-memory-bytes`; these two overrides are mutually exclusive. CPU auto mode keeps a 256-block default. `engine.memory_plan` records how the capacity was selected.
+
+## Execution plans and mixed scheduling
+
+See the [architecture and flow diagrams](unified_execution.md) for
+terminal-readable versions of the unified execution path.
+
+A deployment stage owns one `StageEngine`, scheduler, Request registry, KV manager
+and executor. `StageConfig.role` is independent of `SchedulerConfig.mode`.
+`LLMEngine` remains a compatibility alias. Prefill, decode and mixed deployments
+use the same execution implementation; speculation is a stage-local controller.
+
+The scheduler selects `ScheduledRequest` snapshots in `SchedulerOutput.requests`.
+`Executor` binds them to an immutable `ExecutionBatch` and dispatches through the
+shared forward runtime. These objects reference existing local Requests; they are
+not network payloads or additional lifecycle owners.
+
+A connector determines per-request export routing and readiness. Mixed stages can
+keep local requests while exporting others. Connector backpressure participates
+in both phase selection and batch selection. PD workers now call `StageEngine.step`
+and use its common prompt progress updates rather than a separate prefill loop.
+`reserve_transfer` constructs a stage-local Request once; chunk notifications reuse
+it and `activate_import` activates it only after the protocol verifies completion.
+
+Independent deployment stages own independent KV and RNG resources. Same-stage
+loop/chunk/speculative work stays local. Cross-stage transfers retain the existing
+PD generation, sequence, lease and acknowledgement protocol. No global handoff
+synchronization is introduced; asynchronous staging uses events.
+
+The runner shares input loading, loop execution and hidden writeback across
+prompt and generation work. Homogeneous chunk storage keeps its segment kernels;
+homogeneous generation keeps resident routing descriptors. Heterogeneous storage
+uses tensor views and a contiguous gather. These are storage optimizations, not
+separate stage execution paths. All model operations run through
+`ExecutionRuntime.forward(ForwardBatch)`, including speculative INPUT and OUTPUT.
+`ForwardBatch` binds device tensors, KV views and the operation; `ForwardResult`
+separates hidden state, gate logits and vocabulary logits. Both controllers share
+one runtime instance. `advance()` is a convenience adapter for continuous
+INPUT/LOOP work, not another model execution implementation.
+
+`ExecutionBatch.loop_count` applies to both INPUT and LOOP work. A LOOP plan can
+advance several depths while gathering and storing hidden only once. Only the
+final gate is returned; callers needing a decision after each depth must yield
+at each loop. Invalid depth ranges fail before execution. Chunk size and loop
+submission size are independent: atomic prefill still runs every depth locally.
+
+Speculative control owns draft/verify ordering, candidate tensors and acceptance;
+the engine still owns commit/truncation and asynchronous retirement. It uses the
+same forward implementation without writing provisional hidden to the request's
+committed hidden binding. With refill scheduling, speculative decoding now also
+accepts `ExecutionConfig(atomic_prefill=False)` for loop-yielding chunked prefill.
+This does not enable speculative verification rows in mixed batches. Existing
+restrictions on preemption, KV layout, model and async backends still apply.
+
+```python
+scheduler_config = SchedulerConfig(
+    mode="mixed", max_num_seqs=8, max_num_batched_tokens=128,
+    prefill_chunk_size=64,
+)
+execution_config = ExecutionConfig(atomic_prefill=False)
+```
+
+CLI and serving accept `--mode mixed --no-atomic-prefill`. The initial mixed
+policy combines compatible recurrent work, giving generation rows first use of
+the shared budget and filling the remainder with prompt spans. Boundary work is
+selected separately. All selected requests share one capacity/protection set;
+progress and gate results are applied per item, not from the batch label.
+
+This policy currently requires non-atomic prompt scheduling and LAST_EXITED KV;
+it does not mix speculative rounds. Existing model restrictions still apply.
+Mixed graphs and asynchronous device execution have regression cases marked
+`gpu`; CPU tests validate the corresponding state machine, not GPU overlap or
+performance. The heterogeneous gather currently allocates a contiguous tensor
+and uses per-span copies on writeback; GPU optimization remains unqualified.
 
 ## Fixed-loop self-speculative decoding
 
@@ -201,7 +274,7 @@ env CUDA_VISIBLE_DEVICES=0 python -m vllm_rlt.entrypoints.serve \
 ```bash
 curl -sS http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"ouro","prompt":"请解释一下什么是矩阵乘法。","max_tokens":512,"temperature":0,"min_loops":2,"max_loops":4,"exit_threshold":0.9,"stream":false}' \
+  -d '{"model":"ouro","prompt":"Explain matrix multiplication.","max_tokens":512,"temperature":0,"min_loops":2,"max_loops":4,"exit_threshold":0.9,"stream":false}' \
   | python -c 'import sys,json; r=json.load(sys.stdin); print(r["choices"][0]["text"] if "choices" in r else json.dumps(r,ensure_ascii=False))'
 ```
 

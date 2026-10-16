@@ -1,0 +1,38 @@
+sequenceDiagram
+    autonumber
+    participant C as Coordinator / Host
+    participant P as P · StageEngine
+    participant X as P · PD Connector
+    participant Y as D · PD Connector
+    participant D as D · StageEngine
+    Note over P,X: Same process, no RPC for loop execution
+    Note over Y,D: Same process, Connector owns transfer state and staging
+    C->>Y: reserve (transfer generation)
+    Y->>D: reserve_transfer(receiving=True)
+    Note over D: Create local Request · RECEIVING<br/>Reserve KV and pin lease
+    Y-->>C: reserved (mapping, slot, prefix hit)
+    C->>X: reserve (target mapping)
+    X->>P: reserve_transfer(receiving=False)
+    loop Each prompt submission
+        P->>P: Shared step → Executor → forward
+        P->>X: prefill_submitted (ranges + event)
+        Note over P,X: Logical progress advanced, GPU may still be running
+        X->>X: Queue transferable ranges, stage hidden for final range
+        Note over X,Y: Host drives progress, event.query + Transfer credits<br/>NIXL WRITE when ready, no CPU blocking
+        X-->>Y: KV / hidden and sequence completion notifications
+    end
+    X->>P: release_transfer_compute (ready event)
+    Note over P: Engine checks readiness and releases compute state<br/>Retain KV transfer lease
+    X-->>C: commit (expected count)
+    C->>Y: commit (not receive completion)
+    Y->>Y: Collect this generation's sequences and check compute capacity
+    Y->>D: activate_import (same local Request)
+    Note over D: Mark KV valid · Unpin import lease · Enter CODA
+    Y-->>C: activated
+    C->>X: acknowledge
+    X->>X: Committed + Compute state released<br/>+ Transport no longer accesses source resources
+    X->>P: release_transfer
+    X->>X: Reclaim staging slot
+    rect rgb(255, 244, 239)
+        Note over P,D: Cancellation: Connector stops submissions, Engine suspends scheduling and retains resources<br/>Release after local events and remote access finish, receiver waits for cancel_safe
+    end

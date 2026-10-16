@@ -7,6 +7,20 @@ import torch
 from vllm_rlt.core.kv_cache_manager import _PreparedKVBatch
 
 
+def prefill_stage_rows(config, scheduler, execution) -> int:
+    """Hidden rows per request that staged prompt prefill keeps resident.
+
+    Split prefill stages one chunk at a time, so a chunk is the unit that must
+    survive between two scheduling boundaries. Wavefront chunked prefill advances
+    several chunks of one prompt at different depths concurrently; it then keeps a
+    chunk per recurrence depth in flight, and this becomes
+    ``scheduler.prefill_chunk_size * config.total_ut_steps``.
+    """
+    if execution.atomic_prefill:
+        return 0
+    return scheduler.prefill_chunk_size
+
+
 def execution_buffer_bytes(config, scheduler, cache, execution, element_size):
     rows = scheduler.max_num_batched_tokens
     if execution.pad_to_power_of_two:
@@ -23,6 +37,12 @@ def execution_buffer_bytes(config, scheduler, cache, execution, element_size):
         total += 4 * rows * (hidden + 4 * width + 68)
         total += scheduler.max_num_seqs * (hidden + 8 + planes * width * 4)
         total += 2 * scheduler.max_num_seqs * 24  # fallback exit descriptors
+    # Split prefill holds the staged chunk's hidden rows across batch boundaries.
+    total += scheduler.max_num_seqs * prefill_stage_rows(config, scheduler, execution) * hidden
+    # Split recurrent batches gather staged rows into a contiguous model input.
+    if not execution.atomic_prefill:
+        total += rows * hidden
+        total += 3 * (scheduler.max_num_seqs * 5 * 8 + max(rows, scheduler.prefill_chunk_size) * 8)
     return total
 
 

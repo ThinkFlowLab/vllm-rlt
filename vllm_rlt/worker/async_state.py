@@ -19,6 +19,14 @@ class RoutingBank:
         self.host = torch.empty((rows, 3), dtype=torch.int64, pin_memory=True)
         self.done = self.ready_event = None
         self.uploads = []
+        # A bank owns the pinned upload sources until its last GPU reader ends.
+        self.table_updates = torch.empty(
+            (min(rows, owner.hidden.shape[0]), owner.planes, owner.width),
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        self.table_updates_array = self.table_updates.numpy()
+        self.next_table_update = 0
         self.imports = []
         self.descriptor = None
         if control_only:
@@ -37,17 +45,21 @@ class RoutingBank:
         self.descriptor = None
 
     def acquire(self):
-        if self.done is not None:
+        if self.done is not None and not self.done.query():
             self.done.synchronize()
+        self.done = None
+        self.next_table_update = 0
         self.uploads.clear()
         self.imports.clear()
         self.descriptor = None
 
     def transfer(self, batch=None):
-        from vllm_rlt.kernels.routing import metadata_kernel
+        from vllm_rlt.kernels.routing import metadata_kernel, slots_kernel
 
-        for slot, table in self.uploads:
-            self.owner.tables[slot, :, : table.shape[1]].copy_(table, non_blocking=True)
+        for slot, plane, start, table in self.uploads:
+            self.owner.tables[slot, plane, start : start + table.numel()].copy_(
+                table, non_blocking=True
+            )
         for pool, slot, value in self.imports:
             value.record_stream(torch.cuda.current_stream(self.owner.cache.device))
             pool[slot].copy_(value)
@@ -56,23 +68,29 @@ class RoutingBank:
             if self.owner.use_uva
             else self.host[: self.count].to(self.owner.cache.device, non_blocking=True)
         )
-        metadata_kernel[(self.size,)](
-            self.descriptor,
-            self.owner.tables,
-            self.slots,
-            self.positions,
-            self.lengths,
-            self.blocks,
-            self.offsets,
-            self.tables,
-            self.count,
-            self.size,
-            self.owner.width,
-            self.owner.cache.block_size,
-            self.owner.planes,
-            self.width,
-            256,
-        )
+        if batch is None:
+            # Prelude/coda only route state; do not expand attention page tables.
+            slots_kernel[(math.ceil(self.size / 256),)](
+                self.descriptor, self.slots, self.count, self.size, 256
+            )
+        else:
+            metadata_kernel[(self.size,)](
+                self.descriptor,
+                self.owner.tables,
+                self.slots,
+                self.positions,
+                self.lengths,
+                self.blocks,
+                self.offsets,
+                self.tables,
+                self.count,
+                self.size,
+                self.owner.width,
+                self.owner.cache.block_size,
+                self.owner.planes,
+                self.width,
+                256,
+            )
         self.ready_event = torch.cuda.Event()
         self.ready_event.record(torch.cuda.current_stream(self.owner.cache.device))
         if batch is None:
@@ -141,26 +159,46 @@ class AsyncState:
         ]
         self.index = self.finalize_index = 0
 
-    def ensure_slot(self, request, bank):
+    def reserve_slot(self, request):
         rid = request.request_id
         allocation = self.cache._get_allocation(rid)
         if rid in self.slots:
             if self.owners[rid] != (id(request), id(allocation)):
                 raise RuntimeError("request slot reused before retiring its previous owner")
-            slot = self.slots[rid]
-            if self.table_versions.get(rid) != allocation.block_tables:
-                table = torch.tensor(allocation.block_tables, dtype=torch.int32).pin_memory()
-                bank.uploads.append((slot, table))
-                self.table_versions[rid] = allocation.block_tables
-            return slot
+            return self.slots[rid]
         if not self.free:
             raise RuntimeError("no retired request state slots")
         slot = self.free.pop()
         self.slots[rid] = slot
         self.owners[rid] = (id(request), id(allocation))
-        table = torch.tensor(allocation.block_tables, dtype=torch.int32).pin_memory()
-        bank.uploads.append((slot, table))
-        self.table_versions[rid] = allocation.block_tables
+        return slot
+
+    def ensure_slot(self, request, bank):
+        rid = request.request_id
+        allocation = self.cache._get_allocation(rid)
+        was_reserved = rid in self.slots
+        slot = self.reserve_slot(request)
+        previous = self.table_versions.get(rid)
+        current = allocation.block_tables
+        if previous != current:
+            row = bank.next_table_update
+            bank.next_table_update += 1
+            for plane, pages in enumerate(current):
+                old = previous[plane] if previous is not None else ()
+                start = 0
+                while start < min(len(old), len(pages)) and old[start] == pages[start]:
+                    start += 1
+                end = len(pages)
+                while end > start and end <= len(old) and old[end - 1] == pages[end - 1]:
+                    end -= 1
+                if start < end:
+                    bank.table_updates_array[row, plane, start:end] = pages[start:end]
+                    bank.uploads.append(
+                        (slot, plane, start, bank.table_updates[row, plane, start:end])
+                    )
+            self.table_versions[rid] = current
+        if was_reserved:
+            return slot
         if request.hidden_state is not None:
             bank.imports.append((self.hidden, slot, request.hidden_state))
             request.hidden_state = self.hidden[slot]
@@ -170,12 +208,21 @@ class AsyncState:
         return slot
 
     def prepare(self, requests, depths, positions, size, *, recurrent=False, finalize=False):
+        banks = self.finalize_banks if finalize else self.banks
+        next_index = self.finalize_index if finalize else self.index
+        # Preserve bounded storage, but do not wait on a busy bank when another
+        # bank has already finished. If all are busy, retire the oldest candidate.
+        index = next_index
+        for offset in range(len(banks)):
+            candidate = (next_index + offset) % len(banks)
+            if banks[candidate].done is None or banks[candidate].done.query():
+                index = candidate
+                break
+        bank = banks[index]
         if finalize:
-            bank = self.finalize_banks[self.finalize_index]
-            self.finalize_index = (self.finalize_index + 1) % len(self.finalize_banks)
+            self.finalize_index = (index + 1) % len(banks)
         else:
-            bank = self.banks[self.index]
-            self.index = (self.index + 1) % len(self.banks)
+            self.index = (index + 1) % len(banks)
         bank.acquire()
         bank.count, bank.size = len(requests), size
         bank.width = max(p // self.cache.block_size + 1 for p in positions)

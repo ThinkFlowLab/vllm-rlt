@@ -1,14 +1,18 @@
-"""Synchronous block self-speculation with depth-specific KV/activation reuse.
+"""Submitted block self-speculation with depth-specific KV/activation reuse.
 
-Temporary tensors belong to one execute call. Requests expose only committed
+Temporary tensors belong to a submission until collection. Requests expose only committed
 outputs; the engine applies returned tokens and owns KV commit/truncation.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 
+from vllm_rlt.core.execution import Operation
+from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
+from vllm_rlt.worker.execution import ExecutionRuntime, ForwardBatch
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
@@ -62,10 +66,52 @@ def rejection_sample(candidate, target, proposal, generator):
     return int(Sampler.draw(residual / total, generator).item()), False
 
 
+@dataclass
+class SpeculativeSubmission:
+    runner: "SpeculativeRunner"
+    batch: SchedulerOutput
+    logits: torch.Tensor | None
+    drafted: list
+    proposals: list
+    event: object = None
+    cached: list[SpeculativeResult] | None = None
+
+    @property
+    def has_result(self):
+        return True
+
+    def ready(self):
+        return self.event is None or self.event.query()
+
+    def collect(self):
+        if self.cached is None:
+            if self.event is not None:
+                self.event.synchronize()
+            stream = self.runner.compute_stream
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                self.cached = self.runner._collect_round(self)
+            self.logits = None
+            self.drafted.clear()
+            self.proposals.clear()
+        return self.cached
+
+
 class SpeculativeRunner:
-    def __init__(self, model, cache, config, execution, rng: RngRegistry | None = None):
+    def __init__(
+        self,
+        model,
+        cache,
+        config,
+        execution,
+        rng: RngRegistry | None = None,
+        *,
+        runtime=None,
+        compute_stream=None,
+    ):
         self.model, self.cache, self.config = model, cache, config
+        self.runtime = runtime if runtime is not None else ExecutionRuntime(model, cache)
         self.device = next(model.parameters()).device
+        self.compute_stream = compute_stream
         # The engine injects one registry per engine so both sampling paths share
         # each request's RNG slot.
         self.rng = rng if rng is not None else RngRegistry()
@@ -86,19 +132,14 @@ class SpeculativeRunner:
             positions,
             packed_prefill=self._packed(packed),
         )
-        for depth, batch in zip(depths, batches):
-            hidden = self._core(hidden, ids, positions, depth, packed=packed, batch=batch)
-        return hidden
+        return self.runtime.advance(hidden, batches, graphs=self.graphs).hidden
 
     def _core(self, hidden, ids, positions, depth, *, packed=False, batch=None):
         if batch is None:
             batch = self.cache._prepare_batch(
                 ids, [depth] * len(ids), positions, packed_prefill=self._packed(packed)
             )
-        if self.graphs is not None:
-            hidden, _ = self.graphs.run(hidden, batch)
-        else:
-            hidden, _ = self.model.recurrent_prepared(hidden, batch, self.cache, compute_gate=False)
+        hidden, _ = self.runtime.advance(hidden, (batch,), graphs=self.graphs)
         return hidden
 
     def _acquire_generator(self, request, logits):
@@ -110,42 +151,69 @@ class SpeculativeRunner:
         return self.rng.acquire(request.request_id, request.sampling_params, logits.device)
 
     def _coda(self, hidden):
-        return (
-            self.coda_graphs.run(hidden)
-            if self.coda_graphs is not None
-            else self.model.coda(hidden)
-        )
+        return self.runtime.forward(
+            ForwardBatch(
+                Operation.CODA,
+                hidden=hidden,
+                graphs=self.coda_graphs,
+            )
+        ).logits
 
     @torch.inference_mode()
-    def execute(self, batch):
-        items = batch.items
-        proposals = [[] for _ in items]
-        states = [[] for _ in items]
+    def submit(self, batch):
+        try:
+            if self.compute_stream is not None:
+                self.compute_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with (
+                torch.cuda.stream(self.compute_stream)
+                if self.compute_stream is not None
+                else nullcontext()
+            ):
+                return self._submit_round(batch)
+        except Exception:
+            # Failed submissions may not have recorded a completion event.
+            if self.device.type == "cuda":
+                (self.compute_stream or torch.cuda.current_stream(self.device)).synchronize()
+            raise
+
+    def _submit_round(self, batch):
+        scheduled_requests = batch.requests
+        proposals = [[] for _ in scheduled_requests]
+        states = [[] for _ in scheduled_requests]
         # Draft IDs stay on the device: each offset's IDs are the next offset's
         # prelude input, and all of them are read back once after verification.
         drafted = []
-        inputs = self.cache._stage([item.request.input_token_id for item in items], torch.long)
-        # Each item includes the final shallow input needed for the bonus row.
+        inputs = self.cache._stage(
+            [scheduled_request.request.input_token_id for scheduled_request in scheduled_requests],
+            torch.long,
+        )
+        # Each scheduled request includes the final shallow input needed for the bonus row.
         # Drafting batches independent requests at every autoregressive step.
-        for offset in range(max(item.token_count for item in items)):
+        for offset in range(
+            max(scheduled_request.token_count for scheduled_request in scheduled_requests)
+        ):
             # The rows still drafting at the previous offset are exactly this
             # offset's active rows, in the same order, so their IDs are the inputs.
-            active = [i for i, item in enumerate(items) if offset < item.token_count]
-            ids = [items[i].request.request_id for i in active]
-            positions = [items[i].token_start + offset for i in active]
-            hidden = self.model.prelude(inputs)
+            active = [
+                i
+                for i, scheduled_request in enumerate(scheduled_requests)
+                if offset < scheduled_request.token_count
+            ]
+            ids = [scheduled_requests[i].request.request_id for i in active]
+            positions = [scheduled_requests[i].token_start + offset for i in active]
+            hidden = self.runtime.forward(ForwardBatch(Operation.PRELUDE, tokens=inputs)).hidden
             hidden = self._cores(hidden, ids, positions, range(self.config.draft_loops))
             drafting = []
             for row, i in enumerate(active):
                 states[i].append(hidden[row])
-                if offset + 1 < items[i].token_count:
+                if offset + 1 < scheduled_requests[i].token_count:
                     drafting.append((row, i))
             if not drafting:
                 break
             logits = self._coda(torch.stack([hidden[row] for row, _ in drafting]))
             inputs = logits.argmax(-1)
             for row, (_, i) in enumerate(drafting):
-                request = items[i].request
+                request = scheduled_requests[i].request
                 if request.sampling_params.temperature != 0:
                     q = Sampler.probabilities(logits[row], request.sampling_params)
                     proposals[i].append(q)
@@ -154,9 +222,14 @@ class SpeculativeRunner:
             drafted.append(([i for _, i in drafting], inputs))
         # Group contiguous positions per request for causal ragged attention.
         ids, positions = [], []
-        for item in items:
-            ids.extend([item.request.request_id] * item.token_count)
-            positions.extend(range(item.token_start, item.token_start + item.token_count))
+        for scheduled_request in scheduled_requests:
+            ids.extend([scheduled_request.request.request_id] * scheduled_request.token_count)
+            positions.extend(
+                range(
+                    scheduled_request.token_start,
+                    scheduled_request.token_start + scheduled_request.token_count,
+                )
+            )
         hidden = torch.stack([h for request_states in states for h in request_states])
         hidden = self._cores(
             hidden,
@@ -166,12 +239,28 @@ class SpeculativeRunner:
             packed=True,
         )
         logits = self._coda(hidden)
+        event = None
+        if self.device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+        self.stats.rounds += len(scheduled_requests)
+        self.stats.drafted_tokens += sum(len(rows) for rows, _ in drafted)
+        self.stats.verified_rows += len(ids)
+        return SpeculativeSubmission(self, batch, logits, drafted, proposals, event)
+
+    @torch.inference_mode()
+    def _collect_round(self, submission):
+        scheduled_requests = submission.batch.requests
+        logits, drafted, proposals = submission.logits, submission.drafted, submission.proposals
         # One device-to-host read returns every draft ID and, for greedy requests,
         # every verification target argmax.
-        greedy = any(item.request.sampling_params.temperature == 0 for item in items)
+        greedy = any(
+            scheduled_request.request.sampling_params.temperature == 0
+            for scheduled_request in scheduled_requests
+        )
         pending = [draft for _, draft in drafted] + ([logits.argmax(-1)] if greedy else [])
         values = torch.cat(pending).tolist() if pending else []
-        candidates = [[] for _ in items]
+        candidates = [[] for _ in scheduled_requests]
         start = 0
         for rows, _ in drafted:
             for i, candidate in zip(rows, values[start : start + len(rows)]):
@@ -179,17 +268,17 @@ class SpeculativeRunner:
             start += len(rows)
         targets = values[start:]
         results, start = [], 0
-        for i, item in enumerate(items):
-            rows = logits[start : start + item.token_count]
-            request = item.request
+        for i, scheduled_request in enumerate(scheduled_requests):
+            rows = logits[start : start + scheduled_request.token_count]
+            request = scheduled_request.request
             if request.sampling_params.temperature == 0:
                 tokens, accepted = greedy_accept(
-                    candidates[i], targets[start : start + item.token_count]
+                    candidates[i], targets[start : start + scheduled_request.token_count]
                 )
-                start += item.token_count
+                start += scheduled_request.token_count
                 results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
                 continue
-            start += item.token_count
+            start += scheduled_request.token_count
             # Sampling keeps sequential rejection; RNG consumption order is unchanged.
             tokens, accepted = [], 0
             for offset, candidate in enumerate(candidates[i]):
@@ -211,7 +300,4 @@ class SpeculativeRunner:
                 )
                 tokens.append(int(token.item()))
             results.append(SpeculativeResult(tokens, accepted, len(candidates[i])))
-        self.stats.rounds += len(items)
-        self.stats.drafted_tokens += sum(len(c) for c in candidates)
-        self.stats.verified_rows += len(ids)
         return results
