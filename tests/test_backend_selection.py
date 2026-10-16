@@ -153,11 +153,22 @@ def test_execution_requirements_prevent_unsafe_torch_fallback(packages, monkeypa
 def test_packed_prefill_requires_declared_support(packages, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
     packages.remove("flash_attn.cute")
+    # Without FA4, auto skips FA3/FA2 and selects Triton's packed paged prefill.
+    backend = create_backend(
+        "auto",
+        torch.device("cuda"),
+        torch.bfloat16,
+        128,
+        16,
+        required_capabilities=BackendCapabilities(packed_prefill=True),
+    )
+    assert backend.info["selected_backend"] == "triton"
+    assert backend.capabilities.packed_prefill
     with pytest.raises(ValueError, match="packed_prefill"):
         create_backend(
-            "auto",
-            torch.device("cuda"),
-            torch.bfloat16,
+            "torch",
+            torch.device("cpu"),
+            torch.float32,
             128,
             16,
             required_capabilities=BackendCapabilities(packed_prefill=True),
